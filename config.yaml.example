@@ -1,4 +1,6 @@
-base_url: "https://your-api-endpoint.example.com/v1"
+# CCR 的 OpenAI transformer 会直接 POST 到这个 URL，不会自动拼接 /chat/completions
+# 所以需要填写完整的 chat completions 地址
+base_url: "https://your-api-endpoint.example.com/v1/chat/completions"
 api_key: "your-api-key-here"
 model_name: "your-model-name"
 

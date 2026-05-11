@@ -104,7 +104,9 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
     task_output_dir = output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
-    workspace = tempfile.mkdtemp(prefix=f"harness_{task_id}_")
+    workspace_base = Path.home() / ".harness-eval" / "workspaces"
+    workspace_base.mkdir(parents=True, exist_ok=True)
+    workspace = tempfile.mkdtemp(prefix=f"harness_{task_id}_", dir=str(workspace_base))
 
     try:
         prepare_workspace(task, workspace)
