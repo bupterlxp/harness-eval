@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 """
 Harness Eval Runner
-Reads tasks from a JSONL file, spins up Docker containers with Claude Code,
+
+Reads tasks from a JSONL file, spins up Docker containers with Claude Code + ccr,
 and collects the outputs.
+
+Each task in the JSONL supports three modes:
+  - "prompt":      inline prompt text → written as CLAUDE.md
+  - "prompt_file": path to a .md file → copied as CLAUDE.md
+  - "task_dir":    directory containing CLAUDE.md and supporting files
+
+Optional "files" field: {"dest_path": "src_path"} to copy extra materials into workspace.
 """
 
 import json
@@ -42,26 +50,70 @@ def build_docker_image():
     print("Docker image built.")
 
 
+def prepare_workspace(task: dict, workspace: str):
+    ws = Path(workspace)
+
+    if "task_dir" in task:
+        task_dir = Path(task["task_dir"])
+        if not task_dir.is_dir():
+            raise FileNotFoundError(f"task_dir not found: {task_dir}")
+        for item in task_dir.iterdir():
+            dest = ws / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+        if not (ws / "CLAUDE.md").exists():
+            raise FileNotFoundError(f"CLAUDE.md not found in {task_dir}")
+
+    elif "prompt_file" in task:
+        prompt_path = Path(task["prompt_file"])
+        if not prompt_path.is_file():
+            raise FileNotFoundError(f"prompt_file not found: {prompt_path}")
+        (ws / "CLAUDE.md").write_text(prompt_path.read_text(encoding="utf-8"))
+
+    elif "prompt" in task:
+        (ws / "CLAUDE.md").write_text(task["prompt"])
+
+    else:
+        raise ValueError(
+            f"Task '{task.get('id', '?')}' must have 'prompt', 'prompt_file', or 'task_dir'"
+        )
+
+    if "files" in task:
+        file_map = task["files"]
+        if isinstance(file_map, dict):
+            items = file_map.items()
+        else:
+            raise ValueError(f"'files' must be a dict, got {type(file_map).__name__}")
+
+        for dest_rel, src_rel in items:
+            src = Path(src_rel)
+            dest = ws / dest_rel
+            if not src.exists():
+                raise FileNotFoundError(f"files source not found: {src}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+
+
 def run_task(task: dict, config: dict, output_dir: Path) -> dict:
     task_id = task["id"]
-    prompt = task["prompt"]
     task_output_dir = output_dir / task_id
     task_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a temp dir for workspace mount
     workspace = tempfile.mkdtemp(prefix=f"harness_{task_id}_")
 
-    # Write CLAUDE.md with the task prompt
-    claude_md = Path(workspace) / "CLAUDE.md"
-    claude_md.write_text(f"""# Task
-
-You are an agent tasked with writing a harness. Follow the requirements below carefully.
-Write all output files in the current directory (/workspace).
-
-## Requirements
-
-{prompt}
-""")
+    try:
+        prepare_workspace(task, workspace)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        meta = {"task_id": task_id, "status": "error", "stdout": "", "stderr": str(e)}
+        (task_output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        shutil.rmtree(workspace, ignore_errors=True)
+        print(f"[{task_id}] error preparing workspace: {e}")
+        return meta
 
     container_name = f"harness-eval-{task_id}-{int(time.time())}"
     timeout = config.get("timeout_minutes", 30) * 60
@@ -71,7 +123,6 @@ Write all output files in the current directory (/workspace).
             [
                 "docker", "run",
                 "--name", container_name,
-                "--rm",
                 "-e", f"BASE_URL={config['base_url']}",
                 "-e", f"API_KEY={config['api_key']}",
                 "-e", f"MODEL_NAME={config['model_name']}",
@@ -89,30 +140,33 @@ Write all output files in the current directory (/workspace).
         status = "timeout"
         stdout = ""
         stderr = "Task timed out"
-        subprocess.run(["docker", "kill", container_name], capture_output=True)
+        subprocess.run(["docker", "stop", "-t", "5", container_name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
     except Exception as e:
         status = "error"
         stdout = ""
         stderr = str(e)
 
-    # Copy workspace outputs to output dir
+    # Remove the container if it still exists (no --rm flag)
+    subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+
     for item in Path(workspace).iterdir():
         dest = task_output_dir / item.name
         if item.is_dir():
+            if item.name == ".git":
+                continue
             shutil.copytree(item, dest, dirs_exist_ok=True)
         else:
             shutil.copy2(item, dest)
 
-    # Write metadata
     meta = {
         "task_id": task_id,
         "status": status,
-        "stdout": stdout[-2000:] if stdout else "",
-        "stderr": stderr[-2000:] if stderr else "",
+        "stdout": stdout[-5000:] if stdout else "",
+        "stderr": stderr[-5000:] if stderr else "",
     }
     (task_output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
-    # Cleanup temp workspace
     shutil.rmtree(workspace, ignore_errors=True)
 
     print(f"[{task_id}] {status}")
@@ -134,7 +188,7 @@ def main():
     build_docker_image()
 
     max_concurrent = config.get("max_concurrent", 4)
-    print(f"Running {len(tasks)} tasks with max {max_concurrent} concurrent containers...")
+    print(f"Running {len(tasks)} task(s) with max {max_concurrent} concurrent containers...")
 
     results = []
     with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
@@ -145,7 +199,6 @@ def main():
         for future in as_completed(futures):
             results.append(future.result())
 
-    # Summary
     summary = {
         "total": len(results),
         "success": sum(1 for r in results if r["status"] == "success"),

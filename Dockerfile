@@ -8,15 +8,15 @@ RUN apt-get update && apt-get install -y \
     jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code and Claude Code Router globally
 RUN npm install -g @anthropic-ai/claude-code @musistudio/claude-code-router
 
-# Create workspace (agent works here, no claude code source)
 RUN mkdir -p /workspace /root/.claude-code-router
+
+RUN git config --global user.email "harness@eval.local" && \
+    git config --global user.name "Harness Eval"
 
 WORKDIR /workspace
 
-# Copy entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
