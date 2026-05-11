@@ -1,71 +1,71 @@
 # Harness Eval
 
-A framework for running Claude Code agents in Docker containers to generate harness code from user prompts.
+在 Docker 容器中运行 Claude Code agent，根据用户 prompt 自动生成 harness 代码的框架。
 
-## How It Works
+## 工作原理
 
-1. Read tasks from `tasks.jsonl` — each task contains a prompt describing what harness to build
-2. Spin up Docker containers with Claude Code + [claude-code-router](https://github.com/musistudio/claude-code-router) pre-configured
-3. The agent works in an isolated `/workspace` directory (no Claude Code source code)
-4. After completion, collect all output artifacts from each container
+1. 从 `tasks.jsonl` 读取任务——每个任务包含一段描述需要构建什么 harness 的 prompt
+2. 启动 Docker 容器，内置预配置的 Claude Code + [claude-code-router](https://github.com/musistudio/claude-code-router)
+3. Agent 在隔离的 `/workspace` 目录中工作（不包含 Claude Code 源码）
+4. 任务完成后，收集每个容器的所有输出产物
 
-## Setup
+## 快速开始
 
 ```bash
-# 1. Install Python dependencies
+# 1. 安装 Python 依赖
 pip install -r requirements.txt
 
-# 2. Create config.yaml from the example
+# 2. 从模板创建配置文件
 cp config.yaml.example config.yaml
-# Edit config.yaml with your API endpoint, key, and model name
+# 编辑 config.yaml，填入你的 API 地址、密钥和模型名称
 
-# 3. Run
+# 3. 运行
 python run.py
 ```
 
-## Task Format (tasks.jsonl)
+## 任务格式（tasks.jsonl）
 
-Three modes for defining tasks:
+支持三种任务定义方式：
 
 ```jsonl
-# Inline prompt
-{"id": "my-task", "prompt": "Build a code review harness that..."}
+# 内联 prompt
+{"id": "my-task", "prompt": "构建一个代码审查 harness..."}
 
-# Prompt from file
+# 从文件读取 prompt
 {"id": "my-task", "prompt_file": "./prompts/my_task.md"}
 
-# Directory with CLAUDE.md and supporting files
+# 指定目录（需包含 CLAUDE.md）
 {"id": "my-task", "task_dir": "./my_task_dir"}
 ```
 
-Optional `files` field to copy extra materials into the agent workspace:
+可选 `files` 字段，用于将额外参考材料拷贝到 agent 工作区：
 
 ```jsonl
 {"id": "writing-harness", "prompt_file": "./prompts/writing_harness.md", "files": {"samples/example.txt": "./data/example.txt"}}
 ```
 
-## Configuration (config.yaml)
+## 配置说明（config.yaml）
 
 ```yaml
 base_url: "https://your-api-endpoint/v1"
 api_key: "your-api-key"
 model_name: "your-model-name"
 
-max_concurrent: 4        # parallel containers
-timeout_minutes: 30      # per-task timeout
-output_dir: "./outputs"  # where results go
+max_concurrent: 4        # 并行容器数
+timeout_minutes: 30      # 单任务超时（分钟）
+output_dir: "./outputs"  # 产物输出目录
 tasks_file: "./tasks.jsonl"
 ```
 
-## Output
+## 输出结构
 
-Results are saved to `./outputs/<task-id>/`:
+结果保存在 `./outputs/<task-id>/` 下：
 
 ```
 outputs/
 └── writing-harness/
-    ├── meta.json            # status, stdout, stderr
-    ├── claude_output.log    # full Claude Code output
-    ├── CLAUDE.md            # the prompt that was used
-    └── ...                  # all files the agent created
+    ├── meta.json            # 状态、stdout、stderr
+    ├── claude_output.log    # Claude Code 完整输出日志
+    ├── CLAUDE.md            # 使用的 prompt
+    └── ...                  # agent 生成的所有文件
 ```
