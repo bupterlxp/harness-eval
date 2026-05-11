@@ -2,29 +2,39 @@
 set -e
 
 # Generate claude-code-router config from env vars
+mkdir -p /root/.claude-code-router
 cat > /root/.claude-code-router/config.json <<EOF
 {
-  "providers": [
+  "LOG": false,
+  "LOG_LEVEL": "info",
+  "CLAUDE_PATH": "",
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "APIKEY": "",
+  "API_TIMEOUT_MS": "600000",
+  "PROXY_URL": "",
+  "transformers": [],
+  "Providers": [
     {
       "name": "custom",
-      "apiKey": "${API_KEY}",
-      "baseURL": "${BASE_URL}"
+      "api_base_url": "${BASE_URL}",
+      "api_key": "${API_KEY}",
+      "models": ["${MODEL_NAME}"],
+      "transformer": {
+        "use": ["OpenAI"]
+      }
     }
   ],
-  "router": {
-    "default": {
-      "provider": "custom",
-      "model": "${MODEL_NAME}"
-    },
-    "background": {
-      "provider": "custom",
-      "model": "${MODEL_NAME}"
-    },
-    "thinking": {
-      "provider": "custom",
-      "model": "${MODEL_NAME}"
-    }
-  }
+  "Router": {
+    "default": "custom,${MODEL_NAME}",
+    "background": "custom,${MODEL_NAME}",
+    "think": "custom,${MODEL_NAME}",
+    "longContext": "custom,${MODEL_NAME}",
+    "longContextThreshold": 60000,
+    "webSearch": "custom,${MODEL_NAME}",
+    "image": "custom,${MODEL_NAME}"
+  },
+  "CUSTOM_ROUTER_PATH": ""
 }
 EOF
 
@@ -39,7 +49,6 @@ PROMPT=$(cat /workspace/CLAUDE.md)
 cd /workspace
 
 # Use ccr code to launch claude code through the router
-# --dangerously-skip-permissions: no human confirmation needed in container
 ccr code --dangerously-skip-permissions -p "$PROMPT" --output-format text > /workspace/claude_output.log 2>&1
 
 echo "Task completed. Output in /workspace/"
