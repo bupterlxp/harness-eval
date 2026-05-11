@@ -59,12 +59,15 @@ tasks_file: "./tasks.jsonl"
 
 ## 输出结构
 
-结果保存在 `./outputs/<task-id>/` 下：
+产物输出目录由 `config.yaml` 中的 `output_dir` 指定，默认为 `./outputs`。
+
+每个任务的结果保存在 `<output_dir>/<task-id>/` 下，运行结束后还会生成一个 `summary.json` 汇总所有任务状态：
 
 ```
 outputs/
+├── summary.json             # 汇总：total/success/failed/timeout/error 计数
 └── writing-harness/
-    ├── meta.json            # 状态、stdout、stderr
+    ├── meta.json            # 单任务状态、stdout、stderr
     ├── claude_output.log    # Claude Code 完整输出日志
     ├── CLAUDE.md            # 使用的 prompt
     └── ...                  # agent 生成的所有文件
