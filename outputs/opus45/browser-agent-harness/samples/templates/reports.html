@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}报表中心 - HR管理系统{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>部门考勤报表</h2>
+  <div class="search-bar">
+    <select id="month-filter">
+      <option value="">全部月份</option>
+      <option value="2024-01">2024年1月</option>
+      <option value="2024-02">2024年2月</option>
+      <option value="2024-03">2024年3月</option>
+    </select>
+    <button class="btn btn-primary" onclick="loadReport()">查询</button>
+    <a href="/api/reports/export" class="btn btn-success" style="margin-left:auto" id="export-btn">📥 导出CSV</a>
+  </div>
+  <div id="report-table"><div class="loading">加载中...</div></div>
+</div>
+<div class="card">
+  <h2>出勤率趋势图</h2>
+  <div id="chart-area" style="position:relative;height:280px;padding:20px 0">
+    <canvas id="attendance-chart" style="width:100%;height:100%"></canvas>
+    <div id="chart-placeholder" class="loading">加载中...</div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function loadReport(){
+  var month=document.getElementById('month-filter').value;
+  document.getElementById('report-table').innerHTML='<div class="loading">加载中...</div>';
+  fetch('/api/reports/attendance').then(r=>r.json()).then(function(d){
+    var data=d.attendance;
+    if(month)data=data.filter(function(r){return r.month===month});
+    if(data.length===0){document.getElementById('report-table').innerHTML='<div class="loading">暂无数据</div>';return}
+    var html='<table><thead><tr><th>部门</th><th>月份</th><th>总人数</th><th>平均出勤率</th><th>迟到次数</th><th>早退次数</th><th>缺勤次数</th></tr></thead><tbody>';
+    data.forEach(function(r){
+      var rateColor=r.avg_attendance_rate>=95?'#52c41a':r.avg_attendance_rate>=90?'#d48806':'#ff4d4f';
+      html+='<tr><td>'+r.department_name+'</td><td>'+r.month+'</td><td>'+r.total_staff+'</td><td><span style="color:'+rateColor+';font-weight:600">'+r.avg_attendance_rate+'%</span></td><td>'+r.late_count+'</td><td>'+r.early_leave_count+'</td><td>'+r.absent_count+'</td></tr>';
+    });
+    html+='</tbody></table>';
+    document.getElementById('report-table').innerHTML=html;
+    drawChart(d.attendance);
+  });
+}
+function drawChart(data){
+  var canvas=document.getElementById('attendance-chart');
+  var ctx=canvas.getContext('2d');
+  canvas.width=canvas.parentElement.clientWidth;
+  canvas.height=240;
+  document.getElementById('chart-placeholder').style.display='none';
+  var depts={};
+  data.forEach(function(r){if(!depts[r.department_name])depts[r.department_name]=[];depts[r.department_name].push({month:r.month,rate:r.avg_attendance_rate})});
+  var colors=['#1890ff','#52c41a','#faad14','#ff4d4f','#722ed1'];
+  var months=['2024-01','2024-02','2024-03'];
+  var w=canvas.width,h=canvas.height;
+  var px=60,py=30,pw=w-px-40,ph=h-py-40;
+  ctx.strokeStyle='#f0f0f0';ctx.lineWidth=1;
+  for(var i=0;i<=5;i++){var y=py+ph-ph*i/5;ctx.beginPath();ctx.moveTo(px,y);ctx.lineTo(px+pw,y);ctx.stroke();ctx.fillStyle='#999';ctx.font='11px sans-serif';ctx.textAlign='right';ctx.fillText((90+i*2)+'%',px-8,y+4)}
+  months.forEach(function(m,i){var x=px+pw*(i/(months.length-1));ctx.fillStyle='#999';ctx.textAlign='center';ctx.fillText(m,x,h-8)});
+  var ci=0;
+  Object.keys(depts).forEach(function(dept){
+    var pts=depts[dept].sort(function(a,b){return a.month.localeCompare(b.month)});
+    ctx.strokeStyle=colors[ci%colors.length];ctx.lineWidth=2;ctx.beginPath();
+    pts.forEach(function(p,j){
+      var mi=months.indexOf(p.month);
+      var x=px+pw*(mi/(months.length-1));
+      var y=py+ph-(p.rate-90)/10*ph;
+      if(j===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+    pts.forEach(function(p,j){
+      var mi=months.indexOf(p.month);
+      var x=px+pw*(mi/(months.length-1));
+      var y=py+ph-(p.rate-90)/10*ph;
+      ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);ctx.fillStyle=colors[ci%colors.length];ctx.fill();
+    });
+    ctx.fillStyle=colors[ci%colors.length];ctx.font='11px sans-serif';ctx.textAlign='left';
+    ctx.fillText(dept,px+pw+8,py+12+ci*16);
+    ci++;
+  });
+}
+loadReport();
+</script>
+{% endblock %}

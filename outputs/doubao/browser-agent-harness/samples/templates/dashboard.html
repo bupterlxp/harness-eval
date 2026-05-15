@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}仪表盘 - HR管理系统{% endblock %}
+{% block content %}
+<h2 style="margin-bottom:20px">欢迎回来，{{ user }}</h2>
+<div class="stat-cards" id="stats"><div class="loading">加载中...</div></div>
+<div class="card">
+  <h2>待办事项</h2>
+  <div id="todos"><div class="loading">加载中...</div></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+fetch('/api/dashboard').then(r=>r.json()).then(function(d){
+  document.getElementById('stats').innerHTML=
+    '<div class="stat-card"><div class="number">'+d.total_employees+'</div><div class="label">在职员工总数</div></div>'+
+    '<div class="stat-card"><div class="number" style="color:#d48806">'+d.pending_leaves+'</div><div class="label">待审批请假</div></div>'+
+    '<div class="stat-card"><div class="number" style="color:#52c41a">'+d.new_hires+'</div><div class="label">近30天新入职</div></div>'+
+    '<div class="stat-card"><div class="number" style="color:#ff4d4f">'+d.contract_expiring+'</div><div class="label">合同即将到期</div></div>';
+  var items=[];
+  if(d.pending_leaves>0)items.push('<li style="padding:8px 0;border-bottom:1px solid #f0f0f0">📋 有 <strong>'+d.pending_leaves+'</strong> 条请假申请等待审批 <a href="/leave-requests">去处理</a></li>');
+  if(d.new_hires>0)items.push('<li style="padding:8px 0;border-bottom:1px solid #f0f0f0">👋 近30天有 <strong>'+d.new_hires+'</strong> 名新员工入职 <a href="/employees">查看</a></li>');
+  if(d.contract_expiring>0)items.push('<li style="padding:8px 0;border-bottom:1px solid #f0f0f0">⚠️ 有 <strong>'+d.contract_expiring+'</strong> 名员工合同即将到期 <a href="/employees">查看</a></li>');
+  if(items.length===0)items.push('<li style="padding:8px 0;color:#999">暂无待办事项</li>');
+  document.getElementById('todos').innerHTML='<ul style="list-style:none">'+items.join('')+'</ul>';
+});
+</script>
+{% endblock %}

@@ -152,12 +152,17 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
     # Remove the container if it still exists (no --rm flag)
     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
+    SKIP_DIRS = {".git", "venv", ".venv", "node_modules", "__pycache__"}
     for item in Path(workspace).iterdir():
         dest = task_output_dir / item.name
         if item.is_dir():
-            if item.name == ".git":
+            if item.name in SKIP_DIRS:
                 continue
-            shutil.copytree(item, dest, dirs_exist_ok=True)
+            try:
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            except shutil.Error:
+                shutil.copytree(item, dest, dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns("python*", "python3*"))
         else:
             shutil.copy2(item, dest)
 
@@ -167,6 +172,22 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         "stdout": stdout[-5000:] if stdout else "",
         "stderr": stderr[-5000:] if stderr else "",
     }
+
+    metrics_file = task_output_dir / "metrics.json"
+    if metrics_file.exists():
+        try:
+            metrics = json.loads(metrics_file.read_text())
+            meta["metrics"] = {
+                "total_requests": metrics.get("total_requests", 0),
+                "total_input_tokens": metrics.get("total_input_tokens", 0),
+                "total_output_tokens": metrics.get("total_output_tokens", 0),
+                "total_cache_read_tokens": metrics.get("total_cache_read_tokens", 0),
+                "total_cache_creation_tokens": metrics.get("total_cache_creation_tokens", 0),
+                "total_tokens": metrics.get("total_input_tokens", 0) + metrics.get("total_output_tokens", 0),
+            }
+        except (json.JSONDecodeError, KeyError):
+            pass
+
     (task_output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
     shutil.rmtree(workspace, ignore_errors=True)

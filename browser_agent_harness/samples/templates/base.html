@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}HR管理系统{% endblock %}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;background:#f0f2f5;color:#333;font-size:14px}
+a{color:#1890ff;text-decoration:none}
+a:hover{color:#40a9ff}
+.navbar{background:#001529;color:#fff;display:flex;align-items:center;padding:0 24px;height:48px;position:fixed;top:0;left:0;right:0;z-index:100}
+.navbar .logo{font-size:16px;font-weight:600;margin-right:40px}
+.navbar .nav-links{display:flex;gap:4px}
+.navbar .nav-links a{color:rgba(255,255,255,.65);padding:0 16px;line-height:48px;font-size:14px;transition:all .2s}
+.navbar .nav-links a:hover,.navbar .nav-links a.active{color:#fff;background:rgba(255,255,255,.08)}
+.navbar .user-area{margin-left:auto;display:flex;align-items:center;gap:12px;color:rgba(255,255,255,.65)}
+.navbar .user-area .username{color:#fff}
+.navbar .user-area .logout-btn{background:none;border:1px solid rgba(255,255,255,.3);color:rgba(255,255,255,.65);padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px}
+.navbar .user-area .logout-btn:hover{color:#fff;border-color:#fff}
+.main{margin-top:48px;padding:24px;max-width:1200px;margin-left:auto;margin-right:auto}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:20px;margin-bottom:16px}
+.card h2{font-size:16px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid #f0f0f0}
+table{width:100%;border-collapse:collapse}
+table th,table td{padding:10px 12px;text-align:left;border-bottom:1px solid #f0f0f0;font-size:13px}
+table th{background:#fafafa;font-weight:600;color:#666}
+table tr:hover{background:#fafafa}
+.btn{display:inline-block;padding:6px 16px;border-radius:4px;border:1px solid #d9d9d9;background:#fff;cursor:pointer;font-size:13px;transition:all .2s}
+.btn-primary{background:#1890ff;color:#fff;border-color:#1890ff}
+.btn-primary:hover{background:#40a9ff}
+.btn-success{background:#52c41a;color:#fff;border-color:#52c41a}
+.btn-success:hover{background:#73d13d}
+.btn-danger{background:#ff4d4f;color:#fff;border-color:#ff4d4f}
+.btn-danger:hover{background:#ff7875}
+.btn-sm{padding:3px 10px;font-size:12px}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;margin-bottom:6px;font-weight:500;color:#333}
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;border:1px solid #d9d9d9;border-radius:4px;font-size:14px;transition:border-color .2s}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:#1890ff;box-shadow:0 0 0 2px rgba(24,144,255,.1)}
+.form-group .error{color:#ff4d4f;font-size:12px;margin-top:4px}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;font-weight:500}
+.badge-pending{background:#fff7e6;color:#d48806;border:1px solid #ffd591}
+.badge-approved{background:#f6ffed;color:#389e0d;border:1px solid #b7eb8f}
+.badge-rejected{background:#fff2f0;color:#cf1322;border:1px solid #ffa39e}
+.badge-active{background:#e6f7ff;color:#096dd9;border:1px solid #91d5ff}
+.badge-inactive{background:#f5f5f5;color:#8c8c8c;border:1px solid #d9d9d9}
+.pagination{display:flex;gap:4px;justify-content:center;margin-top:16px}
+.pagination button{padding:4px 12px;border:1px solid #d9d9d9;background:#fff;border-radius:4px;cursor:pointer}
+.pagination button.active{background:#1890ff;color:#fff;border-color:#1890ff}
+.pagination button:disabled{opacity:.5;cursor:not-allowed}
+.search-bar{display:flex;gap:12px;margin-bottom:16px;align-items:center;flex-wrap:wrap}
+.search-bar input,.search-bar select{padding:6px 12px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px}
+.search-bar input{width:200px}
+.alert{padding:12px 16px;border-radius:4px;margin-bottom:16px;font-size:13px}
+.alert-success{background:#f6ffed;border:1px solid #b7eb8f;color:#389e0d}
+.alert-error{background:#fff2f0;border:1px solid #ffa39e;color:#cf1322}
+.alert-info{background:#e6f7ff;border:1px solid #91d5ff;color:#096dd9}
+.loading{text-align:center;padding:40px;color:#999}
+.stat-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:20px}
+.stat-card{background:#fff;border-radius:8px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}
+.stat-card .number{font-size:32px;font-weight:700;color:#1890ff;line-height:1.2}
+.stat-card .label{font-size:13px;color:#999;margin-top:4px}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.45);z-index:200;justify-content:center;align-items:center}
+.modal-overlay.active{display:flex}
+.modal{background:#fff;border-radius:8px;padding:24px;max-width:480px;width:90%;box-shadow:0 4px 20px rgba(0,0,0,.15)}
+.modal h3{margin-bottom:12px;font-size:16px}
+.modal p{color:#666;font-size:13px;margin-bottom:16px;line-height:1.6}
+.modal .modal-actions{display:flex;gap:8px;justify-content:flex-end}
+/* Cookie consent */
+.cookie-banner{display:none;position:fixed;bottom:0;left:0;right:0;background:#001529;color:#fff;padding:16px 24px;z-index:300;justify-content:space-between;align-items:center}
+.cookie-banner.active{display:flex}
+.cookie-banner p{font-size:13px;color:rgba(255,255,255,.85);margin-right:16px}
+.cookie-banner .btn{margin-left:8px}
+</style>
+</head>
+<body>
+{% block navbar %}
+<nav class="navbar">
+  <div class="logo">🏢 HR管理系统</div>
+  <div class="nav-links">
+    <a href="/dashboard" id="nav-dashboard">仪表盘</a>
+    <a href="/employees" id="nav-employees">员工管理</a>
+    <a href="/leave-requests" id="nav-leave">请假管理</a>
+    <a href="/reports" id="nav-reports">报表中心</a>
+  </div>
+  <div class="user-area">
+    <span class="username" id="current-user"></span>
+    <button class="logout-btn" onclick="doLogout()">退出登录</button>
+  </div>
+</nav>
+{% endblock %}
+
+<div class="main">
+  <div id="alert-container"></div>
+  {% block content %}{% endblock %}
+</div>
+
+<!-- Cookie consent banner -->
+<div class="cookie-banner" id="cookie-banner">
+  <p>本系统使用 Cookie 来保障您的登录状态和使用体验。继续使用本系统即表示您同意我们的 Cookie 政策。</p>
+  <div>
+    <button class="btn" onclick="declineCookies()">拒绝非必要</button>
+    <button class="btn btn-primary" onclick="acceptCookies()">接受所有 Cookie</button>
+  </div>
+</div>
+
+<!-- Session expiry modal -->
+<div class="modal-overlay" id="session-modal">
+  <div class="modal">
+    <h3>会话即将过期</h3>
+    <p>您已有一段时间未操作。为保障安全，系统将在 60 秒后自动退出登录。点击"继续"按钮可延长会话。</p>
+    <div class="modal-actions">
+      <button class="btn" onclick="doLogout()">退出登录</button>
+      <button class="btn btn-primary" onclick="extendSession()">继续使用</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Cookie consent
+(function(){
+  if(!localStorage.getItem('cookie_consent')){
+    setTimeout(function(){document.getElementById('cookie-banner').classList.add('active')},800);
+  }
+})();
+function acceptCookies(){localStorage.setItem('cookie_consent','accepted');document.getElementById('cookie-banner').classList.remove('active')}
+function declineCookies(){localStorage.setItem('cookie_consent','declined');document.getElementById('cookie-banner').classList.remove('active')}
+
+// Session management
+var sessionTimer, warnTimer;
+function resetSessionTimer(){
+  clearTimeout(sessionTimer);clearTimeout(warnTimer);
+  warnTimer=setTimeout(function(){document.getElementById('session-modal').classList.add('active')},270000);
+  sessionTimer=setTimeout(function(){doLogout()},330000);
+}
+function extendSession(){document.getElementById('session-modal').classList.remove('active');resetSessionTimer()}
+document.addEventListener('click',function(){resetSessionTimer()});
+document.addEventListener('keydown',function(){resetSessionTimer()});
+resetSessionTimer();
+
+// User display
+(function(){
+  var el=document.getElementById('current-user');
+  if(el){el.textContent='{% if user is defined %}{{user}}{% else %}用户{% endif %}'}
+})();
+
+// Logout
+function doLogout(){
+  fetch('/api/logout',{method:'POST'}).then(function(){window.location.href='/login'});
+}
+
+// Alert helper
+function showAlert(msg,type){
+  var c=document.getElementById('alert-container');
+  var d=document.createElement('div');
+  d.className='alert alert-'+type;
+  d.textContent=msg;
+  c.appendChild(d);
+  setTimeout(function(){d.remove()},5000);
+}
+
+// Active nav
+(function(){
+  var path=window.location.pathname;
+  var links=document.querySelectorAll('.nav-links a');
+  links.forEach(function(a){if(path.startsWith(a.getAttribute('href')))a.classList.add('active')});
+})();
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

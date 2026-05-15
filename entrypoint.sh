@@ -58,11 +58,14 @@ ccr start &
 sleep 2
 
 echo "=== Starting model proxy ==="
-node /model-proxy.js &
+WORKSPACE=/workspace node /model-proxy.js &
 sleep 1
 
 export ANTHROPIC_BASE_URL="http://127.0.0.1:3457"
 export ANTHROPIC_AUTH_TOKEN="placeholder"
+export OPENAI_BASE_URL="http://127.0.0.1:3457/v1"
+export OPENAI_API_KEY="sk-placeholder"
+export MODEL_NAME="${MODEL_NAME}"
 export NO_PROXY="127.0.0.1"
 export DISABLE_TELEMETRY="true"
 export DISABLE_COST_WARNINGS="true"

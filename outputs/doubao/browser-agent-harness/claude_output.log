@@ -1,0 +1,5 @@
+API Error: 500 fetch failedTypeError: fetch failed
+    at node:internal/deps/undici/undici:14976:13
+    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at async fD (/usr/local/lib/node_modules/@musistudio/claude-code-router/dist/cli.js:582:11089)
+    at async cN (/usr/local/lib/node_modules/@musistudio/claude-code-router/dist/cli.js:582:8659). This is a server-side issue, usually temporary — try again in a moment. If it persists, check status.claude.com.

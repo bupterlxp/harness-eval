@@ -1,0 +1,109 @@
+{
+  "scenario": {
+    "name": "企业HR系统多步骤操作自动化",
+    "description": "在企业内部HR管理系统中完成一系列人事管理操作：登录、查看待办、搜索员工、审批请假、提交请假、导出报表",
+    "goal": "以管理员身份完成日常HR工作流程，验证浏览器agent在表单交互、弹窗处理、跨页面状态维护、数据提取等方面的能力",
+    "mock_server": {
+      "command": "python mock_server.py",
+      "url": "http://localhost:5000",
+      "accounts": {
+        "admin": {"username": "admin", "password": "admin123", "role": "管理员"},
+        "employee": {"username": "user01", "password": "user123", "role": "普通员工"}
+      }
+    },
+    "steps": [
+      {
+        "id": 1,
+        "action": "启动Mock服务",
+        "description": "运行 python mock_server.py 启动本地HR系统服务",
+        "expected_state": "服务启动成功，监听 http://localhost:5000"
+      },
+      {
+        "id": 2,
+        "action": "打开登录页并处理弹窗",
+        "description": "导航到 http://localhost:5000/login，页面加载后会弹出 Cookie consent 横幅，需点击'接受所有 Cookie'关闭横幅",
+        "expected_state": "Cookie横幅已关闭，登录表单可见",
+        "challenge": "弹窗处理 — agent需识别并关闭Cookie consent横幅"
+      },
+      {
+        "id": 3,
+        "action": "登录系统",
+        "description": "在用户名输入框填入 admin，密码输入框填入 admin123，点击登录按钮",
+        "expected_state": "登录成功，跳转到仪表盘页面，显示欢迎信息",
+        "challenge": "表单交互 — 需正确定位输入框和按钮并填写"
+      },
+      {
+        "id": 4,
+        "action": "查看仪表盘待办",
+        "description": "在仪表盘页面提取四个统计卡片的数据：在职员工总数、待审批请假数、近30天新入职数、合同到期数",
+        "expected_state": "四项数据已提取并记录到状态存储",
+        "extract_fields": ["total_employees", "pending_leaves", "new_hires", "contract_expiring"]
+      },
+      {
+        "id": 5,
+        "action": "搜索员工",
+        "description": "导航到员工管理页面，在搜索框输入'张'，点击搜索按钮，记录搜索结果数量和第一个员工的姓名",
+        "expected_state": "搜索结果显示所有姓'张'的员工",
+        "extract_fields": ["search_result_count", "first_employee_name"]
+      },
+      {
+        "id": 6,
+        "action": "查看员工详情",
+        "description": "在搜索结果中点击第一个员工的'查看详情'链接，提取完整员工信息",
+        "expected_state": "员工详情页加载完成，显示个人信息和请假记录",
+        "extract_fields": ["name", "department", "position", "hire_date", "annual_leave_balance", "performance_score"],
+        "challenge": "跨页面状态 — 需在新页面中保持之前搜索结果的上下文"
+      },
+      {
+        "id": 7,
+        "action": "审批请假-通过",
+        "description": "导航到请假管理页面（默认显示待审批列表），找到列表中的第一条请假申请，点击'通过'按钮",
+        "expected_state": "第一条请假申请状态变为'已批准'，页面显示成功提示",
+        "challenge": "动态交互 — 按钮点击后页面局部更新"
+      },
+      {
+        "id": 8,
+        "action": "审批请假-拒绝",
+        "description": "找到列表中下一条待审批的请假申请，点击'拒绝'按钮，在弹出的模态框中填写拒绝理由'当前项目进度紧张，建议另选时间'，点击'确认拒绝'",
+        "expected_state": "该请假申请状态变为'已拒绝'，拒绝理由已保存",
+        "challenge": "模态框交互 — 需在模态框中填写文本并确认"
+      },
+      {
+        "id": 9,
+        "action": "提交请假申请",
+        "description": "点击'提交请假申请'按钮进入请假表单页。选择请假类型为'年假'，开始日期为明天，结束日期为后天，原因填写'家庭原因'，紧急联系人填写'张三: 13800138000'。点击提交",
+        "expected_state": "弹出提交成功模态框",
+        "challenge": "复杂表单 — 需正确填写多种表单元素（select/date/textarea/input）"
+      },
+      {
+        "id": 10,
+        "action": "查看考勤报表",
+        "description": "导航到报表中心，查看部门考勤报表，提取技术部2024年1月的平均出勤率",
+        "expected_state": "报表数据已加载，趋势图已渲染",
+        "extract_fields": ["tech_dept_jan_attendance_rate"]
+      },
+      {
+        "id": 11,
+        "action": "导出CSV报表",
+        "description": "点击'导出CSV'按钮，验证CSV文件下载",
+        "expected_state": "CSV文件已下载，包含所有部门的考勤数据",
+        "challenge": "文件下载 — 需处理浏览器下载行为"
+      },
+      {
+        "id": 12,
+        "action": "生成操作报告",
+        "description": "汇总所有步骤的操作结果，生成结构化报告（JSON + 可读文本），包含：各步骤完成状态、提取的所有数据、操作截图路径、异常记录",
+        "expected_state": "报告包含12步的完整执行记录，所有提取的数据字段完整"
+      }
+    ]
+  },
+  "evaluation_criteria": {
+    "task_completion": "12个步骤是否全部完成",
+    "form_interaction": "登录表单、请假表单、搜索框、筛选器是否正确填写和提交",
+    "popup_handling": "Cookie consent横幅、拒绝理由模态框、提交成功模态框是否正确处理",
+    "data_extraction": "仪表盘数据、员工信息、考勤数据是否完整提取",
+    "cross_page_state": "登录session是否跨页面保持，已收集数据是否在导航后仍然可用",
+    "error_recovery": "页面加载等待、元素不可见时的重试、网络延迟下的稳定性",
+    "screenshot_coverage": "关键操作是否有截图证据"
+  }
+}

@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}员工管理 - HR管理系统{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>员工列表</h2>
+  <div class="search-bar">
+    <input type="text" id="search-input" placeholder="搜索姓名/邮箱/职位...">
+    <select id="dept-filter"><option value="">全部部门</option></select>
+    <button class="btn btn-primary" onclick="loadEmployees(1)">搜索</button>
+    <button class="btn" onclick="clearFilters()">重置</button>
+    <span id="result-count" style="color:#999;font-size:13px;margin-left:auto"></span>
+  </div>
+  <div id="employee-table"><div class="loading">加载中...</div></div>
+  <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+var currentPage=1;
+fetch('/api/departments').then(r=>r.json()).then(function(d){
+  var sel=document.getElementById('dept-filter');
+  d.departments.forEach(function(dept){var o=document.createElement('option');o.value=dept.name;o.textContent=dept.name;sel.appendChild(o)});
+});
+function loadEmployees(page){
+  currentPage=page||1;
+  var search=document.getElementById('search-input').value;
+  var dept=document.getElementById('dept-filter').value;
+  var url='/api/employees?page='+currentPage+'&per_page=10';
+  if(search)url+='&search='+encodeURIComponent(search);
+  if(dept)url+='&department='+encodeURIComponent(dept);
+  document.getElementById('employee-table').innerHTML='<div class="loading">加载中...</div>';
+  fetch(url).then(r=>r.json()).then(function(d){
+    document.getElementById('result-count').textContent='共 '+d.total+' 条记录';
+    if(d.employees.length===0){document.getElementById('employee-table').innerHTML='<div class="loading">暂无数据</div>';document.getElementById('pagination').innerHTML='';return}
+    var html='<table><thead><tr><th>ID</th><th>姓名</th><th>性别</th><th>部门</th><th>职位</th><th>入职日期</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    d.employees.forEach(function(e){
+      var badge=e.status==='active'?'badge-active':'badge-inactive';
+      var statusText=e.status==='active'?'在职':'离职';
+      html+='<tr><td>'+e.id+'</td><td>'+e.name+'</td><td>'+e.gender+'</td><td>'+e.department_name+'</td><td>'+e.position+'</td><td>'+e.hire_date+'</td><td><span class="badge '+badge+'">'+statusText+'</span></td><td><a href="/employees/'+e.id+'">查看详情</a></td></tr>';
+    });
+    html+='</tbody></table>';
+    document.getElementById('employee-table').innerHTML=html;
+    var pHtml='';
+    pHtml+='<button '+(d.page<=1?'disabled':'')+' onclick="loadEmployees('+(d.page-1)+')">上一页</button>';
+    for(var i=1;i<=d.total_pages;i++){pHtml+='<button class="'+(i===d.page?'active':'')+'" onclick="loadEmployees('+i+')">'+i+'</button>'}
+    pHtml+='<button '+(d.page>=d.total_pages?'disabled':'')+' onclick="loadEmployees('+(d.page+1)+')">下一页</button>';
+    document.getElementById('pagination').innerHTML=pHtml;
+  });
+}
+function clearFilters(){document.getElementById('search-input').value='';document.getElementById('dept-filter').value='';loadEmployees(1)}
+document.getElementById('search-input').addEventListener('keydown',function(e){if(e.key==='Enter')loadEmployees(1)});
+loadEmployees(1);
+</script>
+{% endblock %}

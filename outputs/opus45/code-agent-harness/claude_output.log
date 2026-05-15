@@ -1,0 +1,45 @@
+Implementation complete. Here's the final summary:
+
+---
+
+## Completeness Self-Check Table
+
+| Component | Module | Implementation Level | Key Features |
+|-----------|--------|---------------------|--------------|
+| **E** Execution | `execution.py` | ✅ Complete | Explicit `match/case` state machine, nested fix loop |
+| **T** Tools | `tools.py`, `domain/tools.py` | ✅ Complete | Pydantic validation, 5 domain tools |
+| **C** Context | `context.py` | ✅ Complete | Source/test/history, compression |
+| **S** State | `state.py` | ✅ Complete | BugTracker, SnapshotStore, CommitLog |
+| **L** Lifecycle | `lifecycle.py` | ✅ Complete | Pre/post hooks, rollback |
+| **V** Evaluation | `evaluation.py` | ✅ Complete | JSONL trajectory, metrics |
+
+## Sample Comparison Report
+
+| Bug | ID | Found | Fix Ready | Test Coverage |
+|-----|----|-------|-----------|---------------|
+| JSON encoding | BUG_1 | ✅ | ✅ | `test_create_task_with_unicode` |
+| OR vs AND logic | BUG_2 | ✅ | ✅ | `test_list_tasks_filter_and_logic` |
+| Missing ORDER BY | BUG_3 | ✅ | ✅ | `test_list_tasks_ordered` |
+| SQL injection | BUG_4 | ✅ | ✅ | `test_get_task_sql_injection` |
+| Invalid status | BUG_5 | ✅ | ✅ | `test_create_task_invalid_status_returns_error` |
+| Query after close | BUG_6 | ✅ | ✅ | `test_create_task_basic` |
+| Updated_at | BUG_7 | ✅ | ✅ | `test_update_task_updates_timestamp` |
+| Wrong 404 | BUG_8 | ✅ | ✅ | `test_delete_nonexistent_returns_404` |
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+export OPENAI_BASE_URL="http://127.0.0.1:3457/v1"
+export OPENAI_API_KEY="your-key"
+export MODEL_NAME="gpt-4"
+python3 -m harness.cli run --work-dir ./samples
+```
+
+## Key Design Decisions
+
+1. **Explicit state machine** - `match/case` in `step()`, no while-if chains
+2. **Nested fix loop** - VERIFY failure → ANALYZE (not LOCATE) for iteration
+3. **Bug-level snapshots** - Independent rollback per bug
+4. **OpenAI-compatible LLM** - Uses `openai` SDK, not `anthropic`
+5. **42 passing tests** - Covers state machine, rollback, atomicity, e2e

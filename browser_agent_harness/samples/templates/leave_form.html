@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}提交请假 - HR管理系统{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px"><a href="/leave-requests">← 返回请假管理</a></div>
+<div class="card">
+  <h2>提交请假申请</h2>
+  <form id="leave-form" onsubmit="return submitLeave(event)" style="max-width:500px">
+    <div class="form-group">
+      <label for="leave-type">请假类型 <span style="color:#ff4d4f">*</span></label>
+      <select id="leave-type" required>
+        <option value="">请选择</option>
+        <option value="年假">年假</option>
+        <option value="病假">病假</option>
+        <option value="事假">事假</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="start-date">开始日期 <span style="color:#ff4d4f">*</span></label>
+      <input type="date" id="start-date" required>
+    </div>
+    <div class="form-group">
+      <label for="end-date">结束日期 <span style="color:#ff4d4f">*</span></label>
+      <input type="date" id="end-date" required>
+    </div>
+    <div class="form-group">
+      <label for="reason">请假原因 <span style="color:#ff4d4f">*</span></label>
+      <textarea id="reason" rows="3" placeholder="请填写请假原因..." required></textarea>
+    </div>
+    <div class="form-group">
+      <label for="emergency">紧急联系人</label>
+      <input type="text" id="emergency" placeholder="姓名 + 电话">
+    </div>
+    <div id="form-error" class="error" style="margin-bottom:12px"></div>
+    <button type="submit" class="btn btn-primary" id="submit-btn" style="width:100%;padding:10px">提交申请</button>
+  </form>
+</div>
+
+<div class="modal-overlay" id="success-modal">
+  <div class="modal">
+    <h3 style="color:#52c41a">✓ 提交成功</h3>
+    <p>您的请假申请已提交，等待管理员审批。</p>
+    <div class="modal-actions">
+      <a href="/leave-requests" class="btn btn-primary">查看请假列表</a>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function submitLeave(e){
+  e.preventDefault();
+  var err=document.getElementById('form-error');
+  err.textContent='';
+  var data={
+    leave_type:document.getElementById('leave-type').value,
+    start_date:document.getElementById('start-date').value,
+    end_date:document.getElementById('end-date').value,
+    reason:document.getElementById('reason').value,
+    emergency_contact:document.getElementById('emergency').value
+  };
+  if(!data.leave_type||!data.start_date||!data.end_date||!data.reason){err.textContent='请填写所有必填字段';return false}
+  if(data.end_date<data.start_date){err.textContent='结束日期不能早于开始日期';return false}
+  var btn=document.getElementById('submit-btn');
+  btn.disabled=true;btn.textContent='提交中...';
+  fetch('/api/leave-requests',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+  .then(r=>r.json().then(d=>({ok:r.ok,data:d})))
+  .then(function(res){
+    btn.disabled=false;btn.textContent='提交申请';
+    if(res.ok){document.getElementById('success-modal').classList.add('active')}
+    else{err.textContent=res.data.error||'提交失败'}
+  })
+  .catch(function(){btn.disabled=false;btn.textContent='提交申请';err.textContent='网络错误，请重试'});
+  return false;
+}
+</script>
+{% endblock %}

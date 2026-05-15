@@ -1,3 +1,10 @@
 __pycache__/
-outputs/
+*.pyc
+.DS_Store
 config.yaml
+config_*.yaml
+hr_mock.db
+*.db
+venv/
+.venv/
+node_modules/

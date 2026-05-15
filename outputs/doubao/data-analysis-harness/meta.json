@@ -1,0 +1,12 @@
+{
+  "task_id": "data-analysis-harness",
+  "status": "success",
+  "stdout": "(recovered from workspace)",
+  "stderr": "",
+  "metrics": {
+    "total_requests": 247,
+    "total_input_tokens": 11825152,
+    "total_output_tokens": 33026,
+    "total_tokens": 11858178
+  }
+}

@@ -1,0 +1,52 @@
+The project is complete. Let me provide a final summary:
+
+---
+
+## Research Agent Harness - Implementation Complete
+
+### Summary
+
+I've built a complete research agent harness with the formal six-component architecture **H = (E, T, C, S, L, V)**:
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **E** | `execution.py` | 10-state machine with multi-hop search (max 3 hops) |
+| **T** | `tools.py` | Rate-limited tool registry with retry |
+| **C** | `context.py` | 3-layer context (evidence, outline, query history) |
+| **S** | `state.py` | Evidence store, citation mapper, draft manager |
+| **L** | `lifecycle.py` | Quality hooks (dedup, filtering, validation) |
+| **V** | `evaluation.py` | JSONL trajectory for full traceability |
+
+### Test Results
+
+```
+57 tests passed in 0.18s
+- test_multi_hop.py (9 tests) - Multi-hop termination conditions
+- test_citation_integrity.py (12 tests) - Citation consistency
+- test_evidence_tracking.py (16 tests) - Evidence traceability  
+- test_e2e.py (20 tests) - End-to-end integration
+```
+
+### Quick Start
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:3457/v1"
+export OPENAI_API_KEY="your-key"
+export MODEL_NAME="gpt-4"
+
+python -m harness.cli samples/research_questions.json -o report.md
+```
+
+### Key Design Decisions
+
+1. **Multi-hop limit = 3** - Balances completeness vs cost
+2. **Source scoring**: `0.4×reliability + 0.4×relevance + 0.2×timeliness`
+3. **Context compression**: Demotes evidence below 0.5 relevance threshold
+4. **Citation format**: `作者(年份). 标题. 来源. URL`
+
+### Deliverables
+
+- `README.md` - Quick start guide
+- `DELIVERABLES.md` - Completeness checklist, comparison report, design decisions
+- Full test suite (57 tests)
+- CLI with `/sources`, `/gaps`, `/outline`, `/verify` commands
