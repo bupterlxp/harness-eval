@@ -62,16 +62,6 @@ python -c "from harness import execution, tools, context, state, lifecycle, eval
 python -m harness --help
 python -m pytest tests/ --co -q
 ```
-
-### 功能验证（下游任务）
-
-harness 将被用于在实际 Web 应用上执行多步骤任务，评测时关注：
-
-- 任务级流程与页面操作逻辑是否正确分离（外层推进时内层重置）
-- 弹窗出现时是否非阻塞处理后继续原任务
-- 跨页面是否正确累积已提取的数据
-- 操作失败时是否截图、重试、最终 graceful 退出
-- 断点续跑是否从正确的步骤恢复
 - DOM 是否被摘要压缩而非全文注入 prompt
 
 ---
