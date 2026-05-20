@@ -1,52 +1,31 @@
-# Agent Harness 构建任务：数据分析智能体（Data Analysis Agent）
+# 任务描述：数据分析智能体 Harness（Data Analysis Agent）
 
 构建一个通用的数据分析 harness，能接受数据文件和分析需求描述，自主完成数据探索、统计分析、可视化和报告生成。
 
----
-
-## 一、入口与输出
-
-```bash
-python -m harness -p "任务描述" --output-dir ./output/
-```
-
-- `-p`：自然语言任务描述（harness 自行解析并执行）
-- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
-- 工作目录中可能包含任务所需的数据文件等，harness 应自动发现并使用
-
-`result.json` 必须包含以下字段，其余字段可自行扩展：
-
-```python
-{
-    "status": str,       # "success" | "partial" | "failed"
-    "trajectory": str,   # JSONL trajectory 文件路径
-}
-```
+工作目录中可能包含任务所需的数据文件等，harness 应自动发现并使用。
 
 ---
 
-## 二、架构约束 H = (E, T, C, S, L, V)
+## 组件特化要求
 
-实现必须包含以下六个**可独立识别**的组件，对应模块名为 `execution`, `tools`, `context`, `state`, `lifecycle`, `evaluation`：
-
-| 组件 | 职责 | 硬性要求 |
-|------|------|----------|
-| **E** Execution Loop | 驱动分析流程 | 显式状态机。支持步骤回溯。状态间有明确的输入/输出 |
-| **T** Tool Registry | 注册分析工具 | 至少覆盖数据加载、统计计算、可视化生成能力，可自行扩展。每个工具声明输入输出类型 |
-| **C** Context Manager | 管理 LLM 上下文 | **禁止**将 DataFrame 全文转成字符串塞进 prompt。必须用 schema + 统计摘要代替 |
-| **S** State Store | 持久化分析状态 | 每步执行后 snapshot。支持 rollback 到任意步骤 |
-| **L** Lifecycle Hooks | 边界检查 | 至少覆盖：执行前检查数据非空、执行后验证输出合理性、绘图前检查数据量 |
-| **V** Evaluation | 结构化轨迹 | JSONL，每步记录：输入 shape、执行代码片段、输出 shape、生成的图表路径 |
+| 组件 | 本 harness 的特定要求 |
+|------|----------------------|
+| **E** | 支持步骤回溯。Plan-Code-Observe 循环：制定计划→生成代码→执行→观察结果→决定修正或推进 |
+| **T** | 至少覆盖：数据加载（CSV/Parquet/Excel）、统计计算、可视化生成（输出文件非 plt.show）。每个工具声明输入输出类型 |
+| **C** | 用 schema + df.describe() + df.head() 摘要代替 DataFrame 全文。图表以描述性文字代替原始数据。超大结果集仅展示前 N 行附总行数 |
+| **S** | 所有变量和 DataFrame 在步骤间持久化于同一命名空间。每步执行后 snapshot，支持 rollback 到任意步骤 |
+| **L** | 执行前检查数据非空且 schema 合理、执行后验证输出值在合理范围、绘图前检查数据量不超限 |
+| **V** | 每步记录：输入 shape、执行的代码片段、输出 shape/类型、生成的图表路径、执行耗时 |
 
 ---
 
-## 三、功能性质
+## 功能性质
 
 一个成熟的数据分析 harness 运行为有状态的执行会话，由编译后的处理节点图驱动。它维护一个共享状态对象，所有变量、DataFrame 和中间计算结果在步骤间持久化于同一线程——后续代码在相同命名空间中执行，可按名称引用任何先前产物。核心循环遵循 Plan-Code-Observe 模式：LLM 制定分析计划并分解为子任务，为当前步骤生成可执行的 Python（或 SQL），将其派发到沙箱执行器（带超时/内存限制的 Docker 容器或本地进程），然后检查 stdout、stderr、返回值和渲染的图表来决定是修正、重试还是推进。中间结果被注册到产物表中（记录 shape、dtypes、列摘要、图表路径），以压缩摘要形式注入上下文——绝不注入原始数据。多轮连续性通过双轨机制维护：对话历史提供叙事连贯性，状态快照（按线程 ID 索引）支持暂停-恢复和回滚。验证是分层的：对生成的查询做语义一致性检查，执行前做可行性评估，执行后做输出合理性检查。当执行失败或产生异常结果时，harness 重新进入生成节点而非中止，实现有界重试的自动修复循环。
 
 ---
 
-## 四、调用示例
+## 调用示例
 
 ### Case 1：电商用户群留存分析
 
@@ -124,20 +103,6 @@ python -m harness -p "基于 sales_history.csv 和 promotions.csv 为每个品�
 
 ---
 
-## 五、技术栈
+## 技术栈补充
 
-- Python 3.11+，type hints
-- LLM 调用：`openai` SDK，OpenAI 兼容接口。环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
 - 可用：pandas、matplotlib、seaborn、numpy、scipy、scikit-learn
-- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
-
----
-
-## 六、环境打包
-
-必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
-
-- 基于 `python:3.11-slim` 或同级官方镜像
-- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`），包括 pandas、matplotlib、seaborn、numpy、scipy 等
-- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
-- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
