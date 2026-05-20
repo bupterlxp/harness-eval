@@ -1,29 +1,36 @@
-# 任务描述：浏览器智能体 Harness（Browser Agent）
+# Agent Harness 构建任务：浏览器智能体（Browser Agent）
 
 构建一个通用的浏览器自动化 harness，能接受 Web 任务描述（导航、表单填写、数据提取、文件下载等），自主在浏览器中完成多步骤操作。
 
 ---
 
-## 组件特化要求
+## 一、入口与输出
 
-| 组件 | 本 harness 的特定要求 |
-|------|----------------------|
-| **E** | 分离任务级流程（子目标分解和推进）和单次页面操作逻辑。支持单步 retry 和 skip |
-| **T** | 至少覆盖：导航、元素交互（click/fill/select）、数据提取、截图、等待。所有操作前必须先等待元素就绪 |
-| **C** | 构建可访问性树摘要（每个可交互元素分配数字索引，裁剪不可见节点），禁止原始 DOM/HTML |
-| **S** | 维护子目标依赖图和完成状态。支持断点续跑：中途失败后从最后成功子目标恢复 |
-| **L** | 导航后自动等待加载完成、弹窗自动检测并非阻塞处理、超时时截图保存后重试 |
-| **V** | 每步记录：URL、操作类型、目标元素索引、操作结果、截图文件路径 |
+```bash
+python -m harness -p "任务描述" --output-dir ./output/
+```
+
+- `-p`：自然语言任务描述（harness 自行解析并执行）
+- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
+
+`result.json` 必须包含以下字段，其余字段可自行扩展：
+
+```python
+{
+    "status": str,       # "success" | "partial" | "failed"
+    "trajectory": str,   # JSONL trajectory 文件路径
+}
+```
 
 ---
 
-## 功能性质
+## 二、功能性质
 
 一个成熟的浏览器代理 harness 运行感知-思考-行动循环，作用于压缩的页面表示。它不摄入原始 DOM（通常 50k+ 节点），而是构建可访问性树摘要：每个可交互元素分配稳定的数字索引，不可见和装饰性节点被裁剪，将数万节点的 DOM 压缩为数百行结构化文本供 LLM 推理。每个循环中 agent 输出一个 JSON 动作（click/fill/scroll/navigate/extract/wait），harness 通过 CDP 或 Playwright 执行，等待 network-idle/element-ready 信号，然后捕获新的页面快照作为下一轮观察。跨页面状态通过持久任务记忆维护——已完成子目标的滚动摘要加当前目标——确保上下文不因页面切换丢失。复杂任务被分解为可变计划（3-10 个子目标）；每完成一个里程碑或遭遇失败后更新计划。动态内容通过显式等待谓词和退避重试处理；弹窗和模态框通过 DOM mutation 观察器检测并非阻塞地关闭后恢复主流程。动作失败时 agent 收到错误、重新获取快照并选择替代路径——对同一元素连续失败 2-3 次后升级策略（滚动可视、换选择器、返回上一页）。提取的数据跨步骤累积，任务完成时输出为结构化 JSON，附带 JSONL 轨迹和带时间戳的截图供审计。
 
 ---
 
-## 调用示例
+## 三、调用示例
 
 ### Case 1：跨站比价
 
@@ -94,7 +101,21 @@ python -m harness -p "在 github.com 检查 anthropics/claude-code 仓库是否�
 
 ---
 
-## 技术栈补充
+## 四、技术栈
 
+- Python 3.11+，type hints
+- LLM 调用：`openai` SDK，OpenAI 兼容接口。环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
 - 浏览器自动化：Playwright（推荐 async API）
-- Dockerfile 额外要求：`playwright install --with-deps chromium`
+- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
+
+---
+
+## 五、环境打包
+
+必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
+
+- 基于 `python:3.11-slim` 或同级官方镜像
+- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`）
+- 安装 Playwright 及其浏览器依赖（`playwright install --with-deps chromium`）
+- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
+- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
