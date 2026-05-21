@@ -1,0 +1,14 @@
+{
+  "task_id": "code-agent-harness",
+  "status": "timeout",
+  "stdout": "",
+  "stderr": "Task timed out",
+  "metrics": {
+    "total_requests": 273,
+    "total_input_tokens": 17082643,
+    "total_output_tokens": 76191,
+    "total_cache_read_tokens": 0,
+    "total_cache_creation_tokens": 0,
+    "total_tokens": 17158834
+  }
+}

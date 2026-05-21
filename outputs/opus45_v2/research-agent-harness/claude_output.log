@@ -1,0 +1,25 @@
+Research Agent Harness complete. Here's a summary:
+
+**Structure (H = (E, T, C, S, L, V)):**
+- `execution.py` - Execution Loop with explicit state machine and multi-hop support (`max_hops` termination)
+- `tools.py` - Tool Registry with search, extraction, evaluation tools with retry strategies
+- `context.py` - Context Manager for evidence/source-to-facts mapping with provenance
+- `state.py` - State Store for sources, facts, section drafts, citation mappings
+- `lifecycle.py` - Lifecycle Hooks for dedup, evidence checks, citation validation
+- `evaluation.py` - JSONL trajectory recording
+
+**Features:**
+- Query decomposition into atomic sub-queries
+- Web + academic search with parallel execution
+- Source credibility evaluation (high/medium/low)
+- Cross-source fact validation
+- Citation integrity checking (no orphaned citations)
+- Multi-hop retrieval with convergence detection
+- Report generation with inline citations + references
+
+**Usage:**
+```bash
+python -m harness -p "Research question" --output-dir ./output/
+```
+
+Outputs `result.json` with status, sources, citation integrity, gaps, and trajectory path.

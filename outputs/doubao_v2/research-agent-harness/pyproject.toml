@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "research-harness"
+version = "0.1.0"
+description = "A general-purpose deep research harness"
+authors = ["Harness Eval <eval@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+openai = "^1.0.0"
+httpx = "^0.24.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.4.0"
+black = "^23.0"
+flake8 = "^6.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

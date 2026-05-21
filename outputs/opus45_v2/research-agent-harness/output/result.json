@@ -1,0 +1,12 @@
+{
+  "status": "partial",
+  "report_path": "output/report.md",
+  "sources": [],
+  "citation_integrity": {
+    "total_citations": 0,
+    "orphaned": 0,
+    "unused": 0
+  },
+  "gaps": [],
+  "trajectory": "output/trajectory.jsonl"
+}

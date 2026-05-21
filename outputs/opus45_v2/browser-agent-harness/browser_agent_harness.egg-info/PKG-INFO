@@ -1,0 +1,20 @@
+Metadata-Version: 2.4
+Name: browser-agent-harness
+Version: 0.1.0
+Summary: A general-purpose browser automation harness for web task execution
+Author: Browser Agent Team
+License: MIT
+Keywords: browser,automation,agent,playwright,llm
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: playwright>=1.40.0
+Requires-Dist: openai>=1.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.0; extra == "dev"

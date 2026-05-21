@@ -1,0 +1,37 @@
+The Creative Writing Agent Harness is complete. Here's a summary of what was built:
+
+**Six Modular Components (H = E, T, C, S, L, V):**
+
+1. **execution.py (E)** - State machine driving the creative writing process through phases: INIT → PLANNING → GENERATING → CHECKING → REVISING → FINALIZING → COMPLETED
+
+2. **tools.py (T)** - Tool registry with:
+   - `parse_task` - Parse natural language prompts into TaskSpec
+   - `plan_plot` - Generate plot beats and scene breakdown
+   - `draft_scene` - Generate individual scenes with context injection
+   - `check_consistency` - Detect entity/style/timeline drift
+   - `revise_scene` - Fix consistency issues
+
+3. **context.py (C)** - Context manager with:
+   - StyleAnchor for voice consistency (prevents style drift)
+   - EntityTracker for character/object attributes (prevents reference drift)
+   - ImageryTracker for recurring motifs
+   - Scene context building with style anchor injection
+
+4. **state.py (S)** - State store with:
+   - Scene-level snapshots
+   - Rollback capability (rewrite scene N without affecting scenes 0..N-1)
+   - Persistence to JSON
+
+5. **lifecycle.py (L)** - Lifecycle hooks for:
+   - Pre-scene: Style anchor injection
+   - Post-scene: Consistency check triggering
+   - Timeout handling with draft saving
+
+6. **evaluation.py (V)** - JSONL trajectory recording of every step
+
+**Usage:**
+```bash
+python3 -m harness -p "Write a psychological thriller about a detective" --output-dir ./output/
+```
+
+**Output:** `result.json` with manuscript path, word count, outline, consistency issues, and trajectory file path.

@@ -1,0 +1,10 @@
+The harness is complete with all six required components:
+
+1. **execution.py** (E) - Explicit state machine with states: INIT → UNDERSTAND → LOCATE → PLAN → EDIT → VALIDATE → SUCCESS/FAILED, supporting nested retry loops and rollback
+2. **tools.py** (T) - Tool registry with schema validation for file read/write, repo scan, code search, command execution, diff generation
+3. **context.py** (C) - Context manager with file summarization, truncation, and token-aware compression (no full file content in prompts)
+4. **state.py** (S) - Persistent state store with snapshot/rollback, file backups, crash recovery from disk
+5. **lifecycle.py** (L) - Lifecycle hooks for start, backup, success, failure, error, rollback, timeout, and interrupt events
+6. **evaluation.py** (V) - JSONL trajectory recording with steps, tool calls, LLM calls, and analysis
+
+The CLI entry point accepts `-p` for task description and `--output-dir` for results, producing `result.json` that conforms to the specified schema.

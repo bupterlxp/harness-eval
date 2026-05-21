@@ -1,0 +1,44 @@
+The browser agent harness is complete. Here's a summary of what was built:
+
+## Browser Agent Harness - Complete
+
+### Architecture (H = (E, T, C, S, L, V))
+
+| Module | File | Purpose |
+|--------|------|---------|
+| **E** Execution | `execution.py` | Explicit state machine with task-level flow and single-operation logic separation |
+| **T** Tools | `tools.py` | 25+ browser tools (navigate, click, type, extract, screenshot, wait, etc.) |
+| **C** Context | `context.py` | Accessibility tree summarization - never injects full DOM into prompts |
+| **S** State | `state.py` | Task state persistence with checkpoint/resume support |
+| **L** Lifecycle | `lifecycle.py` | Page event handling, non-blocking popup/dialog dismissal |
+| **V** Evaluation | `evaluation.py` | JSONL trajectory recording |
+
+### CLI Interface
+```bash
+python -m harness -p "task description" --output-dir ./output/
+```
+
+### Output Format (result.json)
+```python
+{
+    "status": "success" | "partial" | "failed",
+    "extracted_data": {...},
+    "screenshots": [...],
+    "downloads": [...],
+    "errors": [...],
+    "trajectory": "path/to/trajectory.jsonl"
+}
+```
+
+### Key Features
+- Semantic element selection (aria-label, placeholder, text content)
+- Automatic wait before all operations
+- Non-blocking cookie banner/modal handling
+- Retry with exponential backoff (max 3 retries per step)
+- Resume from last successful checkpoint
+- JSONL trajectory for every action
+- No full DOM in prompts - uses accessibility tree summary
+
+### Validation
+- 122 tests passing
+- All structural requirements verified
