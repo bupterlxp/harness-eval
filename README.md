@@ -134,3 +134,53 @@ outputs/
 |------|------|------|
 | Claude Opus 4.5 | 万卿平台 | 稳定，极少重试 |
 | Doubao-Seed-2.0-Mini | 万卿平台 | 频繁 429 限流，retry 过滤有效 |
+
+## 评测样例对比
+
+以 `code_agent_harness.md` 同一份 prompt 为例，对比两个模型生成 harness 的质量：
+
+### Claude Opus 4.5
+
+完整实现 ETCSLV 六组件架构，生成可运行的 agent harness：
+
+```
+harness/
+├── __main__.py      # CLI 入口（argparse: -p, --output-dir, --max-steps）
+├── execution.py     # 显式状态机（ExecutionState enum + STATE_TRANSITIONS dict）
+├── tools.py         # 7 工具注册（glob, grep, read_file, write_file, edit_file, shell, list_dir）
+├── context.py       # TokenBudget 截断 + 对话压缩
+├── state.py         # AgentState dataclass + snapshot/rollback
+├── lifecycle.py     # 13 个生命周期事件 + register/trigger
+└── evaluation.py    # JSONL 轨迹记录 + EvaluationMetrics 聚合
+```
+
+关键实现特征：
+- LLM 驱动的自主执行循环（OpenAI chat completions + tool_choice=auto）
+- edit_file 带唯一性守卫（old_string 必须在文件中唯一匹配）
+- shell 工具带 timeout 和 exit_code 捕获
+- 状态转移有合法性校验（`can_transition()` 检查）
+- 每 5 步自动 checkpoint
+
+效率指标：13 次有效请求，121K input / 14.6K output tokens
+
+### Doubao-Seed-2.0-Mini
+
+仅生成单文件壳代码，不具备实际执行能力：
+
+```
+harness/
+└── __main__.py      # 单文件 ~260 行，所有逻辑内联
+```
+
+主要问题：
+- **无 LLM 调用** — 注释写着 `# in a real implementation, this would use an LLM`，用 if-else 硬编码任务分支
+- **无状态机** — 线性执行，无重试/恢复机制
+- **无 tool registry** — 工具方法直接写在 Harness 类里，无 JSON schema
+- **无上下文管理** — 无 token budget、无对话压缩
+- 生成的 `src/` 目录是示例假代码，非 harness 组件
+
+效率指标：22 次有效请求（34 次 429 重试），465K input / 5.2K output tokens
+
+### 结论
+
+该评测任务（从 prompt 生成完整 agent harness）要求模型具备：跨文件架构一致性理解、LLM 工具调用范式知识、状态机设计能力。弱模型即使能理解接口规范（CLI 格式、trajectory 输出），也无法实现核心的 LLM 驱动执行循环。
