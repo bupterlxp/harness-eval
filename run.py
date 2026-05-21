@@ -184,6 +184,10 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
                 "total_cache_read_tokens": metrics.get("total_cache_read_tokens", 0),
                 "total_cache_creation_tokens": metrics.get("total_cache_creation_tokens", 0),
                 "total_tokens": metrics.get("total_input_tokens", 0) + metrics.get("total_output_tokens", 0),
+                "effective_requests": metrics.get("effective_requests", 0),
+                "effective_input_tokens": metrics.get("effective_input_tokens", 0),
+                "effective_output_tokens": metrics.get("effective_output_tokens", 0),
+                "retry_requests": metrics.get("retry_requests", 0),
             }
         except (json.JSONDecodeError, KeyError):
             pass

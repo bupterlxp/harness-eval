@@ -16,6 +16,10 @@ const metrics = {
   total_output_tokens: 0,
   total_cache_read_tokens: 0,
   total_cache_creation_tokens: 0,
+  effective_requests: 0,
+  effective_input_tokens: 0,
+  effective_output_tokens: 0,
+  retry_requests: 0,
   usage_source: 'none', // 'api' if real usage found, 'estimated' if fallback
   requests: [],
 };
@@ -164,7 +168,8 @@ const server = http.createServer((req, res) => {
 
       const proxy = http.request(options, (proxyRes) => {
         const chunks = [];
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+        const statusCode = proxyRes.statusCode;
+        res.writeHead(statusCode, proxyRes.headers);
         proxyRes.on('data', (chunk) => {
           chunks.push(chunk);
           res.write(chunk);
@@ -180,11 +185,26 @@ const server = http.createServer((req, res) => {
             if (usage.source === 'none') usage.source = 'estimated';
           }
 
+          // Detect retry/failed requests:
+          // - HTTP error status (4xx/5xx)
+          // - No output tokens AND no API-reported usage (likely API failure)
+          const isRetry = statusCode >= 400 ||
+            (usage.output_tokens === 0 && usage.source !== 'api');
+
           metrics.total_requests += 1;
           metrics.total_input_tokens += usage.input_tokens;
           metrics.total_output_tokens += usage.output_tokens;
           metrics.total_cache_read_tokens += usage.cache_read_tokens;
           metrics.total_cache_creation_tokens += usage.cache_creation_tokens;
+
+          if (isRetry) {
+            metrics.retry_requests += 1;
+          } else {
+            metrics.effective_requests += 1;
+            metrics.effective_input_tokens += usage.input_tokens;
+            metrics.effective_output_tokens += usage.output_tokens;
+          }
+
           if (usage.source === 'api') metrics.usage_source = 'api';
           else if (metrics.usage_source === 'none') metrics.usage_source = 'estimated';
 
@@ -192,6 +212,8 @@ const server = http.createServer((req, res) => {
             seq: metrics.total_requests,
             timestamp: new Date().toISOString(),
             elapsed_ms: elapsed,
+            status_code: statusCode,
+            is_retry: isRetry,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
@@ -199,7 +221,8 @@ const server = http.createServer((req, res) => {
             source: usage.source,
           });
 
-          console.log(`[req #${metrics.total_requests}] ${elapsed}ms | in=${usage.input_tokens} out=${usage.output_tokens} (${usage.source})`);
+          const retryTag = isRetry ? ' [RETRY]' : '';
+          console.log(`[req #${metrics.total_requests}] ${elapsed}ms | in=${usage.input_tokens} out=${usage.output_tokens} (${usage.source})${retryTag}`);
           res.end();
         });
       });
