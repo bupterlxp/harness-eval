@@ -271,6 +271,35 @@ outputs/
 
 ---
 
+## Metrics 统计
+
+每个任务运行时，`model-proxy.js` 作为透明代理拦截所有 LLM 请求，自动生成 `metrics.json`：
+
+```json
+{
+  "total_requests": 56,
+  "total_input_tokens": 781927,
+  "total_output_tokens": 5186,
+  "effective_requests": 22,
+  "effective_input_tokens": 465460,
+  "effective_output_tokens": 5186,
+  "retry_requests": 34,
+  "requests": [...]
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `total_*` | 包含所有请求（含重试）的原始计数 |
+| `effective_*` | 排除重试后的有效计数（用于评估真实效率） |
+| `retry_requests` | 被识别为重试的请求数 |
+
+**重试识别规则**：HTTP 状态码 >= 400（如 429 限流），或响应中无 API 报告的 usage 且 output_tokens=0。这避免了因 API 不稳定（如豆包频繁 429）导致的 token 统计膨胀。
+
+`requests` 数组记录每次请求的详细信息：时间戳、HTTP 状态码、input/output tokens、模型名称、是否为重试。可用于分析请求分布、识别限流模式、计算有效利用率。
+
+---
+
 ## 项目结构
 
 ```
