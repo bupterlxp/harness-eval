@@ -3,6 +3,8 @@ __pycache__/
 .DS_Store
 config.yaml
 config_*.yaml
+secrets*.env
+*.local.env
 hr_mock.db
 *.db
 venv/

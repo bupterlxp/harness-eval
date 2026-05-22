@@ -345,13 +345,12 @@ def _commands_for_domain(
     output_dir: Path,
 ) -> list[list[str]]:
     sample_dir = harness_workspace / "samples"
-    commands: list[list[str]] = [
-        [python_bin, "-m", "harness", "-p", prompt, "--output-dir", str(output_dir)],
-        [python_bin, "-m", "harness.cli", "-p", prompt, "--output-dir", str(output_dir)],
-    ]
+    commands: list[list[str]] = []
     if domain == "writing":
         commands.extend(
             [
+                [python_bin, "-m", "harness", "-p", prompt, "--output-dir", str(output_dir)],
+                [python_bin, "-m", "harness.cli", "-p", prompt, "--output-dir", str(output_dir)],
                 [python_bin, "-m", "harness", prompt, "--output", str(output_dir / "response.md")],
                 [python_bin, "-m", "harness", prompt, "--auto-approve"],
                 [python_bin, "-m", "harness.cli", prompt, "--output", str(output_dir / "response.md")],
@@ -361,8 +360,35 @@ def _commands_for_domain(
     elif domain == "data_analysis":
         data_candidates = sorted(task_work_dir.rglob("*.csv")) + sorted(task_work_dir.rglob("*.sqlite"))
         data_file = data_candidates[0] if data_candidates else sample_dir / "sales_data.csv"
+        max_turns = os.environ.get("HARNESS_EVAL_DATA_MAX_TURNS", "8")
         commands.extend(
             [
+                [
+                    python_bin,
+                    "-m",
+                    "harness",
+                    "-p",
+                    prompt,
+                    "--workdir",
+                    str(task_work_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--max-turns",
+                    max_turns,
+                ],
+                [
+                    python_bin,
+                    "-m",
+                    "harness.cli",
+                    "-p",
+                    prompt,
+                    "--workdir",
+                    str(task_work_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--max-turns",
+                    max_turns,
+                ],
                 [python_bin, "-m", "harness", str(data_file), "--goal", prompt, "--auto-run", "--output", str(output_dir)],
                 [python_bin, "-m", "harness.cli", str(data_file), "--goal", prompt, "--auto-run", "--output", str(output_dir)],
                 [
@@ -383,6 +409,8 @@ def _commands_for_domain(
     elif domain == "code":
         commands.extend(
             [
+                [python_bin, "-m", "harness", "-p", prompt, "--output-dir", str(output_dir)],
+                [python_bin, "-m", "harness.cli", "-p", prompt, "--output-dir", str(output_dir)],
                 [
                     python_bin,
                     "-m",
@@ -502,6 +530,9 @@ def _commands_for_domain(
             ]
         )
     elif domain == "research":
+        max_steps = os.environ.get("HARNESS_EVAL_RESEARCH_MAX_STEPS", "8")
+        breadth = os.environ.get("HARNESS_EVAL_RESEARCH_BREADTH", "2")
+        depth = os.environ.get("HARNESS_EVAL_RESEARCH_DEPTH", "1")
         task_json = output_dir / "research_task.json"
         write_json(
             task_json,
@@ -518,6 +549,36 @@ def _commands_for_domain(
         )
         commands.extend(
             [
+                [
+                    python_bin,
+                    "-m",
+                    "harness",
+                    "-p",
+                    prompt,
+                    "--output-dir",
+                    str(output_dir),
+                    "--max-steps",
+                    max_steps,
+                    "--breadth",
+                    breadth,
+                    "--depth",
+                    depth,
+                ],
+                [
+                    python_bin,
+                    "-m",
+                    "harness.cli",
+                    "-p",
+                    prompt,
+                    "--output-dir",
+                    str(output_dir),
+                    "--max-steps",
+                    max_steps,
+                    "--breadth",
+                    breadth,
+                    "--depth",
+                    depth,
+                ],
                 [
                     python_bin,
                     "-m",
@@ -539,9 +600,18 @@ def _commands_for_domain(
         scenario = sample_dir / "task_scenarios.json"
         commands.extend(
             [
+                [python_bin, "-m", "harness", "-p", prompt, "--output-dir", str(output_dir)],
+                [python_bin, "-m", "harness.cli", "-p", prompt, "--output-dir", str(output_dir)],
                 [python_bin, "-m", "harness", str(scenario), "--headless"],
                 [python_bin, "-m", "harness", "--scenario", str(scenario), "--headless"],
                 [python_bin, "-m", "harness", "--demo", "--headless"],
+            ]
+        )
+    else:
+        commands.extend(
+            [
+                [python_bin, "-m", "harness", "-p", prompt, "--output-dir", str(output_dir)],
+                [python_bin, "-m", "harness.cli", "-p", prompt, "--output-dir", str(output_dir)],
             ]
         )
     return commands
@@ -578,6 +648,10 @@ def run_generated_harness(
         env.setdefault("OPENAI_BASE_URL", env.get("SEED2LITE_BASE_URL", env.get("BASE_URL", "")))
         env.setdefault("OPENAI_API_KEY", env.get("SEED2LITE_API_KEY", env.get("API_KEY", "")))
         env.setdefault("MODEL_NAME", env.get("SEED2LITE_MODEL_ID", env.get("MODEL_ID", "")))
+        if env.get("SERPER_KEY_ID") and not env.get("SERPER_API_KEY"):
+            env["SERPER_API_KEY"] = env["SERPER_KEY_ID"]
+        if env.get("SEARCH_API_KEY") and not env.get("SERPER_API_KEY"):
+            env["SERPER_API_KEY"] = env["SEARCH_API_KEY"]
         if domain == "research":
             env["HARNESS_EVAL_ENABLE_REAL_SEARCH"] = "1"
             env.setdefault("HARNESS_EVAL_RESEARCH_MAX_QUERIES", "2")

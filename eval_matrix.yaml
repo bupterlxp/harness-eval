@@ -57,6 +57,8 @@ benchmarks:
       - [SEED2LITE_API_KEY, API_KEY]
     task_ids: [dacomp-001]
     threads: 1
+    harness_timeout: 900
+    judge_timeout: 240
     default_subset: "dacomp-001"
 
   - id: writing_bench
@@ -97,6 +99,7 @@ benchmarks:
     search_provider: "SERPER_KEY_ID/TAVILY_API_KEY/SEARCH_API_KEY preferred; Bing/DuckDuckGo HTML fallback for local one-task bring-up"
     max_search_queries: 2
     n_limit: 1
+    harness_timeout: 900
     default_subset: "1 text-only HLE-style task"
 
   - id: browsecomp
@@ -110,15 +113,18 @@ benchmarks:
     search_provider: "SERPER_KEY_ID/TAVILY_API_KEY/SEARCH_API_KEY preferred; Bing/DuckDuckGo HTML fallback for local one-task bring-up"
     max_search_queries: 2
     n_limit: 1
+    harness_timeout: 900
     default_subset: "1 question"
 
   - id: the_agent_company
     name: TheAgentCompany
     domain: browser
-    runner: unsupported
+    runner: the_agent_company_generated
     required_paths:
       - harness_house/benchmarks/legacy/the_agent_company/run_infer.py
     required_executables:
       - docker
-    unsupported_reason: "TheAgentCompany runner expects OpenHands agent config plus service stack; generated browser harness needs an OpenHands/browser-agent adapter."
-    default_subset: "1 task image"
+    task_image_name: ghcr.io/theagentcompany/admin-arrange-meeting-rooms-image:1.0.0
+    server_hostname: host.docker.internal
+    service_health_url: http://localhost:2999/api/healthcheck/rocketchat
+    default_subset: "admin-arrange-meeting-rooms"

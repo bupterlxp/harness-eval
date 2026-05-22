@@ -49,9 +49,13 @@ fi
 
 cd /workspace
 
-git init -q
-git add -A
-git commit -q -m "initial" --allow-empty
+rm -rf .git
+if git init -q && git add -A && git commit -q -m "initial" --allow-empty; then
+    echo "git workspace initialized."
+else
+    echo "warning: git workspace initialization failed; continuing without an initial commit." >&2
+    rm -rf .git
+fi
 
 echo "=== Starting ccr service ==="
 ccr start &

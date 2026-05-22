@@ -405,10 +405,100 @@ python3.12 run_creation_eval.py \
 | `eqbench3` | `eqbench3` | 复用现有 EQ-Bench3/Kimi-writer wrapper，并将 `KIMI_WRITER_PATH` 指向 generated harness adapter。 |
 | `deepresearch_bench` | `deepresearch_generated` | 用本地 HLE-style task，generated research harness 产出 answer，再用 short-answer judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
 | `browsecomp` | `browsecomp_generated` | 下载 OpenAI simple-evals BrowseComp encrypted CSV，解密一条题，generated research harness 回答，再用 judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
+| `the_agent_company` | `the_agent_company_generated` | 将 generated browser harness 接到 TheAgentCompany task image；需要官方服务栈先在本机或远端启动，包括 RocketChat、ownCloud、GitLab、Plane 等服务。 |
 
 Research 类 BMK 不接受 generated harness 自带的 mock/LLM-simulated search 作为正式分数。adapter 会在临时运行目录中给 generated research harness 注入真实联网搜索工具：有 Serper/Tavily/API key 时走 API provider，没有 key 时走 Bing/DuckDuckGo HTML fallback。论文级稳定复现实验建议配置正式 search API key；本地一两条任务验证可以先用 fallback。
 
 本地单样本验证目标是让每个可运行 BMK 产出真实 summary score，而不是 full run。写作类评测只保留 `writing_bench` 和 `eqbench3`。`mle_bench` 的代码路径已接通，但真跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data。
+
+### 非代码四类 harness 的单任务验证命令
+
+生成端和评测端都已经参数化。下面示例用 `claude-code` 作为 meta harness，后端 generation LLM 和 eval LLM 都走 OpenRouter 的 Opus 4.7 最强推理档。把 `--model-name`、`--eval-model-name` 或 `--meta-harness` 替换即可切换到 GPT5.5、Seed2.0、Qwen3.7、Gemini3.1、K2.6、GLM5.1、Claude4.7 或 Codex 路径。
+
+```bash
+# 生成四类非代码 harness
+python3 run.py \
+  --run-id noncode-opus47-max \
+  --meta-harness claude-code \
+  --base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --api-key "$OPENROUTER_API_KEY" \
+  --model-name "anthropic/claude-opus-4.7" \
+  --claude-model-name claude-sonnet-4-6 \
+  --reasoning-effort max \
+  --task-id data-analysis-harness,writing-harness,research-agent-harness,browser-agent-harness
+```
+
+也可以直接对已经生成好的目录跑 downstream BMK。建议用环境变量传 key，避免把 key 留在 shell history 或进程列表里：
+
+```bash
+export EVAL_API_KEY="$OPENROUTER_API_KEY"
+```
+
+然后执行：
+
+```bash
+# Writing：Writing-bench + EQbench3，各 1 个任务
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-opus47-max-final-20260523 \
+  --domain writing \
+  --bench writing_bench,eqbench3 \
+  --run-id noncode-writing-opus47-eval \
+  --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+
+# Data：MLE-bench + DAComp；MLE 需要 Kaggle credential 和 prepared data，DAComp 可直接跑单任务
+HARNESS_EVAL_DATA_MAX_TURNS=8 .venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-opus47-max-final-20260523 \
+  --domain data_analysis \
+  --bench all \
+  --run-id noncode-data-opus47-eval \
+  --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+
+# Research：DeepResearch bench + BrowseComp，各 1 个任务
+HARNESS_EVAL_RESEARCH_MAX_STEPS=8 \
+HARNESS_EVAL_RESEARCH_BREADTH=2 \
+HARNESS_EVAL_RESEARCH_DEPTH=1 \
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-opus47-max-final-20260523 \
+  --domain research \
+  --bench deepresearch_bench,browsecomp \
+  --run-id noncode-research-opus47-eval \
+  --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+
+# Browser / Digital Employee：TheAgentCompany
+# 需要先启动官方服务栈。服务健康检查地址：
+#   http://localhost:2999/api/healthcheck/rocketchat
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-opus47-max-final-20260523 \
+  --domain browser \
+  --bench the_agent_company \
+  --run-id noncode-browser-opus47-eval \
+  --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+```
+
+当前本机验证记录：
+
+| Run ID | 结果 |
+|---|---|
+| `noncode-writing-opus47-eval-20260523` | `writing_bench` 和 `eqbench3` 均真实运行成功。 |
+| `noncode-data-opus47-eval-20260523` | `dacomp` 真实运行成功；`mle_bench` 因缺 Kaggle credential 和 prepared data 被结构化标记为 `skipped/missing_dependency`。 |
+| `noncode-research-opus47-eval-20260523` | `deepresearch_bench` 和 `browsecomp` 均真实运行成功。 |
+| `noncode-browser-opus47-eval-20260523` | 代码链路已接到 TheAgentCompany runner；本机服务栈未启动，因此结构化标记为 `skipped/missing_dependency`。 |
+
+TheAgentCompany 官方服务栈启动命令：
+
+```bash
+curl -fsSL https://github.com/TheAgentCompany/the-agent-company-backup-data/releases/download/setup-script-20241208/setup.sh | sh
+```
+
+注意：该脚本会拉取多个大型 Docker 镜像，并使用 `--network host` 启动 `api-server`。在 macOS Docker Desktop 上，`servers-gitlab` 镜像压缩层约 11.9GB，本机实测在 GitLab 镜像大层下载阶段可能长时间无进度输出。论文级或连续实验建议放到 Linux 开发机执行 TheAgentCompany。
 
 ### 任务格式（tasks.jsonl）
 

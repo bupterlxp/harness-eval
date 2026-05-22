@@ -9,6 +9,8 @@ import re
 import shutil
 import sqlite3
 import statistics
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -277,6 +279,17 @@ def _read_adapter_response(result: HarnessRunResult) -> str:
     if result.stdout_path and Path(result.stdout_path).exists():
         return Path(result.stdout_path).read_text(encoding="utf-8", errors="replace")
     return ""
+
+
+def _http_head_ok(url: str, timeout: float = 5.0) -> tuple[bool, str]:
+    request = urllib.request.Request(url, method="HEAD")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= int(response.status) < 400, f"http_status={response.status}"
+    except urllib.error.HTTPError as exc:
+        return 200 <= int(exc.code) < 400, f"http_status={exc.code}"
+    except Exception as exc:  # noqa: BLE001 - dependency probe result is surfaced
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def _load_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -726,9 +739,65 @@ def run_eqbench3(
             "HARNESS_EVAL_PYTHON": python_bin,
         }
     )
-    script = writing_root / "scripts" / "run_eqbench_kimi_smoke.sh"
     scenarios = str(entry.get("default_subset", "1"))
-    cmd_result = run_command(["bash", str(script), scenarios], cwd=writing_root, env=env, timeout=timeout)
+    eqbench_python = writing_root / ".venv" / "bin" / "python"
+    python_for_eqbench = str(eqbench_python) if eqbench_python.exists() else python_bin
+    eqbench_root = writing_root / "third_party" / "eqbench3"
+    model_id = (
+        env.get("MODEL_ID")
+        or env.get("SEED2LITE_CODE_MODEL_ID")
+        or env.get("SEED2LITE_MODEL_ID")
+        or env.get("MODEL_NAME")
+        or "generated-harness-model"
+    )
+    env.update(
+        {
+            "MOONSHOT_API_KEY": env.get("MOONSHOT_API_KEY") or env.get("SEED2LITE_API_KEY") or env.get("API_KEY", ""),
+            "MOONSHOT_BASE_URL": env.get("MOONSHOT_BASE_URL") or env.get("SEED2LITE_BASE_URL") or env.get("BASE_URL", ""),
+            "KIMI_WRITER_MODEL": env.get("KIMI_WRITER_MODEL") or model_id,
+            "KIMI_WRITER_PYTHON": python_bin,
+            "KIMI_WRITER_OUTPUT_DIR": str(writing_root / "outputs" / "kimi-writer"),
+            "TEST_API_KEY": env.get("TEST_API_KEY") or env.get("SEED2LITE_API_KEY") or env.get("API_KEY", ""),
+            "TEST_API_URL": env.get("TEST_API_URL") or env.get("SEED2LITE_CHAT_COMPLETIONS_URL_HTTP") or env.get("API_URL", ""),
+            "JUDGE_API_KEY": env.get("JUDGE_API_KEY") or env.get("SEED2LITE_API_KEY") or env.get("API_KEY", ""),
+            "JUDGE_API_URL": env.get("JUDGE_API_URL") or env.get("SEED2LITE_CHAT_COMPLETIONS_URL_HTTP") or env.get("API_URL", ""),
+            "REQUEST_TIMEOUT": env.get("REQUEST_TIMEOUT", "300"),
+            "MAX_RETRIES": env.get("MAX_RETRIES", "12"),
+            "RETRY_DELAY": env.get("RETRY_DELAY", "30"),
+            "RETRY_AFTER_CAP": env.get("RETRY_AFTER_CAP", "600"),
+        }
+    )
+    cmd_result = run_command(
+        [
+            python_for_eqbench,
+            "eqbench3.py",
+            "--test-model",
+            model_id,
+            "--judge-model",
+            model_id,
+            "--model-name",
+            f"{model_id}-generated-writing-harness",
+            "--run-id",
+            run_id,
+            "--runs-file",
+            str(raw_run_file),
+            "--elo-results-file",
+            str(writing_root / "outputs" / f"eqbench3_elo.{run_id}.json"),
+            "--select-scenarios",
+            scenarios,
+            "--threads",
+            str(entry.get("threads", 1)),
+            "--iterations",
+            "1",
+            "--no-elo",
+            "--ignore-canonical",
+            "--verbosity",
+            "INFO",
+        ],
+        cwd=eqbench_root,
+        env={**env, "USE_AGENT_FOR_TEST": "1"},
+        timeout=timeout,
+    )
     stdout_path.write_text(cmd_result.stdout, encoding="utf-8")
     stderr_path.write_text(cmd_result.stderr, encoding="utf-8")
     if cmd_result.returncode != 0:
@@ -808,7 +877,7 @@ def run_dacomp_generated(
     env["API_URL"] = env["SEED2LITE_CHAT_COMPLETIONS_URL_HTTP"]
     env["AUTH_TOKEN"] = env["SEED2LITE_API_KEY"]
     env["PYTHONPATH"] = str(eval_root) + os.pathsep + env.get("PYTHONPATH", "")
-    judge_model = str(entry.get("judge_model") or env.get("SEED2LITE_MODEL_ID") or "ep-20260214145701-frz7j")
+    judge_model = str(entry.get("judge_model") or env.get("DACOMP_JUDGE_MODEL_CONFIG") or "ep-20260214145701-frz7j")
 
     adapter_results: list[HarnessRunResult] = []
     for task in tasks:
@@ -856,6 +925,7 @@ def run_dacomp_generated(
             encoding="utf-8",
         )
 
+    judge_timeout = int(entry.get("judge_timeout", min(timeout, 240)))
     judge = run_command(
         [
             python_bin,
@@ -877,8 +947,23 @@ def run_dacomp_generated(
         ],
         cwd=eval_root,
         env=env,
-        timeout=timeout,
+        timeout=judge_timeout,
     )
+    score_csvs = [
+        path
+        for path in score_dir.glob("*.csv")
+        if path.name != "overall_results.csv"
+    ]
+    if judge.returncode != 0 and not score_csvs:
+        stdout_path.write_text("\n\n=== adapter ===\n" + "\n".join(r.stdout_path for r in adapter_results) + "\n\n=== judge ===\n" + judge.stdout, encoding="utf-8")
+        stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr, encoding="utf-8")
+        return HarnessRunResult(
+            status="failed/timeout" if judge.returncode == 124 else "failed",
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            raw_result_path=str(score_dir),
+            error=(judge.stderr or judge.stdout)[-2000:],
+        )
     score = run_command(
         [python_bin, "get_score.py", "--scores-dir", str(score_dir), "--src-dir", "src"],
         cwd=eval_root,
@@ -887,13 +972,13 @@ def run_dacomp_generated(
     )
     stdout_path.write_text("\n\n=== adapter ===\n" + "\n".join(r.stdout_path for r in adapter_results) + "\n\n=== judge ===\n" + judge.stdout + "\n\n=== score ===\n" + score.stdout, encoding="utf-8")
     stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr + "\n\n=== score ===\n" + score.stderr, encoding="utf-8")
-    if judge.returncode != 0 or score.returncode != 0:
+    if score.returncode != 0:
         return HarnessRunResult(
-            status="failed/timeout" if 124 in {judge.returncode, score.returncode} else "failed",
+            status="failed/timeout" if score.returncode == 124 else "failed",
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             raw_result_path=str(score_dir),
-            error=(judge.stderr or score.stderr or judge.stdout or score.stdout)[-2000:],
+            error=(score.stderr or score.stdout or judge.stderr or judge.stdout)[-2000:],
         )
 
     overall = score_dir / "overall_results.csv"
@@ -1279,6 +1364,197 @@ print(json.dumps(report.to_dict(), default=str))
     )
 
 
+def run_the_agent_company_generated(
+    artifact: HarnessArtifact,
+    entry: dict[str, Any],
+    output_dir: Path,
+    *,
+    python_bin: str,
+    timeout: int,
+    dry_run: bool,
+) -> HarnessRunResult:
+    task_image = str(entry.get("task_image_name") or "ghcr.io/theagentcompany/admin-arrange-meeting-rooms-image:1.0.0")
+    server_hostname = str(entry.get("server_hostname") or os.environ.get("TAC_SERVER_HOSTNAME") or "host.docker.internal")
+    health_url = str(entry.get("service_health_url") or os.environ.get("TAC_SERVICE_HEALTH_URL") or "http://localhost:2999/api/healthcheck/rocketchat")
+    stdout_path = output_dir / "the_agent_company_stdout.log"
+    stderr_path = output_dir / "the_agent_company_stderr.log"
+    eval_result_path = output_dir / "the_agent_company_eval.json"
+    report_path = output_dir / "the_agent_company_report.json"
+    workspace_dir = output_dir / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    if dry_run:
+        return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(report_path), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
+
+    healthy, health_detail = _http_head_ok(health_url)
+    if not healthy:
+        return HarnessRunResult(
+            status="skipped/missing_dependency",
+            missing_dependencies=[
+                f"TheAgentCompany service stack is not reachable at {health_url}: {health_detail}",
+                "Start the official service stack first: `curl -fsSL https://github.com/TheAgentCompany/the-agent-company-backup-data/releases/download/setup-script-20241208/setup.sh | sh`",
+                "Docker Desktop on macOS must have host networking enabled for the official stack.",
+            ],
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+        )
+
+    docker_base = [
+        "docker",
+        "run",
+        "--rm",
+        "--platform",
+        "linux/amd64",
+        "-v",
+        f"{workspace_dir.resolve()}:/workspace",
+        "-v",
+        f"{output_dir.resolve()}:/outputs",
+        "-e",
+        f"SERVER_HOSTNAME={server_hostname}",
+        "-e",
+        f"LITELLM_API_KEY={os.environ.get('OPENAI_API_KEY') or os.environ.get('API_KEY') or 'proxy-placeholder'}",
+        "-e",
+        f"LITELLM_BASE_URL={os.environ.get('OPENAI_BASE_URL') or os.environ.get('BASE_URL') or 'http://127.0.0.1:1/v1'}",
+        "-e",
+        f"LITELLM_MODEL={os.environ.get('MODEL_NAME') or os.environ.get('OPENAI_MODEL') or 'generated-harness'}",
+        task_image,
+    ]
+
+    task = run_command(
+        docker_base + ["bash", "-lc", "cat /instruction/task.md && echo '\n---DEPENDENCIES---' && cat /utils/dependencies.yml"],
+        cwd=output_dir,
+        timeout=180,
+    )
+    if task.returncode != 0:
+        stdout_path.write_text(task.stdout, encoding="utf-8")
+        stderr_path.write_text(task.stderr, encoding="utf-8")
+        return HarnessRunResult(
+            status="failed",
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            error=task.stderr[-2000:] or task.stdout[-2000:],
+        )
+    task_text, _, deps_text = task.stdout.partition("\n---DEPENDENCIES---\n")
+    (workspace_dir / "task.md").write_text(task_text, encoding="utf-8")
+
+    init = run_command(docker_base + ["bash", "-lc", "bash /utils/init.sh"], cwd=output_dir, timeout=min(timeout, 1800))
+    if init.returncode != 0:
+        stdout_path.write_text(task.stdout + "\n\n=== init ===\n" + init.stdout, encoding="utf-8")
+        stderr_path.write_text(task.stderr + "\n\n=== init ===\n" + init.stderr, encoding="utf-8")
+        return HarnessRunResult(
+            status="failed/timeout" if init.returncode == 124 else "failed",
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            error=init.stderr[-2000:] or init.stdout[-2000:],
+            score_breakdown={"stage": "init", "task_image": task_image, "dependencies": deps_text.strip()},
+        )
+
+    browser_prompt = (
+        "You are running a real TheAgentCompany browser task. Complete the task using the live local services.\n\n"
+        f"Task image: {task_image}\n"
+        f"Service hostname inside task containers: {server_hostname}\n"
+        "For browser access from this host, prefer these URLs when applicable:\n"
+        "- RocketChat: http://localhost:3000/  (username: theagentcompany, password: theagentcompany)\n"
+        "- GitLab: http://localhost:8929/  (username: root, password: theagentcompany)\n"
+        "- ownCloud: http://localhost:8092/  (username: theagentcompany, password: theagentcompany)\n"
+        "- Plane: http://localhost:8091/\n\n"
+        f"Workspace directory for required files: {workspace_dir.resolve()}\n"
+        "If the task asks you to write /workspace/ans.txt, write the answer to the host file "
+        f"{(workspace_dir / 'ans.txt').resolve()}.\n\n"
+        "Original task:\n"
+        f"{task_text.strip()}\n"
+    )
+    adapter_result = run_generated_harness(
+        artifact.path,
+        "browser",
+        browser_prompt,
+        output_dir / "adapter_outputs" / "the_agent_company",
+        task_work_dir=workspace_dir,
+        python_bin=python_bin,
+        timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
+    )
+    trajectory_path = output_dir / "generated_trajectory.txt"
+    trajectory_bits = {
+        "adapter_status": adapter_result.status,
+        "adapter_error": adapter_result.error,
+        "raw_result_path": adapter_result.raw_result_path,
+        "stdout_path": adapter_result.stdout_path,
+        "stderr_path": adapter_result.stderr_path,
+        "response": _read_adapter_response(adapter_result),
+    }
+    trajectory_path.write_text(json.dumps(trajectory_bits, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    eval_cmd = docker_base + [
+        "bash",
+        "-lc",
+        "DECRYPTION_KEY='theagentcompany is all you need' "
+        "python /utils/eval.py --trajectory_path /outputs/generated_trajectory.txt "
+        "--result_path /outputs/the_agent_company_eval.json",
+    ]
+    evaluate = run_command(eval_cmd, cwd=output_dir, timeout=min(timeout, 900))
+    stdout_path.write_text(
+        task.stdout
+        + "\n\n=== init ===\n"
+        + init.stdout
+        + "\n\n=== adapter ===\n"
+        + (Path(adapter_result.stdout_path).read_text(encoding="utf-8", errors="replace") if adapter_result.stdout_path and Path(adapter_result.stdout_path).exists() else "")
+        + "\n\n=== evaluator ===\n"
+        + evaluate.stdout,
+        encoding="utf-8",
+    )
+    stderr_path.write_text(
+        task.stderr
+        + "\n\n=== init ===\n"
+        + init.stderr
+        + "\n\n=== adapter ===\n"
+        + (Path(adapter_result.stderr_path).read_text(encoding="utf-8", errors="replace") if adapter_result.stderr_path and Path(adapter_result.stderr_path).exists() else "")
+        + "\n\n=== evaluator ===\n"
+        + evaluate.stderr,
+        encoding="utf-8",
+    )
+    if evaluate.returncode != 0:
+        return HarnessRunResult(
+            status="failed/timeout" if evaluate.returncode == 124 else "failed",
+            raw_result_path=str(eval_result_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            error=evaluate.stderr[-2000:] or evaluate.stdout[-2000:],
+            score_breakdown={"stage": "evaluator", "task_image": task_image, "adapter_status": adapter_result.status},
+            interactions=1,
+        )
+    result = read_json(eval_result_path) if eval_result_path.exists() else {}
+    final = result.get("final_score") or {}
+    total = final.get("total")
+    got = final.get("result")
+    try:
+        score = float(got) / float(total) if total else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        score = None
+    write_json(
+        report_path,
+        {
+            "task_image": task_image,
+            "dependencies": deps_text.strip(),
+            "adapter_status": adapter_result.status,
+            "score": score,
+            "raw_eval": result,
+        },
+    )
+    return HarnessRunResult(
+        status="success" if score is not None else "failed",
+        score=score,
+        pass_rate=score,
+        raw_result_path=str(report_path),
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        score_breakdown={"metric": "TheAgentCompany final_score.result / total", "task_image": task_image, **final},
+        interactions=1,
+    )
+
+
 def run_proxy_smoke(
     artifact: HarnessArtifact,
     entry: dict[str, Any],
@@ -1404,6 +1680,15 @@ def run_benchmark(
             entry,
             output_dir,
             harness_eval_root=harness_eval_root,
+            python_bin=python_bin,
+            timeout=timeout,
+            dry_run=dry_run,
+        )
+    if runner == "the_agent_company_generated":
+        return run_the_agent_company_generated(
+            artifact,
+            entry,
+            output_dir,
             python_bin=python_bin,
             timeout=timeout,
             dry_run=dry_run,

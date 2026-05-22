@@ -4,7 +4,7 @@ const path = require('path');
 
 const CCR_PORT = 3456;
 const PROXY_PORT = 3457;
-const PROVIDER_PROXY_PORT = 3458;
+const PROVIDER_PROXY_PORT = parseInt(process.env.PROVIDER_PROXY_PORT || '3458', 10);
 const PROVIDER_PROXY_HOST = process.env.PROVIDER_PROXY_HOST || '127.0.0.1';
 const MODEL_NAME = process.env.MODEL_NAME || 'claude-sonnet-4-6';
 const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL;
