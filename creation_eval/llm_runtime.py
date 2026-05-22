@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+from creation_eval.model_aliases import resolve_model_alias
+
+
+@dataclass
+class LLMRuntime:
+    process: subprocess.Popen | None = None
+    log_handle: object | None = None
+    log_path: Path | None = None
+
+    def close(self) -> None:
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        if self.log_handle:
+            try:
+                self.log_handle.close()
+            except Exception:
+                pass
+
+
+def normalize_chat_completions_url(url: str) -> str:
+    url = url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    return url + "/chat/completions"
+
+
+def normalize_openai_base_url(url: str) -> str:
+    url = url.rstrip("/")
+    suffix = "/chat/completions"
+    if url.endswith(suffix):
+        return url[: -len(suffix)]
+    return url
+
+
+def configure_eval_llm(
+    *,
+    harness_eval_root: Path,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    model_name: str | None = None,
+    reasoning_effort: str | None = None,
+    provider_proxy: bool = True,
+    provider_proxy_host: str = "0.0.0.0",
+    provider_proxy_port: int = 3458,
+    log_path: Path | None = None,
+) -> LLMRuntime:
+    """Configure env for the LLM used by generated harnesses during eval.
+
+    Host-side judges use OPENAI_BASE_URL. Docker-contained benchmark tasks use
+    CONTAINER_OPENAI_BASE_URL, which avoids pointing containers at their own
+    localhost when a local provider proxy is used.
+    """
+    resolved_model = resolve_model_alias(model_name or os.environ.get("EVAL_MODEL_NAME") or "") or ""
+    resolved_base_url = base_url or os.environ.get("EVAL_BASE_URL") or ""
+    resolved_api_key = api_key or os.environ.get("EVAL_API_KEY") or ""
+    resolved_effort = reasoning_effort or os.environ.get("EVAL_REASONING_EFFORT") or ""
+
+    if not any([resolved_model, resolved_base_url, resolved_api_key, resolved_effort]):
+        return LLMRuntime()
+    missing = [
+        name
+        for name, value in {
+            "eval model": resolved_model,
+            "eval base url": resolved_base_url,
+            "eval api key": resolved_api_key,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise ValueError("Missing eval LLM config: " + ", ".join(missing))
+
+    if provider_proxy:
+        upstream_url = normalize_chat_completions_url(resolved_base_url)
+        host_base = f"http://127.0.0.1:{provider_proxy_port}/v1"
+        container_base = f"http://host.docker.internal:{provider_proxy_port}/v1"
+        os.environ.update(
+            {
+                "OPENAI_BASE_URL": host_base,
+                "BASE_URL": host_base,
+                "OPENAI_API_KEY": "proxy-placeholder",
+                "API_KEY": "proxy-placeholder",
+                "MODEL_NAME": resolved_model,
+                "OPENAI_MODEL": resolved_model,
+                "CONTAINER_OPENAI_BASE_URL": container_base,
+                "CONTAINER_BASE_URL": container_base,
+                "CONTAINER_OPENAI_API_KEY": "proxy-placeholder",
+                "CONTAINER_API_KEY": "proxy-placeholder",
+            }
+        )
+        proxy_env = os.environ.copy()
+        proxy_env.update(
+            {
+                "UPSTREAM_BASE_URL": upstream_url,
+                "UPSTREAM_API_KEY": resolved_api_key,
+                "MODEL_NAME": resolved_model,
+                "PROVIDER_PROXY_HOST": provider_proxy_host,
+                "OPENROUTER_VERBOSITY": resolved_effort,
+                "OPENROUTER_REASONING_ENABLED": "true" if resolved_effort else "",
+            }
+        )
+        if log_path is None:
+            log_path = harness_eval_root / "eval_provider_proxy.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = log_path.open("a", encoding="utf-8")
+        process = subprocess.Popen(
+            ["node", str(harness_eval_root / "model-proxy.js")],
+            cwd=harness_eval_root,
+            env=proxy_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        time.sleep(1.0)
+        if process.poll() is not None:
+            log_handle.close()
+            raise RuntimeError(f"Eval provider proxy exited early. See {log_path}")
+        return LLMRuntime(process=process, log_handle=log_handle, log_path=log_path)
+
+    base = normalize_openai_base_url(resolved_base_url)
+    os.environ.update(
+        {
+            "OPENAI_BASE_URL": base,
+            "BASE_URL": base,
+            "OPENAI_API_KEY": resolved_api_key,
+            "API_KEY": resolved_api_key,
+            "MODEL_NAME": resolved_model,
+            "OPENAI_MODEL": resolved_model,
+            "CONTAINER_OPENAI_BASE_URL": base,
+            "CONTAINER_BASE_URL": base,
+            "CONTAINER_OPENAI_API_KEY": resolved_api_key,
+            "CONTAINER_API_KEY": resolved_api_key,
+        }
+    )
+    return LLMRuntime()

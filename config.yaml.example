@@ -2,7 +2,53 @@
 # 所以需要填写完整的 chat completions 地址
 base_url: "https://your-api-endpoint.example.com/v1/chat/completions"
 api_key: "your-api-key-here"
-model_name: "your-model-name"
+model_name: "your-model-name-or-alias"
+
+# 生成 harness 的 meta harness。可选：
+# - claude-code: Docker 内运行 Claude Code + ccr，真实后端由 base_url/api_key/model_name 控制。
+# - codex: 本机运行 Codex CLI，模型通过 Codex CLI 的 -m 参数控制。
+meta_harness: "claude-code"
+
+# Codex meta harness 的可选配置。
+codex_bin: "codex"
+codex_sandbox: "workspace-write"
+codex_enable_search: false
+# codex_extra_args: "--profile my-profile"
+
+# Codex CLI 默认使用本机 Codex 登录态，模型名通常不是 OpenRouter ID。
+# 如果你的 Codex profile 支持更多 provider，可以在这里覆盖。
+codex_model_aliases:
+  GPT5.5: "gpt-5.5"
+
+# Claude Code CLI 只接受 Claude-family alias；真实后端请求仍由 model_name 决定。
+claude_model_name: "claude-sonnet-4-6"
+
+# 可选：Claude Code 的 --effort，以及 OpenRouter 的 verbosity。
+# Opus 4.7 最强推理档用 "max"。
+reasoning_effort: "max"
+
+# 模型别名。命令行里的 --model-name / --eval-model-name 可以直接填这些短名，
+# 也可以填真实 provider model id。下面是内置默认值的显式写法；如平台 ID 变化，
+# 只需要在本地 config.yaml 里改这里，不需要改代码。
+model_aliases:
+  GPT5.5: "openai/gpt-5.5"
+  Seed2.0: "ep-20260214145701-frz7j"
+  Qwen3.7: "qwen/qwen3.7"
+  Gemini3.1: "google/gemini-3.1"
+  K2.6: "moonshotai/kimi-k2.6"
+  GLM5.1: "z-ai/glm-5.1"
+  Claude4.7: "anthropic/claude-opus-4.7"
+
+# 下游 eval 时，被测 generated harness 调用的 LLM。
+# 不填时，run.py --eval-after 默认复用上面的 generation LLM 配置。
+# eval_base_url: "https://your-api-endpoint.example.com/v1/chat/completions"
+# eval_api_key: "your-api-key-here"
+# eval_model_name: "your-eval-model-name"
+# eval_reasoning_effort: "max"
+
+# 生成 prompt 默认采用 system_prompt + task_prompt。
+system_prompt_file: "./prompts/system_prompt.md"
+include_system_prompt: true
 
 # Docker settings
 max_concurrent: 4

@@ -1,8 +1,18 @@
 # Harness Eval
 
-用 LLM 驱动 coding agent 自动生成 agent harness，并评估不同模型的构建能力。
+用 LLM 驱动 coding agent 自动生成 agent harness，并把生成结果接到 downstream BMK 上评估。
 
 核心假设：**如果一段 prompt 足够好，强模型应该能从中生成结构完整、可运行的 agent 系统**。本项目用这种方式同时评估 prompt 质量和模型能力。
+
+当前执行链路：
+
+1. 从 `tasks.jsonl` 读取任务——每个任务包含一段描述需要构建什么 harness 的 prompt
+2. 根据 `--meta-harness` 选择生成器：
+   - `claude-code`：启动 Docker 容器，内置 Claude Code + [claude-code-router](https://github.com/musistudio/claude-code-router)
+   - `codex`：调用本机 Codex CLI，在临时 workspace 里生成 harness
+3. Claude Code 路径会经过 model-proxy 透明代理 LLM 请求，记录 token 用量和交互轮次
+4. Agent 在临时 workspace 中工作
+5. 任务完成后，收集输出产物和 metrics
 
 ---
 
@@ -14,12 +24,12 @@
 
 1. **调研**（`research/`）：分析各领域生产级 agent 的实现模式，提炼共性架构
 2. **提示词设计**（`prompts/`）：将调研结论转化为结构化 prompt，定义功能要求和调用示例
-3. **生成**（`run.py` + Docker）：将 prompt 喂给 coding agent（Claude Code），在隔离容器中生成完整 harness
-4. **验证**（`outputs/`）：检查产物是否符合架构约束、能否导入运行、代码质量如何
+3. **生成**（`run.py`）：将 prompt 喂给 meta harness（Claude Code Docker 或本机 Codex CLI），生成完整 harness
+4. **验证/评测**（`run_creation_eval.py`）：检查产物是否符合架构约束，并把 generated harness 接到 downstream BMK
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Docker Container                                │
+│  claude-code meta harness                        │
 │                                                  │
 │  Claude Code ──► model-proxy(:3457)              │
 │                      │  记录 metrics.json        │
@@ -27,8 +37,10 @@
 │               claude-code-router(:3456)          │
 │                      │                           │
 │                      ▼                           │
-│               外部 LLM API (万卿/OpenAI/...)     │
+│               外部 LLM API (OpenRouter/内部平台) │
 └─────────────────────────────────────────────────┘
+
+codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传入。它依赖本机 Codex CLI 的登录和 provider 配置；如果要用 OpenRouter/内部非 OpenAI 模型，默认更稳的是 `claude-code + model-proxy` 路径。
 ```
 
 ---
@@ -212,7 +224,7 @@ outputs/opus4_showcase/<harness>/
 
 ## 快速开始
 
-### Docker 模式（评测用）
+### 生成模式
 
 ```bash
 # 1. 安装依赖
@@ -222,11 +234,185 @@ pip install pyyaml
 cp config.yaml.example config.yaml
 # 编辑 config.yaml，填入 API 地址、密钥和模型名称
 
-# 3. 运行
+# 3. 运行默认 claude-code 生成模式
 python3 run.py
 ```
 
+`config.yaml` 会被 `.gitignore` 忽略，因为里面通常包含 API key。本仓库只提交 `config.yaml.example`。
+如果不想创建本地配置文件，也可以直接用命令行指定生成模型和任务。
+
+### 一条命令生成并评测
+
+命令行里可以同时指定：
+
+- `--meta-harness`：用什么 meta harness 生成 harness；当前支持 `claude-code` 和 `codex`
+- `--model-name`：meta harness 背后的 LLM，也就是“写 harness”的模型；可以填真实 model id，也可以填别名如 `GPT5.5`、`Seed2.0`、`Claude4.7`
+- `--eval-model-name`：生成出来的 harness 在下游 BMK 里调用的 LLM，也就是“被测 harness 使用”的模型；同样支持别名，不填则默认复用 `--model-name`
+- `--task-id`：生成哪个方向的 harness
+- `--eval-bench`：生成后接哪些下游 BMK
+- `--run-id`：本次 generation/eval 的目录名，便于复现和对比
+
+例如，用 Claude Code 作为 meta harness、用指定 LLM 生成 code harness，然后直接跑 SWE-bench Pro 和 Terminal 2.0：
+
+```bash
+python3 run.py \
+  --run-id code-claude-opus-example \
+  --meta-harness claude-code \
+  --base-url "$BASE_URL" \
+  --api-key "$API_KEY" \
+  --model-name "$MODEL_NAME" \
+  --claude-model-name claude-sonnet-4-6 \
+  --reasoning-effort max \
+  --eval-model-name "$MODEL_NAME" \
+  --eval-reasoning-effort max \
+  --task-id code-agent-harness \
+  --eval-after \
+  --eval-domain code \
+  --eval-bench swebench_pro,terminal_2_bench
+```
+
+用 OpenRouter 时，`BASE_URL` 通常应是完整 chat completions 地址：
+
+```bash
+export BASE_URL="https://openrouter.ai/api/v1/chat/completions"
+export API_KEY="$OPENROUTER_API_KEY"
+export MODEL_NAME="anthropic/claude-opus-4.7"
+```
+
+如果想把写 harness 的模型和被测 harness 的模型分开，例如用 Claude Code 这个 meta harness 调两个不同后端模型：
+
+```bash
+python3 run.py \
+  --run-id code-gpt55-create-opus-eval \
+  --meta-harness claude-code \
+  --base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --api-key "$OPENROUTER_API_KEY" \
+  --model-name "openai/gpt-5.5" \
+  --claude-model-name claude-sonnet-4-6 \
+  --reasoning-effort max \
+  --task-id code-agent-harness \
+  --eval-after \
+  --eval-domain code \
+  --eval-bench swebench_pro,terminal_2_bench \
+  --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+```
+
+这里 `--claude-model-name` 只是传给 Claude Code CLI 的壳模型名；真实请求会被本仓库的 proxy 改写到 `--model-name`。所以只要 OpenRouter 支持对应 model id，就可以把 `--model-name` 或 `--eval-model-name` 换成 GPT 系列、Claude 系列或其他模型。`--eval-after` 会自动启动一个本地 provider proxy，把 eval 模型配置注入到 Docker 里的 generated harness。
+
+如果要用 Codex 作为 meta harness：
+
+```bash
+python3 run.py \
+  --run-id code-codex-gpt55-example \
+  --meta-harness codex \
+  --model-name GPT5.5 \
+  --reasoning-effort xhigh \
+  --task-id code-agent-harness
+```
+
+Codex 路径不会强制要求 `--base-url/--api-key`，因为它默认使用本机 Codex 登录态。`GPT5.5` 在 Codex 路径会解析成 `gpt-5.5`，而不是 OpenRouter 的 `openai/gpt-5.5`。需要非默认 provider 时，可以通过 `--codex-extra-args` 传 Codex CLI 的本地 profile/config override，或在 `codex_model_aliases` 里覆盖。
+
+内置模型别名可以这样查看：
+
+```bash
+python3 run.py --list-model-aliases
+```
+
+生成完成后直接接 downstream BMK，也可以继续使用配置文件：
+
+```bash
+# 只生成/评测代码 harness，并跑 SWE-bench Pro + Terminal 2.0
+python3 run.py config.yaml \
+  --task-id code-agent-harness \
+  --eval-after \
+  --eval-domain code \
+  --eval-bench swebench_pro,terminal_2_bench
+
+# 只生成/评测写作 harness，并跑 Writing-bench + EQbench3
+python3 run.py config.yaml \
+  --task-id writing-harness \
+  --eval-after \
+  --eval-domain writing \
+  --eval-bench writing_bench,eqbench3
+```
+
+### 生成后接下游 BMK 评测
+
+`run_creation_eval.py` 会把已经生成的 harness 目录接到下游 benchmark registry 上，输出统一的
+`eval_results/<run_id>/summary.jsonl` 和 `summary.csv`。
+
+```bash
+python3.12 run_creation_eval.py \
+  --generation-output outputs/opus45 \
+  --run-id opus45-dryrun \
+  --dry-run
+```
+
+如果系统 Python 由系统包管理器保护、不能直接安装依赖，推荐使用本仓库虚拟环境：
+
+```bash
+uv venv .venv --python /opt/homebrew/bin/python3.12
+uv pip install --python .venv/bin/python -r requirements.txt
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/opus45 \
+  --python-bin "$PWD/.venv/bin/python"
+```
+
+常用筛选：
+
+```bash
+# 只跑 writing 相关 benchmark
+python3.12 run_creation_eval.py --generation-output outputs/opus45 --domain writing
+
+# 只跑写作类最终保留的两个 downstream BMK
+python3.12 run_creation_eval.py \
+  --generation-output outputs/opus45/writing-harness \
+  --bench writing_bench,eqbench3
+
+# 只跑代码类两个 downstream BMK
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/opus45/code-agent-harness \
+  --bench swebench_pro,terminal_2_bench \
+  --python-bin "$PWD/.venv/bin/python"
+
+# 对尚未接入真实运行器的 benchmark 跑 generated-harness 代理冒烟验证，
+# 结果会标记为 proxy_smoke_*，不会伪装成真实 BMK 分数。
+python3.12 run_creation_eval.py \
+  --generation-output outputs/opus45 \
+  --proxy-smoke-for-unsupported
+```
+
+当前 registry 在 `eval_matrix.yaml`，包含截图中的全部 BMK 名称。V1 对真实 runner 做依赖门控：
+可直接接入的 runner 会运行；缺数据、缺服务、缺 API key 或还没有 generated-harness agent adapter 的项会在
+`missing_dependencies` 中明确记录为 `skipped/*`。
+
+代码类 BMK 目前已经接入 generated harness：
+
+- `swebench_pro`: 通过 `harness_house/benchmarks` 的 SWE-bench/OpenHands workspace 启动实例，把 generated code harness 上传进 repo workspace，运行后抽取 `git diff`，再调用 `swebench-eval` 得到真实 resolved/pass rate。
+- `terminal_2_bench`: 通过 Harbor `--agent-import-path` 注册 `GeneratedHarnessAgent`，在 TerminalBench task container 内上传并运行 generated code harness，再用现有 `terminalbench-eval` 汇总 verifier 结果。
+
+这两个 runner 不伪造分数；Docker/Harbor 启动超时、generated harness adapter 失败、官方 evaluator 缺镜像等都会写成 `failed/*` 或明确的依赖缺失。
+
+截图中的非代码类 BMK 也已 registry 化并接到 generated harness：
+
+| BMK | 运行器 | 当前接入方式 |
+|---|---|---|
+| `mle_bench` | `mlebench_generated` | 接官方 `openai/mle-bench`，generated data harness 生成 submission CSV 后调用官方 `grade_csv`；需要 Kaggle credential 和 prepared competition data。 |
+| `dacomp` | `dacomp_generated` | 将 DAComp SQLite 导出为 CSV，generated data harness 产出报告，再复用 DAComp `llm_judge.py/get_score.py`。 |
+| `writing_bench` | `writingbench_generated` | 接官方 `X-PLUG/WritingBench` query/checklist，generated writing harness 产出回答，再用 OpenAI-compatible judge 打 criterion 分。 |
+| `eqbench3` | `eqbench3` | 复用现有 EQ-Bench3/Kimi-writer wrapper，并将 `KIMI_WRITER_PATH` 指向 generated harness adapter。 |
+| `deepresearch_bench` | `deepresearch_generated` | 用本地 HLE-style task，generated research harness 产出 answer，再用 short-answer judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
+| `browsecomp` | `browsecomp_generated` | 下载 OpenAI simple-evals BrowseComp encrypted CSV，解密一条题，generated research harness 回答，再用 judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
+
+Research 类 BMK 不接受 generated harness 自带的 mock/LLM-simulated search 作为正式分数。adapter 会在临时运行目录中给 generated research harness 注入真实联网搜索工具：有 Serper/Tavily/API key 时走 API provider，没有 key 时走 Bing/DuckDuckGo HTML fallback。论文级稳定复现实验建议配置正式 search API key；本地一两条任务验证可以先用 fallback。
+
+本地单样本验证目标是让每个可运行 BMK 产出真实 summary score，而不是 full run。写作类评测只保留 `writing_bench` 和 `eqbench3`。`mle_bench` 的代码路径已接通，但真跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data。
+
 ### 任务格式（tasks.jsonl）
+
+支持三种任务定义方式：
 
 ```jsonl
 {"id": "code-agent", "prompt_file": "./prompts/code_agent_harness.md"}
@@ -239,9 +425,38 @@ python3 run.py
 ### 配置说明（config.yaml）
 
 ```yaml
-base_url: "https://your-api-endpoint/v1"
+base_url: "https://your-api-endpoint/v1/chat/completions"
 api_key: "your-api-key"
-model_name: "your-model-name"
+model_name: "GPT5.5"                   # 可填别名或真实 provider model id
+meta_harness: "claude-code"            # 可选 claude-code / codex
+claude_model_name: "claude-sonnet-4-6"  # 只用于 Claude Code CLI；后端真实模型仍用 model_name
+reasoning_effort: "max"                 # Opus 4.7 最强推理档；映射到 Claude Code --effort 和 OpenRouter verbosity
+
+# Codex meta harness 可选配置。
+codex_bin: "codex"
+codex_sandbox: "workspace-write"
+codex_enable_search: false
+codex_model_aliases:
+  GPT5.5: "gpt-5.5"
+
+# 模型别名可按本地 provider 实际 ID 覆盖。
+model_aliases:
+  GPT5.5: "openai/gpt-5.5"
+  Seed2.0: "ep-20260214145701-frz7j"
+  Qwen3.7: "qwen/qwen3.7"
+  Gemini3.1: "google/gemini-3.1"
+  K2.6: "moonshotai/kimi-k2.6"
+  GLM5.1: "z-ai/glm-5.1"
+  Claude4.7: "anthropic/claude-opus-4.7"
+
+# 可选：下游 BMK 里 generated harness 调用的 LLM。
+# 不填时 run.py --eval-after 默认复用 generation 的 base_url/api_key/model_name/reasoning_effort。
+eval_base_url: "https://openrouter.ai/api/v1/chat/completions"
+eval_model_name: "Claude4.7"
+eval_reasoning_effort: "max"
+
+system_prompt_file: "./prompts/system_prompt.md"
+include_system_prompt: true
 
 max_concurrent: 4        # 并行容器数
 timeout_minutes: 30      # 单任务超时
@@ -249,15 +464,36 @@ output_dir: "./outputs"
 tasks_file: "./tasks.jsonl"
 ```
 
-### 输出结构
+常用查看命令：
+
+```bash
+# 查看当前可生成的 harness 类型
+python3 run.py --list-tasks
+
+# 查看模型别名会解析到哪个 provider id
+python3 run.py --list-model-aliases
+
+# 只做 generation，不跑 BMK
+python3 run.py \
+  --run-id code-only-debug \
+  --meta-harness claude-code \
+  --base-url "$BASE_URL" \
+  --api-key "$API_KEY" \
+  --model-name "$MODEL_NAME" \
+  --reasoning-effort max \
+  --task-id code-agent-harness
+```
+
+## 输出结构
 
 ```
 outputs/
 ├── summary.json             # 汇总统计
 └── <task-id>/
     ├── meta.json            # 任务状态 + metrics 摘要
-    ├── metrics.json         # 请求级 token 用量
-    ├── claude_output.log    # Claude Code 完整日志
+    ├── metrics.json         # 完整请求级用量记录
+    ├── claude_output.log    # Claude Code 路径的完整输出日志（如有）
+    ├── codex_last_message.txt / codex_command.json  # Codex 路径的输出记录（如有）
     ├── CLAUDE.md            # 使用的 prompt
     └── harness/             # 生成的 harness 代码
         ├── __main__.py
@@ -268,8 +504,6 @@ outputs/
         ├── lifecycle.py
         └── evaluation.py
 ```
-
----
 
 ## Metrics 统计
 
@@ -306,7 +540,12 @@ outputs/
 harness-eval/
 ├── README.md                 # 本文件
 ├── REPORT.md                 # 详细评测报告
-├── run.py                    # 评测运行器（Docker 模式）
+├── run.py                    # harness generation 入口，支持 claude-code / codex
+├── run_creation_eval.py      # generated harness -> downstream BMK eval 入口
+├── eval_matrix.yaml          # downstream BMK registry
+├── generated_harness_adapter.py
+├── harbor_generated_harness_agent.py
+├── creation_eval/            # adapter、validator、benchmark dispatcher、summary schema
 ├── Dockerfile                # 评测容器镜像
 ├── entrypoint.sh             # 容器入口脚本
 ├── model-proxy.js            # LLM 请求代理（记录 metrics）

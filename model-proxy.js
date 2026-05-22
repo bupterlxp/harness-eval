@@ -4,7 +4,13 @@ const path = require('path');
 
 const CCR_PORT = 3456;
 const PROXY_PORT = 3457;
+const PROVIDER_PROXY_PORT = 3458;
+const PROVIDER_PROXY_HOST = process.env.PROVIDER_PROXY_HOST || '127.0.0.1';
 const MODEL_NAME = process.env.MODEL_NAME || 'claude-sonnet-4-6';
+const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL;
+const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY;
+const OPENROUTER_VERBOSITY = process.env.OPENROUTER_VERBOSITY || '';
+const OPENROUTER_REASONING_ENABLED = process.env.OPENROUTER_REASONING_ENABLED === 'true';
 const METRICS_PATH = path.join(process.env.WORKSPACE || '/workspace', 'metrics.json');
 
 // Rough estimate: 1 token ≈ 4 chars for English, ≈ 2 chars for Chinese
@@ -140,6 +146,84 @@ function extractInputFromRequest(body) {
   return 0;
 }
 
+function buildUpstreamOptions(targetUrl, method, headers, bodyLength) {
+  const upstream = new URL(targetUrl);
+  const nextHeaders = { ...headers };
+  nextHeaders.host = upstream.host;
+  nextHeaders.authorization = `Bearer ${UPSTREAM_API_KEY}`;
+  nextHeaders['content-length'] = bodyLength;
+  delete nextHeaders.connection;
+  delete nextHeaders['accept-encoding'];
+  return {
+    protocol: upstream.protocol,
+    hostname: upstream.hostname,
+    port: upstream.port || (upstream.protocol === 'https:' ? 443 : 80),
+    path: upstream.pathname + upstream.search,
+    method,
+    headers: nextHeaders,
+  };
+}
+
+function shapeProviderRequest(bodyText) {
+  let payload;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch (e) {
+    return Buffer.from(bodyText);
+  }
+
+  payload.model = MODEL_NAME;
+
+  // Claude Opus 4.7 uses adaptive thinking. OpenRouter recommends opting in
+  // with reasoning.enabled and controlling the overall effort with verbosity.
+  if (OPENROUTER_REASONING_ENABLED) {
+    payload.reasoning = { ...(payload.reasoning || {}), enabled: true };
+  }
+  if (OPENROUTER_VERBOSITY) {
+    payload.verbosity = OPENROUTER_VERBOSITY;
+  }
+
+  // Claude 4.7 ignores these sampling parameters. Removing them keeps the
+  // provider payload explicit and avoids provider-specific compatibility issues.
+  if (String(MODEL_NAME).includes('claude-opus-4.7')) {
+    delete payload.temperature;
+    delete payload.top_p;
+    delete payload.top_k;
+  }
+
+  return Buffer.from(JSON.stringify(payload));
+}
+
+const providerProxy = http.createServer((req, res) => {
+  if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'UPSTREAM_BASE_URL or UPSTREAM_API_KEY is missing' } }));
+    return;
+  }
+
+  const reqChunks = [];
+  req.on('data', (chunk) => reqChunks.push(chunk));
+  req.on('end', () => {
+    const originalBody = Buffer.concat(reqChunks).toString('utf-8');
+    const shapedBody = shapeProviderRequest(originalBody);
+    const options = buildUpstreamOptions(UPSTREAM_BASE_URL, req.method, req.headers, shapedBody.length);
+    const transport = options.protocol === 'https:' ? require('https') : http;
+
+    const upstreamReq = transport.request(options, (upstreamRes) => {
+      res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+      upstreamRes.pipe(res, { end: true });
+    });
+
+    upstreamReq.on('error', (err) => {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `Upstream proxy error: ${err.message}` } }));
+    });
+
+    upstreamReq.write(shapedBody);
+    upstreamReq.end();
+  });
+});
+
 const server = http.createServer((req, res) => {
   if (req.url === '/v1/models' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -258,4 +342,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(PROXY_PORT, '127.0.0.1', () => {
   console.log(`Model proxy listening on 127.0.0.1:${PROXY_PORT}, forwarding to CCR on ${CCR_PORT}`);
+});
+
+providerProxy.listen(PROVIDER_PROXY_PORT, PROVIDER_PROXY_HOST, () => {
+  const effort = OPENROUTER_VERBOSITY || 'default';
+  console.log(`Provider proxy listening on ${PROVIDER_PROXY_HOST}:${PROVIDER_PROXY_PORT}, upstream effort=${effort}`);
 });
