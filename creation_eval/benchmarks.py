@@ -1329,17 +1329,71 @@ print(json.dumps({{
         if root and root.exists():
             csv_candidates.extend(path for path in root.rglob("*.csv") if path.is_file())
     if not csv_candidates:
-        return HarnessRunResult(status="adapter_failed", raw_result_path=result.raw_result_path, stdout_path=result.stdout_path, stderr_path=result.stderr_path, error="Generated harness did not produce a submission CSV")
+        report = {
+            "competition_id": competition_id,
+            "score": 0.0,
+            "submission_exists": False,
+            "valid_submission": False,
+            "failure_mode": "no_submission",
+            "adapter_status": result.status,
+            "adapter_error": result.error,
+            "metric_source": "no_submission_zero_score",
+        }
+        write_json(report_path, report)
+        stdout_path.write_text(
+            (result.stdout_path and Path(result.stdout_path).read_text(encoding="utf-8", errors="replace") or "")
+            + "\n\n=== grade ===\nNo submission CSV found; scored as 0.0.\n",
+            encoding="utf-8",
+        )
+        stderr_path.write_text(
+            (result.stderr_path and Path(result.stderr_path).read_text(encoding="utf-8", errors="replace") or ""),
+            encoding="utf-8",
+        )
+        return HarnessRunResult(
+            status="success",
+            score=0.0,
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            error="Generated harness did not produce a submission CSV",
+            score_breakdown={"metric": "MLE-bench no-submission zero score", **report},
+            interactions=1,
+        )
     submission = csv_candidates[0]
     grade_code = f"""
 import json
+from datetime import datetime
 from pathlib import Path
 from mlebench.registry import registry
 from mlebench.grade import grade_csv
+from mlebench.utils import load_answers, read_csv
 reg = registry.set_data_dir(Path({str(data_dir)!r}))
 competition = reg.get_competition({competition_id!r})
-report = grade_csv(Path({str(submission)!r}), competition)
-print(json.dumps(report.to_dict(), default=str))
+submission_path = Path({str(submission)!r})
+try:
+    report = grade_csv(submission_path, competition)
+    payload = report.to_dict()
+    payload["metric_source"] = "grade_csv"
+except AssertionError as exc:
+    # Some local MLE-bench registry snapshots have Kaggle leaderboard files
+    # without a normalized `score` column. The actual competition metric can
+    # still be computed from the private answers and official grader.
+    if "Leaderboard must have a `score` column" not in str(exc):
+        raise
+    submission_df = read_csv(submission_path)
+    answers = load_answers(competition.answers)
+    score = competition.grader(submission_df, answers)
+    payload = {{
+        "competition_id": competition.id,
+        "score": score,
+        "submission_exists": submission_path.is_file(),
+        "valid_submission": score is not None,
+        "submission_path": str(submission_path),
+        "metric_source": "competition_grader",
+        "rank_unavailable_reason": str(exc),
+        "created_at": datetime.now(),
+    }}
+print(json.dumps(payload, default=str))
 """
     grade = run_command([python_bin, "-c", grade_code], cwd=mle_root, env=env, timeout=timeout)
     stdout_path.write_text((result.stdout_path and Path(result.stdout_path).read_text(encoding="utf-8", errors="replace") or "") + "\n\n=== grade ===\n" + grade.stdout, encoding="utf-8")
@@ -1374,8 +1428,8 @@ def run_the_agent_company_generated(
     dry_run: bool,
 ) -> HarnessRunResult:
     task_image = str(entry.get("task_image_name") or "ghcr.io/theagentcompany/admin-arrange-meeting-rooms-image:1.0.0")
-    server_hostname = str(entry.get("server_hostname") or os.environ.get("TAC_SERVER_HOSTNAME") or "host.docker.internal")
-    health_url = str(entry.get("service_health_url") or os.environ.get("TAC_SERVICE_HEALTH_URL") or "http://localhost:2999/api/healthcheck/rocketchat")
+    server_hostname = str(os.environ.get("TAC_SERVER_HOSTNAME") or entry.get("server_hostname") or "host.docker.internal")
+    health_url = str(os.environ.get("TAC_SERVICE_HEALTH_URL") or entry.get("service_health_url") or "http://localhost:2999/api/healthcheck/rocketchat")
     stdout_path = output_dir / "the_agent_company_stdout.log"
     stderr_path = output_dir / "the_agent_company_stderr.log"
     eval_result_path = output_dir / "the_agent_company_eval.json"

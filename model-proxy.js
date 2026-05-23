@@ -2,8 +2,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const CCR_PORT = 3456;
-const PROXY_PORT = 3457;
+const CCR_PORT = parseInt(process.env.CCR_PORT || '3456', 10);
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || '3457', 10);
 const PROVIDER_PROXY_PORT = parseInt(process.env.PROVIDER_PROXY_PORT || '3458', 10);
 const PROVIDER_PROXY_HOST = process.env.PROVIDER_PROXY_HOST || '127.0.0.1';
 const MODEL_NAME = process.env.MODEL_NAME || 'claude-sonnet-4-6';

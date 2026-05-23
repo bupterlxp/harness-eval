@@ -624,6 +624,101 @@ outputs/
 
 ---
 
+## 数据分析 / 浏览器链路
+
+这两类任务也走同一条流水线：
+
+```text
+harness creation -> generated harness adapter -> downstream BMK -> summary.csv / summary.jsonl
+```
+
+### 生成 data / browser harness
+
+```bash
+export API_KEY="你的 OpenRouter 或其他 provider key"
+export BASE_URL="https://openrouter.ai/api/v1/chat/completions"
+export MODEL_NAME="anthropic/claude-opus-4.7"
+export CLAUDE_MODEL_NAME="$MODEL_NAME"
+
+.venv/bin/python run.py \
+  --run-id noncode-data-browser-opus47-max \
+  --meta-harness claude-code \
+  --reasoning-effort max \
+  --task-id data-analysis-harness,browser-agent-harness \
+  --max-concurrent 1 \
+  --timeout-minutes 90
+```
+
+替换 meta harness 或模型时，只改参数即可：
+
+```bash
+.venv/bin/python run.py \
+  --run-id data-qwen-codex \
+  --meta-harness codex \
+  --base-url "$BASE_URL" \
+  --api-key "$API_KEY" \
+  --model-name "qwen/qwen3.7" \
+  --reasoning-effort max \
+  --task-id data-analysis-harness
+```
+
+### 跑数据分析 BMK
+
+MLE-bench 需要先准备 Kaggle 数据。`~/.kaggle/kaggle.json` 需要存在，且对应 Kaggle competition rules 已接受。
+
+```bash
+.venv/bin/python -m mlebench.cli prepare \
+  -c spaceship-titanic \
+  --data-dir ~/.cache/mle-bench/data
+
+export EVAL_API_KEY="$API_KEY"
+export HARNESS_EVAL_DATA_MAX_TURNS=8
+
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-data-browser-opus47-max \
+  --domain data_analysis \
+  --bench mle_bench,dacomp \
+  --run-id data-eval-opus47-max \
+  --eval-base-url "$BASE_URL" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+```
+
+如果 generated harness 没有生成 MLE submission CSV，runner 会把这次真实失败记为 `score=0.0`，并在 `score_breakdown.failure_mode=no_submission` 里说明原因。
+
+### 跑 TheAgentCompany 浏览器 BMK
+
+官方 TheAgentCompany setup 在 Linux 上依赖 host networking。Mac Docker 本地 smoke 时，先启动真实服务栈，再用本仓库的本地 shim 提供 task image 初始化时需要的 reset/health API。
+
+```bash
+# 1. 启动真实服务栈
+curl -fsSL https://github.com/TheAgentCompany/the-agent-company-backup-data/releases/download/setup-script-20241208/setup.sh -o /tmp/tac-setup.sh
+sh /tmp/tac-setup.sh
+
+# 2. Mac Docker 下如果官方 api-server 端口不可用，启动 shim
+.venv/bin/python tools/tac_api_shim.py --host 0.0.0.0 --port 2999
+```
+
+另开一个终端跑 eval：
+
+```bash
+export EVAL_API_KEY="$API_KEY"
+export TAC_SERVICE_HEALTH_URL="http://localhost:2999/api/healthcheck/rocketchat"
+
+.venv/bin/python run_creation_eval.py \
+  --generation-output outputs/noncode-data-browser-opus47-max \
+  --domain browser \
+  --bench the_agent_company \
+  --run-id browser-eval-opus47-max \
+  --eval-base-url "$BASE_URL" \
+  --eval-model-name "anthropic/claude-opus-4.7" \
+  --eval-reasoning-effort max
+```
+
+当前 TheAgentCompany V1 接的是 `admin-arrange-meeting-rooms` 一个真实 task image。分数来自 task image 自带的 `/utils/eval.py`，不是手写规则。
+
+---
+
 ## 项目结构
 
 ```
@@ -639,6 +734,7 @@ harness-eval/
 ├── Dockerfile                # 评测容器镜像
 ├── entrypoint.sh             # 容器入口脚本
 ├── model-proxy.js            # LLM 请求代理（记录 metrics）
+├── tools/tac_api_shim.py     # Mac Docker 本地 TheAgentCompany reset/health shim
 ├── config.yaml.example       # 配置模板
 ├── tasks.jsonl               # 任务定义
 ├── prompts/                  # 提示词

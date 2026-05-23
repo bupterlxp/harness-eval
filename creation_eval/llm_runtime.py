@@ -126,6 +126,7 @@ def configure_eval_llm(
                 "UPSTREAM_BASE_URL": upstream_url,
                 "UPSTREAM_API_KEY": resolved_api_key,
                 "MODEL_NAME": resolved_model,
+                "PROXY_PORT": str(max(1, provider_proxy_port - 1)),
                 "PROVIDER_PROXY_HOST": provider_proxy_host,
                 "PROVIDER_PROXY_PORT": str(provider_proxy_port),
                 "OPENROUTER_VERBOSITY": resolved_effort,
