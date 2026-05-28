@@ -1,233 +1,474 @@
 # Agent Harness 构建任务：创意写作智能体（Creative Writing Agent）
 
-构建一个通用的创意写作 harness，能接受写作任务规格（体裁、风格、约束），自主完成从规划到终稿的全流程创作。
+构建一个创意写作 harness，接收写作任务描述（体裁、风格、字数等），通过 LLM 驱动的 agent 循环自主完成规划、起草、评估、修订的全流程创作。
 
 ---
 
-## 一、入口与输出
+## 接口
 
 ```bash
 python -m harness -p "任务描述" --output-dir ./output/
 ```
 
-- `-p`：自然语言任务描述（harness 自行解析并执行）
-- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
+执行完成后在 `--output-dir` 下生成：
+- `result.json`：`{"status": "success"|"partial"|"failed", "trajectory": "trajectory.jsonl"}`
+- `trajectory.jsonl`：每行一个 JSON，记录每步的 action 和 observation
 
-`result.json` 必须包含以下字段，其余字段可自行扩展：
+---
+
+## 文件结构
+
+你必须创建以下文件结构：
+
+```
+harness/
+  __init__.py        # 空文件或简短描述
+  __main__.py        # 入口：从主模块导入 main 并执行
+Dockerfile
+requirements.txt
+```
+
+关键：`python -m harness` 要求 `harness/` 目录下有 `__main__.py` 文件。最简单的做法是把所有代码放在 `harness/__main__.py` 中。
+
+---
+
+## 代码骨架
+
+以下是**完整可运行的骨架代码**。你必须基于它构建 harness，保留核心结构（LLM 调用循环 + tool calling），按需扩展工具实现和错误处理。
+
+**⚠️ 关键约束：骨架中的以下全局变量必须保留，禁止删除、重命名或移到函数内部：**
+- `client = OpenAI(...)` — LLM 客户端实例
+- `MODEL = os.environ.get("MODEL_NAME", "gpt-4")` — 模型名称
+- `SYSTEM_PROMPT = """..."""` — 系统提示词
+- `TOOLS = [...]` — 工具定义列表
+你可以修改它们的内容，但变量名和初始化位置必须保持在模块顶层。
 
 ```python
-{
-    "status": str,       # "success" | "partial" | "failed"
-    "trajectory": str,   # JSONL trajectory 文件路径
-}
+#!/usr/bin/env python3
+"""Creative Writing Agent Harness - 自主创意写作智能体"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from openai import OpenAI
+
+# ── 配置 ─────────────────────────────────────────────
+client = OpenAI(
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    api_key=os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
+)
+MODEL = os.environ.get("MODEL_NAME", "gpt-4")
+
+SYSTEM_PROMPT = """You are a creative writing agent. You plan outlines, write sections, evaluate drafts, revise based on feedback, and produce polished final text.
+Workflow: plan_outline -> write_section (repeat for each section) -> evaluate_draft -> revise_section (if needed) -> write_file (save final) -> finish.
+Always follow this workflow. Write high-quality, engaging content that matches the requested style and constraints."""
+
+# ── 全局草稿缓冲区 ──────────────────────────────────
+draft_buffer: list[str] = []  # 按 section 顺序存储各段文本
+
+# ── 工具定义（OpenAI function calling 格式）────────────
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_outline",
+            "description": "Create a structured outline for the writing task. Returns the outline text for reference.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Working title"},
+                    "outline": {"type": "string", "description": "Full outline with sections, key points, and structure"},
+                },
+                "required": ["title", "outline"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_section",
+            "description": "Write a section of the draft. The text is appended to the draft buffer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "section_name": {"type": "string", "description": "Name of this section (e.g. 'Introduction', 'Chapter 1')"},
+                    "content": {"type": "string", "description": "The full text content of this section"},
+                },
+                "required": ["section_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "evaluate_draft",
+            "description": "Critique the current draft. Provide scores and specific feedback for revision.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "criteria": {"type": "string", "description": "Evaluation criteria (e.g. 'coherence, style, engagement, structure')"},
+                    "feedback": {"type": "string", "description": "Detailed critique with specific issues and suggestions"},
+                    "score": {"type": "number", "description": "Overall quality score 1-10"},
+                },
+                "required": ["criteria", "feedback", "score"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revise_section",
+            "description": "Revise a specific section based on evaluation feedback. Replaces that section in the draft buffer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "section_index": {"type": "integer", "description": "Index of the section to revise (0-based)"},
+                    "revised_content": {"type": "string", "description": "The revised text for this section"},
+                    "changes_made": {"type": "string", "description": "Summary of what was changed and why"},
+                },
+                "required": ["section_index", "revised_content", "changes_made"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Save content to a file in the output directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Output filename (e.g. 'story.md', 'essay.txt')"},
+                    "content": {"type": "string", "description": "Full file content to write"},
+                },
+                "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Signal that the writing task is complete",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+                    "summary": {"type": "string", "description": "Brief summary of the completed work"},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+]
+
+
+# ── 工具执行 ──────────────────────────────────────────
+def execute_tool(name: str, args: dict, output_dir: str) -> str:
+    """执行工具调用，返回结果字符串。"""
+    global draft_buffer
+    try:
+        if name == "plan_outline":
+            title = args.get("title", "Untitled")
+            outline = args.get("outline", "")
+            return f"Outline created: '{title}'\n{outline}"
+
+        elif name == "write_section":
+            section_name = args.get("section_name", "Section")
+            content = args.get("content", "")
+            draft_buffer.append(content)
+            idx = len(draft_buffer) - 1
+            word_count = len(content.split())
+            total_words = sum(len(s.split()) for s in draft_buffer)
+            return f"Section '{section_name}' written (index={idx}, {word_count} words). Total draft: {len(draft_buffer)} sections, {total_words} words."
+
+        elif name == "evaluate_draft":
+            full_draft = "\n\n".join(draft_buffer)
+            word_count = len(full_draft.split())
+            score = args.get("score", 0)
+            feedback = args.get("feedback", "")
+            return f"Draft evaluated ({word_count} words, {len(draft_buffer)} sections). Score: {score}/10.\nFeedback: {feedback}"
+
+        elif name == "revise_section":
+            idx = args.get("section_index", 0)
+            revised = args.get("revised_content", "")
+            changes = args.get("changes_made", "")
+            if 0 <= idx < len(draft_buffer):
+                old_words = len(draft_buffer[idx].split())
+                draft_buffer[idx] = revised
+                new_words = len(revised.split())
+                return f"Section {idx} revised ({old_words} -> {new_words} words). Changes: {changes}"
+            else:
+                return f"Error: section index {idx} out of range (0-{len(draft_buffer)-1})"
+
+        elif name == "write_file":
+            filename = args.get("filename", "output.md")
+            content = args.get("content", "")
+            filepath = os.path.join(output_dir, filename)
+            os.makedirs(output_dir, exist_ok=True)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"File written: {filepath} ({len(content)} chars, {len(content.split())} words)"
+
+        elif name == "finish":
+            return f"FINISH: {args.get('status', 'success')}"
+
+        else:
+            return f"Error: Unknown tool '{name}'"
+
+    except Exception as e:
+        return f"Error executing {name}: {str(e)}"
+
+
+# ── Agent 主循环 ──────────────────────────────────────
+def run_agent(task: str, output_dir: str, max_steps: int = 30):
+    """运行 agent 主循环。"""
+    global draft_buffer
+    draft_buffer = []
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_path = os.path.join(output_dir, "trajectory.jsonl")
+    result_path = os.path.join(output_dir, "result.json")
+    trajectory_file = open(trajectory_path, "w", encoding="utf-8")
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
+
+    final_status = "failed"
+
+    for step in range(max_steps):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            entry = {"step": step, "error": str(e), "timestamp": time.time()}
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            time.sleep(2)
+            continue
+
+        choice = response.choices[0]
+        assistant_msg = choice.message
+
+        # 将 assistant 回复加入对话
+        messages.append(assistant_msg.model_dump())
+
+        # 如果没有 tool calls，继续循环
+        if not assistant_msg.tool_calls:
+            entry = {
+                "step": step,
+                "action": "text_response",
+                "content": assistant_msg.content or "",
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            continue
+
+        # 执行所有 tool calls
+        for tool_call in assistant_msg.tool_calls:
+            func_name = tool_call.function.name
+            try:
+                func_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                func_args = {}
+
+            # 执行工具
+            result = execute_tool(func_name, func_args, output_dir)
+
+            # 记录 trajectory
+            entry = {
+                "step": step,
+                "action": func_name,
+                "args": func_args,
+                "observation": result[:2000],
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            # 将工具结果加入对话
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+            # 检查是否完成
+            if func_name == "finish":
+                final_status = func_args.get("status", "success")
+                trajectory_file.close()
+                with open(result_path, "w") as f:
+                    json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+                return final_status
+
+    # 达到步数上限
+    trajectory_file.close()
+    with open(result_path, "w") as f:
+        json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+    return final_status
+
+
+# ── CLI 入口 ──────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Creative Writing Agent Harness")
+    parser.add_argument("-p", "--prompt", required=True, help="Writing task description")
+    parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max agent steps")
+    args = parser.parse_args()
+
+    print(f"Running writing agent: {args.prompt[:100]}...")
+    status = run_agent(args.prompt, args.output_dir, args.max_steps)
+    print(f"Done. Status: {status}")
+    sys.exit(0 if status == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
-## 二、功能性质
+## 核心能力要求
 
-一个成熟的创意写作 harness 运行为分层自主管线，将种子前提转化为结构连贯、风格一致的长篇手稿。
+基于上面的骨架，你需要确保 harness 具备以下能力：
 
-**多层级规划系统。** 采用三级递进规划：总纲（世界观+主线脊柱+角色弧线）→ 卷纲（节拍表+时间线+伏笔布局）→ 章纲（起始节点+推进节点+终结节点的结构化定义）。规划产出包含严格约束：每章时间锚点必须单调递增（除闪回），倒计时事件标记截止距离，相邻章结尾→开头必须逻辑承接。跨卷一致性强制：上一卷未回收的伏笔必须出现在新卷规划中。对于学术/技术写作，规划阶段综合前序研究产物（文献分析、假设列表、实验数据）构建论文骨架，每节定义严格字数范围。
-
-**三层记忆架构。** Working Memory（本章即时上下文）+ Episodic Memory（近期事件序列）+ Semantic Memory（全书长期知识，按 7 个分桶组织：角色状态/故事事实/世界规则/时间线/未回收伏笔/读者承诺/人物关系）。记忆系统具备去重机制（按主键规则合并，旧值降级为 outdated 状态），防膨胀压缩（超 500 条时清理已回收伏笔、合并远距离时间线），以及智能过滤注入（根据章纲关键词匹配筛选相关记忆 → 按优先级截断 → 控制 token 预算注入上下文）。
-
-**正典层与一致性强制。** 维护持久的"正典层"作为硬性契约：角色认知状态追踪每个实体在每个故事节点知道什么/不知道什么；时间线同步表协调并行线索；世界规则圣经记录魔法系统/物理法则/社会结构的硬约束。每次写入调用前自动读取相关正典约束注入 prompt，写入后验证无违规（如角色使用了不应知道的信息、时间线矛盾）。
-
-**风格控制与反 AI 检测。** 通过声音指纹文档定义目标风格（句法结构、词汇偏好、节奏模式），在评分时评估并作为 few-shot 锚点注入。Anti-AI 系统识别 LLM 写作癖好（万能副词、模式化开头、情感直述而非展示），维护禁止模式列表和替代方案速查表。题材裁决层根据体裁类型（玄幻/言情/悬疑/科幻）调整权重：动作描写密度、情绪弧线曲率、线索植入频率。有效风格模式积累为项目经验（hook/pacing/dialogue/payoff）供后续章节参考。
-
-**批评-修改循环。** 初稿完成后进入对抗性修订：多视角评审面板（文学评论家/类型读者/发展编辑/连续性检查员）逐维度评分——词汇层、句式层、叙事层、情感层、对话层、AI 味检测。产出优先排序的修订简报指导定向改写。修改版有长度保护（短于原文 80% 则重试加强约束，最坏保留原文）。循环持续直到：分数达标 / 连续 N 轮变化<阈值（平台检测）/ 达到最大迭代次数。反馈从实质性重构转为修饰性建议时自动终止。学术写作场景下，LLM 扮演会议评审生成 Strengths/Weaknesses/Actionable revisions，禁止在响应评审时捏造新数据。
-
-**长上下文管理。** 对于超出单次上下文限制的作品：分段写作（3+ 次 LLM 调用拼接完整文本），滚动 preamble（所有前序产物压缩为摘要注入当前阶段），RAG 混合检索（向量嵌入+BM25）支持远距离引用。记忆预算按任务类型分配（working 15 条 + episodic 8 条 + semantic 7 条，总上限 30 条），优先级排序截断（world_rule > character_state > relationship > story_fact > open_loop）。
-
-**多 Rollout 质量保证。** 同一写作任务可用不同角色/策略生成多个候选草稿（如：乐观者/怀疑者/方法论者视角），从中选择质量最高的进入下一阶段。迭代精炼：完整执行→评分→低分则重跑写作阶段→注入上轮 feedback 作为改进方向。LLM 无输出时有 default fallback 保底结构。
+- **规划能力**：根据写作任务自动生成结构化大纲（章节、要点、逻辑线）
+- **分段写作**：按大纲逐段生成内容，每段积累到草稿缓冲区
+- **自我评估**：完成初稿后对整体质量打分，给出具体修改建议
+- **定向修订**：根据评估反馈修改特定段落，而非重写全文
+- **风格控制**：遵循任务中指定的体裁、语调、字数等约束
+- **结构化输出**：`result.json` + `trajectory.jsonl`
 
 ---
 
-## 三、调用示例
+## 必须实现的扩展
 
-### Case 1：史诗奇幻系列——卷初始化（三级规划 + 正典层构建）
+以下扩展是骨架中**未提供实现**的，你必须自己编写代码完成。
+
+### 通用扩展（必须实现）
+
+**1. LLM 调用错误重试**
+- API 调用失败时指数退避重试（初始 2s，因子 2x，上限 30s，至少重试 3 次）
+- 区分可重试错误（超时、429 rate limit、5xx）和不可重试错误（401/403）
+- 尊重 API 返回的 retry-after 头
+- 重试耗尽后记录错误到 trajectory 并继续（不直接 crash）
+
+**2. 上下文窗口管理**
+- 监控消息历史总长度（字符数或 token 估算）
+- 超过阈值时分级压缩：Level 1 截断旧步骤的工具输出（保留前 N 字符 + "[truncated]"）→ Level 2 移除更早的完整轮次 → Level 3 用摘要替换历史
+- 始终保护 system prompt 和最近 N 轮完整对话不被压缩
+- 工具单次输出超过阈值时立即截断
+
+**3. 重复动作检测与 Doom Loop 防护**
+- 追踪最近 N 步的 action + 参数
+- 连续 3 次相同 tool + 相同参数 → 注入提示要求换策略
+- 连续 5 次仍重复 → 强制切换策略或终止
+- 在 trajectory 中标记检测到的重复事件
+
+**4. 步数预算管理与优雅结束**
+- 达到 max_steps 的 75% 时注入预算警告，要求优先保存已有成果
+- 达到步数上限时保存部分结果（而非空输出）
+- 任何未捕获异常都写入 result.json（status="error"），不应出现无 result.json 的情况
+- result.json 中明确区分 success / partial / failed / error 四种状态
+
+**5. 工具执行鲁棒性**
+- 每个工具调用设置超时（防止无限挂起）
+- 工具参数校验（缺少必填参数时返回明确错误信息而非 crash）
+- 工具执行异常捕获，返回结构化错误信息给 LLM（而非 traceback）
+- 工具输出截断（超过阈值时截断并标注 "[output truncated, N chars total]"）
+
+**6. 进度日志**
+- 每步在 stderr 打印：步数、执行的工具名、耗时、当前消息历史长度
+- 方便调试和监控 agent 运行状态
+
+### 领域特定扩展（必须实现）
+
+**7. 多层级规划**
+- 接收写作任务后先生成结构化大纲（outline），再按节/段生成内容
+- 大纲包含每节的要点、预估字数、风格指引
+- 后续写作步骤按大纲顺序推进
+
+**8. 批评-修订循环**
+- evaluate_draft 后如果质量不达标（按 LLM 自评分），自动触发 revise
+- 支持多维度评审：结构、逻辑、语言、风格、是否满足约束
+- 修订后再次评估，循环直到达标或达到最大迭代次数（如 3 次）
+- 修订版有长度保护：修改后字数不应低于原文 80%
+
+**9. 字数追踪与控制**
+- 每次 write_section 后自动统计当前总字数
+- 将字数信息反馈给 LLM（如 "当前已写 650 字 / 目标 800 字"）
+- 接近目标字数时提醒 LLM 准备收尾
+
+**10. 风格一致性控制**
+- SYSTEM_PROMPT 中定义目标风格参数（叙事视角、语调、词汇偏好）
+- evaluate_draft 时检查风格一致性（是否符合指定的人称、语调等约束）
+- 标记风格偏离并在修订指令中具体指出
+
+---
+
+## 调用示例
+
+### Case 1：短篇故事创作
 
 ```bash
-python -m harness -p "前提：一位失势的制图师发现她画的边界能重塑现实，被曾雇佣她的帝国追杀。体裁：史诗奇幻。目标 12 万字，3 卷。第三人称有限轮换 POV。语调：抒情但推进感强，Ursula Le Guin meets Joe Abercrombie" --output-dir ./output/
+python -m harness -p "写一篇500字的科幻短篇故事。要求：以火星殖民地为背景，主角是一名植物学家，发现了一种能在火星土壤中存活的地球植物变异体。包含悬念和情感转折。语调：冷静克制但有温度。" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Phase 1（总纲展开）：从种子前提展开完整设定——
-  - 主角 Seren Voss：制图师，34岁，负罪感驱动弧线（每卷一个弧段：否认→承担→牺牲）
-  - 反派 Chancellor Orvain：政治动机+个人执念双层
-  - 魔法系统规则圣经：墨缚约束（画出即成真，但代价为等价地理消亡）、制图师等级（学徒/大师/禁界者）、四条硬性约束（不可逆、范围与墨量成正比、需亲眼所见之地、使用后 72h 体力衰竭）
-  - 三卷情节脊柱：卷一（发现+逃亡）卷二（联盟+反击）卷三（真相+代价），含幕级转折点
-- Phase 2（卷一大纲）：28 章结构化定义——
-  - 每章含 3-5 场景节拍，指定 POV 角色、地点、冲突类型和故事价值转换
-  - 示例 Ch.4 Beat 2："Seren 发现她擦去的 Thornmere 地图导致小镇消失——价值转换：否认→恐惧"
-  - 伏笔钩子标记：Ch.3 植入"银墨来源之谜"，预计 Ch.19 回收；Ch.7 植入"Orvain 的真实身份线索"，预计卷二回收
-- Phase 3（声音指纹）：
-  - 分析 Le Guin 特征：长周期句+自然意象+哲思插入 vs Abercrombie 特征：简洁内心独白+黑色幽默+动作场景断句
-  - 生成混合规则：叙事段落用 Le Guin 节奏，对话和战斗用 Abercrombie 节奏
-  - Anti-AI 禁止列表：禁用"缓缓""淡淡""不禁""恍若""仿佛一切都..."等
-- Phase 4（正典层初始化）：
-  - 角色认知状态表：Seren 知道制图术基础、不知道银墨来源、不知道 Orvain 真实动机
-  - 三 POV 线程时间线同步表（Seren / Orvain 视角 / 盟友 Kael）
-  - 世界规则 hash 索引（写入时对比验证）
+**预期行为：**
+1. `plan_outline(title="火星花园", outline="引入：植物学家日常...转折：发现变异体...高潮：变异体的真正含义...结尾：希望与代价")` → 建立故事结构
+2. `write_section("开篇", "第37个火星日，陈岚...")` → 写开篇段落
+3. `write_section("发展", "变异体的根系...")` → 写发展段落
+4. `write_section("高潮与结尾", "当她把样本...")` → 写结尾段落
+5. `evaluate_draft(criteria="叙事节奏、情感深度、科幻细节、字数控制", feedback="...", score=7)` → 评估初稿
+6. `revise_section(section_index=1, revised_content="...", changes_made="加强悬念感")` → 修订薄弱段落
+7. `write_file("story.md", 完整终稿)` → 保存最终版本
+8. `finish(status="success")`
 
-**产物：** `MASTER_SETTING.json`（魔法系统+地理+历史），`volume_1_outline.md`（28 章结构化大纲），`voice_fingerprint.md`（风格规则+禁止模式），`entity_registry.json`（角色认知状态），`timeline_sync.csv`（三线程时间同步），`foreshadow_tracker.json`（伏笔植入/回收计划）
-
----
-
-### Case 2：悬疑小说——中段章节生成（记忆检索 + 认知约束 + 审查循环）
+### Case 2：结构化议论文
 
 ```bash
-python -m harness -p "起草第 14 章 'The Second Witness'。POV: Detective Mara Cosgrave。节拍：[Mara 对峙证人 Yusuf Okafor 后者翻供] [Mara 注意到与法医报告矛盾的细节] [章末 Mara 手机显示被停职搭档的未接来电]" --output-dir ./output/
+python -m harness -p "写一篇800字的议论文，主题：'远程办公是否应成为知识工作者的默认模式'。要求：包含引言、正方论点（2个）、反方论点（1个）、反驳、结论。引用具体数据或案例支撑论点。语调：理性客观。" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Context Loading（记忆注入）：
-  - Working Memory: 第 13 章摘要（Mara 刚从证物室回来，发现仓库火灾时间戳有偏差）
-  - Episodic Memory: 近 3 章事件链（ch.12 Yusuf 首次作证 → ch.13 法医报告到达 → ch.14 当前）
-  - Semantic Memory 过滤：根据章纲关键词"Yusuf""法医""翻供"匹配——注入 Yusuf 档案、Mara 认知状态（知道仓库火灾/不知道 Yusuf 与受害者家族关联）、活跃情节线（7 条中 3 条标记"14-16 章收敛"）
-  - 正典约束：Mara 此时绝对不能知道的信息列表（Saya 存活、Yusuf 家族联系、搭档被停职的真正原因）
-- Draft Generation（3,200 字）：
-  - 场景 1：审讯室对峙，对话密集，Yusuf 翻供（从"我那晚不在场"改为"我可能在附近但不记得细节"）
-  - 场景 2：Mara 翻阅法医报告时注意到——报告记录火灾起始时间 23:15，但 Yusuf 首次作证称"午夜后才听到动静"。矛盾植入完成
-  - 场景 3：离开审讯室，手机震动——3 个未接来电来自被停职搭档 Det. Farrow。不接。
-- Quality Check（六维审查）：
-  - 词汇层：OK（无万能副词堆积）
-  - 句式层：标记一处——连续 3 个"She+动词"结构，自动替换第 2 个为动作先行
-  - 叙事层：标记一处"telling"段落（"Mara felt suspicious"→ 改为展示："她的手指无意识地敲着报告封面的日期戳"）
-  - AI 味检测：通过（无模式化开头/结尾）
-  - 声音评估（目标：简洁 Ellroy 式节奏）：7.8/10，过阈值
-- Post-write Updates：
-  - entity_registry: Mara 现在知道 Yusuf 翻供 + 法医时间戳矛盾
-  - foreshadow_tracker: "法医矛盾"伏笔植入，deadline: Ch.18 前必须回收
-  - timeline_sync: ch.14 时间点标记（案发后 Day 6, 14:30-16:00）
-
-**产物：** `chapters/ch14_the_second_witness.md`（3,200 字终稿），`revision_log_ch14.json`（2 处内联修订记录），更新的 `entity_registry.json` 和 `foreshadow_tracker.json`
+**预期行为：**
+1. `plan_outline(title="远程办公的未来", outline="引言：后疫情时代的工作方式变革...正方1：生产力数据...正方2：人才获取...反方：协作与文化挑战...反驳...结论")` → 建立论证结构
+2. `write_section("引言", "2020年以来...")` → 写引言
+3. `write_section("正方论点", "斯坦福大学研究显示...")` → 写正方论据
+4. `write_section("反方与反驳", "然而批评者指出...")` → 写反方和反驳
+5. `write_section("结论", "综合以上分析...")` → 写结论
+6. `evaluate_draft(criteria="论证逻辑、证据质量、结构完整性、字数", feedback="...", score=8)` → 评估
+7. `write_file("essay.md", 完整终稿)` → 保存
+8. `finish(status="success")`
 
 ---
 
-### Case 3：文学小说——全卷对抗性修订（多评审 + 收敛检测）
-
-```bash
-python -m harness -p "对卷一执行对抗性修订。关注：[第 8-12 章节奏] [Elena 声音一致性] [兄弟债务支线的解决]。最多 4 轮修订" --output-dir ./output/
-```
-
-**行为轨迹：**
-- 准备阶段：加载卷一全稿（1-24 章，~85,000 字）——通过压缩摘要 + RAG 检索构建评审上下文（非逐章全文注入）
-- 第 1 轮（诊断）：
-  - 4 人设评审面板独立评估三个目标维度：
-    - 文学评论家：Ch.9-11 节奏死区（场景转换过缓，内心独白过长），参与度评分 5.2/10
-    - 类型读者：Ch.10-11 缺少悬念钩子，连续两章无章末悬念
-    - 发展编辑：Elena 两个 POV 章的句法模式漂移——第一次出现时用断句+地中海习语，Ch.15/Ch.19 退化为通用叙述者语调
-    - 连续性检查员：兄弟债务线 Ch.6 引入，Ch.7 提及，之后到 Ch.22 才再次出现——16 章空白期过长
-  - 综合修订简报：3 个 HIGH 优先级 issue（节奏/声音/支线断裂）
-- 第 2 轮（定向修订）：
-  - Ch.9：从 4,100 字压缩至 2,800（删除冗余闪回，保留核心情感转折）
-  - Ch.10：新增 400 字推进债务线（加入兄弟打来的未接电话 + 主角回避反应），章末加钩子
-  - Ch.11：拆分过长场景为两个，中间插入节奏转换
-  - Elena 章节（Ch.15, Ch.19）：重新注入声音锚点——恢复其标志性断句模式和地中海习语（"Madonna mia"/"总是用食物比喻情感"）
-- 第 3 轮（重评）：
-  - 节奏评分：5.2 → 7.1（+1.9）
-  - Elena 一致性：6.0 → 8.4（+2.4）
-  - 支线连续性：已解决（Ch.10 新增内容建立了过渡）
-  - 反馈性质分析：从"需要实质性重构"转为"轻微措辞优化建议"——检测到收敛平台
-- 在第 3 轮终止（低于 max 4 轮），生成修订对比报告
-
-**产物：** `revision_report_v1.md`（含逐章 delta 评分表 + 前后对比摘要），8 个章节文件被修改（Ch.9-11, Ch.15, Ch.19 + 3 个连带调整），`revision_history.json`（完整修订 diff 日志），更新的 `voice_fingerprint.md`（新增 Elena 特征条目）
-
----
-
-### Case 4：连载网文——大规模连续性管理（远距离引用 + 认知隔离 + 记忆压缩）
-
-```bash
-python -m harness -p "起草第 147 章 'What the River Remembers'。系列《流浪王座》卷六。POV: Kael。约束：[必须引用 Kael 在 ch.38 对 Commander Lirien 的誓言] [河灵魔法系统：代价是记忆而非法力] [Kael 尚不知 Saya 在 ch.142 桥塌中存活]" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Context Assembly（智能记忆注入）：
-  - RAG 检索 "ch.38 誓言"：精确定位原始措辞——"以河灵之名，Commander，我的剑永不指向 Thornwood 子民"
-  - 世界圣经检索 "河灵魔法"：规则集——代价为记忆（与法术规模成正比），不可恢复，施法者可选择牺牲哪段记忆，大规模法术可能导致人格碎片
-  - Kael 当前认知状态：412 条已知事实 + 23 条显式排除（含"Saya 在 ch.142 桥塌中存活"）
-  - Working Memory：最近 3 章摘要（ch.144 Kael 到达河岸 / ch.145 发现河灵祭坛 / ch.146 准备仪式）
-  - 卷六大纲中 ch.147 节拍指引
-  - 记忆预算分配：working 8 + episodic 5 + semantic 10（河灵规则和誓言为高优先级）= 23 条，在预算内
-- Draft Generation（2,900 字）：
-  - 开篇：Kael 站在河畔祭坛前，内心独白引用誓言原文（自然嵌入而非生硬引用）
-  - 核心场景：Kael 施展河灵之力拯救下游村庄——选择牺牲的记忆：对姐姐名字的记忆（从 ch.12 既有背景中选取，确保该记忆确实存在于角色历史中）
-  - 情感高潮：法术完成后 Kael 发现自己想不起"那个人"的名字，只知道自己曾经有一个很重要的人（戏剧反讽——读者知道 Saya 活着且正在赶来）
-  - 章末：Kael 在河边发现一朵不应在此季节开放的白莲——暗示河灵对牺牲的回应（新伏笔植入）
-- Consistency Verification：
-  - ✓ 誓言引用匹配 ch.38 源文本（逐字核对）
-  - ✓ 记忆代价规则合规（代价与法术规模成正比——拯救村庄=中等规模→失去一段重要记忆，合理）
-  - ✓ Kael 对话和内心独白无信息泄漏（未提及 Saya 存活、未暗示知道她的下落）
-  - ✓ 时间线一致（ch.147 距 ch.146 一天，符合叙事节奏）
-- Post-write State Updates：
-  - Kael 认知状态更新：新增排除——"不记得姐姐名字"（HIGH impact 标记，需后续响应）
-  - 伏笔植入：白莲意象，建议回收点 ch.155-160
-  - 时间线：ch.147 = Day 312, Saya 时间线（并行线程）在 Day 317，预计 ch.152 收敛
-
-**产物：** `chapters/v6_ch147_what_the_river_remembers.md`（2,900 字终稿），更新的 `entity_states/kael.json`（记忆清单修改 + impact 标记），`continuity_check_ch147.json`（pass, 0 violations），更新的 `timeline_sync.csv`，`foreshadow_tracker.json`（新增白莲条目）
-
----
-
-### Case 5：情感智力角色扮演——复杂人际冲突场景（心智理论 + 多方共情 + 结构化情感分析）
-
-```bash
-python -m harness -p "角色扮演场景：你是 Alex 的老朋友。Alex 刚发现伴侣 Jordan 一直在跟前任频繁联系（每天 20+ 条消息），Jordan 说'只是朋友'但删除了聊天记录。Alex 现在打电话给你说'我觉得我疯了，也许我反应过度了'。上下文：Alex 前段恋情因对方出轨结束，有信任创伤。Jordan 不知道 Alex 看到了消息记录。要求输出三段：[内心思考与感受] [对方心理分析] [角色内回应]，总计约1000字" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Phase 1（场景解析与心智建模）：
-  - 识别关键情感要素：Alex 的信任创伤史 → 当前触发 → 自我怀疑（"也许我反应过度"是创伤后常见的自我否定模式）
-  - 多方心智模型构建：
-    - Alex：信任创伤激活 + 试图理性化("也许我疯了") + 寻求外部验证
-    - Jordan：删除记录=有意隐瞒（无论动机）→ 行为本身成立为问题
-    - 前任（隐含第三方）：角色未知但频率异常
-  - 场景约束识别：作为朋友角色——需要验证感受但不火上浇油，不替 Alex 做决定
-
-- Phase 2（结构化情感写作）：
-
-  **[内心思考与感受]（~300 字）：**
-  - 生成友人视角内心独白：听到 Alex 的声音就知道事情严重——那种刻意平静的语调和上次发现出轨时一模一样
-  - 内心矛盾：想直接说"这不正常"但知道 Alex 现在需要的不是判断，而是一个安全空间来承认自己的直觉
-  - 情绪识别：对 Jordan 有一丝愤怒（至少应该透明），同时担心 Alex 会重复旧模式——把合理的警觉当成"自己的问题"
-
-  **[对方心理分析]（~300 字）：**
-  - Alex 的心理状态：创伤后认知扭曲在运作——过去被欺骗的经历使 Alex 同时(a)对信号高度敏感和(b)不信任自己的判断。"也许我反应过度"不是真的在问是否过度反应，而是在问"我值得被认真对待吗"
-  - Jordan 的可能动机光谱：(a)确实只是朋友但知道 Alex 会不安所以隐瞒→善意但有害 (b)边界不清但无恶意 (c)情感上已在移动但自己未承认。无论哪种——删记录这个行为本身就是一个独立的信任问题
-  - 关系动态：Alex-Jordan 间存在信息不对称（Alex 知道但 Jordan 不知道 Alex 知道），这造成了额外的权力失衡
-
-  **[角色内回应]（~400 字）：**
-  - 开头不是"你有权感到..."这类套话，而是具体化："等等——每天二十多条消息然后删掉？Alex，我先问你一个问题：如果是我跟你说这事儿，你会觉得'我朋友反应过度了'吗？"
-  - 中段验证感受但不评判 Jordan："你不是疯了。你看到了一个事实——频繁联系+删除记录。这两件事放在一起，任何人都会不安。这跟你过去的经历无关，这是现在发生的事。"
-  - 不替 Alex 做决定，但点出下一步："你不需要现在就知道该怎么办。但我觉得有一件事是清楚的——你现在掌握了信息但 Jordan 不知道你知道。这个不对称待得越久，你越难受。"
-  - 结尾留余地但表达支持："不管你想怎么处理，我都在。但 Alex——别把'合理的警觉'当成'自己有问题'。那是两码事。"
-
-- Phase 3（质量审查）：
-  - 共情维度：验证了 Alex 的感受而非否定 ✓
-  - 心智理论：准确建模了三方心理状态 + 识别出自我否定的创伤模式 ✓
-  - 社交灵敏度：没有直接下判断/没有说"离开他"/没有过度安慰"肯定没事" ✓
-  - Anti-AI 检查：无"我理解你的感受"/"这确实很难"等空泛套话，用具体反问和镜像技术替代 ✓
-  - 情绪推理深度：识别了表面问题(消息)vs 底层问题(删记录=信任)vs 元问题(Alex 的自我怀疑) ✓
-
-**产物：** `response.md`（三段结构化回应，~1000 字），`emotional_analysis.json`（场景心智模型 + 各方情绪状态映射 + 冲突维度识别），`quality_scores.json`（各维度评分）
-
----
-
-## 四、技术栈
+## 技术要求
 
 - Python 3.11+，type hints
-- LLM 调用：`openai` SDK，OpenAI 兼容接口。环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
-- 可用：无额外特殊依赖
-- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- LLM 调用：`openai` SDK，通过环境变量配置：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
+- 禁止使用：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- 必须提供 `Dockerfile`（基于 `python:3.11-slim`）和 `requirements.txt`
+- Dockerfile 中 LLM 配置通过环境变量注入，不硬编码
 
 ---
 
-## 五、环境打包
+## 最低要求清单
 
-必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
+你的 harness **必须**满足以下所有条件：
 
-- 基于 `python:3.11-slim` 或同级官方镜像
-- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`）
-- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
-- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
+1. ✅ `python -m harness -p "..." --output-dir ./output/` 可运行
+2. ✅ 使用 `openai` SDK 调用 LLM（至少每个任务调用 1 次）
+3. ✅ 使用 function calling / tool calling 模式驱动工具执行
+4. ✅ 至少实现 4 个工具：plan_outline, write_section, evaluate_draft, finish
+5. ✅ 产出 `result.json`（含 status 和 trajectory 字段）
+6. ✅ 产出 `trajectory.jsonl`（每步记录 action 和 observation）
+7. ✅ 提供 `Dockerfile` 和 `requirements.txt`
+8. ✅ LLM API 调用有指数退避重试（至少 3 次）
+9. ✅ 消息历史超长时自动压缩（截断旧工具输出或移除旧轮次）
+10. ✅ 检测连续相同动作并注入策略切换提示
+11. ✅ 达到步数上限时保存部分结果，异常时仍输出 result.json

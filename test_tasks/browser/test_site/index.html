@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Test Commerce Site</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #4CAF50; color: white; }
+        form { background: #f9f9f9; padding: 20px; border-radius: 5px; margin: 20px 0; }
+        label { display: block; margin: 10px 0 5px; }
+        input, select { width: 100%; padding: 8px; margin-bottom: 10px; box-sizing: border-box; }
+        button { background: #4CAF50; color: white; padding: 10px 20px; border: none; cursor: pointer; }
+        #result { display: none; background: #dff0d8; padding: 15px; margin: 10px 0; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>Welcome to TestShop</h1>
+    <p>Browse our products and register for exclusive deals.</p>
+
+    <h2>Registration Form</h2>
+    <form id="regForm" onsubmit="return handleSubmit(event)">
+        <label for="name">Full Name:</label>
+        <input type="text" id="name" name="name" required placeholder="Enter your name">
+
+        <label for="email">Email:</label>
+        <input type="email" id="email" name="email" required placeholder="Enter your email">
+
+        <label for="category">Preferred Category:</label>
+        <select id="category" name="category">
+            <option value="electronics">Electronics</option>
+            <option value="books">Books</option>
+            <option value="clothing">Clothing</option>
+        </select>
+
+        <button type="submit">Register</button>
+    </form>
+    <div id="result">Registration successful! Welcome, <span id="welcomeName"></span>!</div>
+
+    <h2>Product Catalog</h2>
+    <table id="productTable">
+        <thead>
+            <tr>
+                <th>Product</th>
+                <th>Category</th>
+                <th>Price</th>
+                <th>In Stock</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>Wireless Mouse</td><td>Electronics</td><td>$29.99</td><td>Yes</td></tr>
+            <tr><td>Python Cookbook</td><td>Books</td><td>$45.00</td><td>Yes</td></tr>
+            <tr><td>USB-C Hub</td><td>Electronics</td><td>$59.99</td><td>No</td></tr>
+            <tr><td>Cotton T-Shirt</td><td>Clothing</td><td>$19.99</td><td>Yes</td></tr>
+            <tr><td>Mechanical Keyboard</td><td>Electronics</td><td>$89.99</td><td>Yes</td></tr>
+            <tr><td>Clean Code</td><td>Books</td><td>$39.99</td><td>Yes</td></tr>
+            <tr><td>Denim Jacket</td><td>Clothing</td><td>$79.99</td><td>No</td></tr>
+            <tr><td>Monitor Stand</td><td>Electronics</td><td>$34.99</td><td>Yes</td></tr>
+        </tbody>
+    </table>
+
+    <h2>Contact</h2>
+    <p>Email us at <a href="mailto:support@testshop.example.com">support@testshop.example.com</a></p>
+    <p>Visit our <a href="/about">About page</a> for more info.</p>
+
+    <script>
+        function handleSubmit(event) {
+            event.preventDefault();
+            var name = document.getElementById('name').value;
+            document.getElementById('welcomeName').textContent = name;
+            document.getElementById('result').style.display = 'block';
+            return false;
+        }
+    </script>
+</body>
+</html>

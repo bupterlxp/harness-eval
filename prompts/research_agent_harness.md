@@ -1,238 +1,495 @@
-# Agent Harness 构建任务：研究智能体（Research Agent）
+# 构建研究智能体 Harness
 
-构建一个通用的深度研究 harness，能接受研究问题，自主完成信息检索、来源评估、证据组织和结构化报告生成。
+构建一个研究智能体：接收自然语言研究问题，通过 LLM 驱动的多轮检索-分析循环，自主搜索信息、评估来源、生成结构化研究报告。
 
 ---
 
-## 一、入口与输出
+## 接口
 
 ```bash
-python -m harness -p "任务描述" --output-dir ./output/
+python -m harness -p "研究问题" --output-dir ./output/
 ```
 
-- `-p`：自然语言任务描述（harness 自行解析并执行）
-- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
+执行完成后在 `--output-dir` 下生成：
+- `result.json`：`{"status": "success"|"partial"|"failed", "trajectory": "trajectory.jsonl"}`
+- `trajectory.jsonl`：每行一个 JSON，记录每步的 action 和 observation
 
-`result.json` 必须包含以下字段，其余字段可自行扩展：
+---
+
+## 文件结构
+
+你必须创建以下文件结构：
+
+```
+harness/
+  __init__.py        # 空文件或简短描述
+  __main__.py        # 入口：从主模块导入 main 并执行
+Dockerfile
+requirements.txt
+```
+
+关键：`python -m harness` 要求 `harness/` 目录下有 `__main__.py` 文件。最简单的做法是把所有代码放在 `harness/__main__.py` 中。
+
+---
+
+## 代码骨架
+
+以下是**完整可运行的骨架代码**。你必须基于它构建 harness，保留核心结构（LLM 调用循环 + tool calling），按需扩展工具实现和错误处理。
+
+**⚠️ 关键约束：骨架中的以下全局变量必须保留，禁止删除、重命名或移到函数内部：**
+- `client = OpenAI(...)` — LLM 客户端实例
+- `MODEL = os.environ.get("MODEL_NAME", "gpt-4")` — 模型名称
+- `SYSTEM_PROMPT = """..."""` — 系统提示词
+- `TOOLS = [...]` — 工具定义列表
+你可以修改它们的内容，但变量名和初始化位置必须保持在模块顶层。
+
+**重要：harness 运行在无互联网的 Docker 容器中，无法访问真实搜索引擎。`search_web` 工具通过调用 LLM 本身来提供信息——LLM 充当知识源，根据查询返回相关事实和数据。**
 
 ```python
-{
-    "status": str,       # "success" | "partial" | "failed"
-    "trajectory": str,   # JSONL trajectory 文件路径
-}
+#!/usr/bin/env python3
+"""Research Agent Harness - 自主研究智能体"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from openai import OpenAI
+
+# ── 配置 ─────────────────────────────────────────────
+client = OpenAI(
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    api_key=os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
+)
+MODEL = os.environ.get("MODEL_NAME", "gpt-4")
+
+SYSTEM_PROMPT = """You are a research agent. You investigate questions by searching for information, analyzing sources, and writing structured reports.
+
+Workflow:
+1. Decompose the research question into sub-questions
+2. Use search_web to gather information on each sub-question (multiple rounds if needed)
+3. Use analyze_sources to synthesize findings and identify knowledge gaps
+4. Use write_report to compose the final structured report section by section
+5. Call finish when the research is complete
+
+Always cite your sources. Track what you have learned and what gaps remain after each search round."""
+
+# ── 工具定义（OpenAI function calling 格式）────────────
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search for information on a topic. Returns relevant facts, data, and source descriptions. Use specific queries for best results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "num_results": {"type": "integer", "description": "Number of results to return (default 5)"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_sources",
+            "description": "Synthesize and analyze collected findings. Identifies patterns, contradictions, and knowledge gaps.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "findings": {"type": "string", "description": "Collected findings to analyze"},
+                    "question": {"type": "string", "description": "The research question being addressed"},
+                },
+                "required": ["findings", "question"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_report",
+            "description": "Write a section of the research report to a file. Appends to the file if it exists.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path for the report (e.g. report.md)"},
+                    "section_title": {"type": "string", "description": "Title of this report section"},
+                    "content": {"type": "string", "description": "Section content in markdown"},
+                },
+                "required": ["path", "section_title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read contents of a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file (creates or overwrites)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "content": {"type": "string", "description": "Full file content"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Signal that the research is complete",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+                    "summary": {"type": "string", "description": "Brief summary of research findings"},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+]
+
+
+# ── 工具执行 ──────────────────────────────────────────
+def execute_tool(name: str, args: dict) -> str:
+    """执行工具调用，返回结果字符串。"""
+    try:
+        if name == "search_web":
+            # 无互联网环境：用 LLM 自身作为知识源
+            query = args["query"]
+            num_results = args.get("num_results", 5)
+            search_prompt = (
+                f"You are a search engine. For the query below, provide {num_results} "
+                f"relevant and factual results. Each result should have a title, a brief "
+                f"description of the source, and key facts/data. Be specific and cite "
+                f"plausible sources (academic papers, official reports, news articles).\n\n"
+                f"Query: {query}"
+            )
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": search_prompt}],
+            )
+            return resp.choices[0].message.content or "No results found."
+
+        elif name == "analyze_sources":
+            findings = args["findings"]
+            question = args["question"]
+            analysis_prompt = (
+                f"Analyze the following research findings for the question: {question}\n\n"
+                f"Findings:\n{findings}\n\n"
+                f"Provide:\n1. Key themes and patterns\n2. Contradictions between sources\n"
+                f"3. Knowledge gaps that need further research\n4. Confidence assessment"
+            )
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": analysis_prompt}],
+            )
+            return resp.choices[0].message.content or "Analysis failed."
+
+        elif name == "write_report":
+            path = args["path"]
+            title = args["section_title"]
+            content = args["content"]
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+            mode = "a" if os.path.exists(path) else "w"
+            with open(path, mode, encoding="utf-8") as f:
+                f.write(f"\n## {title}\n\n{content}\n")
+            return f"Section '{title}' written to {path}"
+
+        elif name == "read_file":
+            path = args["path"]
+            if not os.path.exists(path):
+                return f"Error: File not found: {path}"
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            return text[:10000]
+
+        elif name == "write_file":
+            path = args["path"]
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(args["content"])
+            return f"File written: {path} ({len(args['content'])} chars)"
+
+        elif name == "finish":
+            return f"FINISH: {args.get('status', 'success')}"
+
+        else:
+            return f"Error: Unknown tool '{name}'"
+
+    except Exception as e:
+        return f"Error executing {name}: {str(e)}"
+
+
+# ── Agent 主循环 ──────────────────────────────────────
+def run_agent(task: str, output_dir: str, max_steps: int = 30):
+    """运行 agent 主循环。"""
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_path = os.path.join(output_dir, "trajectory.jsonl")
+    result_path = os.path.join(output_dir, "result.json")
+    trajectory_file = open(trajectory_path, "w", encoding="utf-8")
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
+
+    final_status = "failed"
+
+    for step in range(max_steps):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            entry = {"step": step, "error": str(e), "timestamp": time.time()}
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            time.sleep(2)
+            continue
+
+        choice = response.choices[0]
+        assistant_msg = choice.message
+
+        # 将 assistant 回复加入对话
+        messages.append(assistant_msg.model_dump())
+
+        # 如果没有 tool calls，记录并继续
+        if not assistant_msg.tool_calls:
+            entry = {
+                "step": step,
+                "action": "text_response",
+                "content": assistant_msg.content or "",
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            continue
+
+        # 执行所有 tool calls
+        for tool_call in assistant_msg.tool_calls:
+            func_name = tool_call.function.name
+            try:
+                func_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                func_args = {}
+
+            result = execute_tool(func_name, func_args)
+
+            # 记录 trajectory
+            entry = {
+                "step": step,
+                "action": func_name,
+                "args": func_args,
+                "observation": result[:2000],
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            # 将工具结果加入对话
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+            # 检查是否完成
+            if func_name == "finish":
+                final_status = func_args.get("status", "success")
+                trajectory_file.close()
+                with open(result_path, "w") as f:
+                    json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+                return final_status
+
+    # 达到步数上限
+    trajectory_file.close()
+    with open(result_path, "w") as f:
+        json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+    return final_status
+
+
+# ── CLI 入口 ──────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Research Agent Harness")
+    parser.add_argument("-p", "--prompt", required=True, help="Research question")
+    parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max agent steps")
+    args = parser.parse_args()
+
+    print(f"Running research agent: {args.prompt[:100]}...")
+    status = run_agent(args.prompt, args.output_dir, args.max_steps)
+    print(f"Done. Status: {status}")
+    sys.exit(0 if status == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
-## 二、功能性质
+## 核心能力要求
 
-一个成熟的研究智能体 harness 接收自然语言研究问题后，自主将其分解为校准知识缺口的子问题树，通过多跳迭代检索构建证据体系，最终合成有据可查的结构化报告。
+基于上面的骨架，你需要确保 harness 具备以下能力：
 
-**多跳迭代检索。** 核心搜索引擎以广度×深度参数控制的递归模式运行：初始广泛搜索（breadth 个并行子查询）产出初步发现，对每层结果分析不足之处和知识缺口，自动生成精炼的后续查询深入追踪特定线索——每个周期继承前序轮次的累积认知。搜索深度逐层递减（每层广度减半直到下限），形成先宽后深的搜索树。支持多引擎并行搜索（通用 Web、学术论文库、专业数据源），并发抓取网页内容后用智能摘要压缩为证据片段。整个检索过程以迭代周期运行（默认 3-4 轮），每轮输出：当前发现 → 知识缺口分析 → 下一轮查询计划。
-
-**证据管理与质量评估。** 每个检索到的文档经过处理管线：内容提取 → 文本分块（1000 字/块，100 字重叠）→ 向量嵌入相似度过滤（阈值 0.35 以上保留）→ 结构化证据卡片生成（标题/支持内容/矛盾证据/来源 URL/摘要/标签/质量评分/唯一 ID）。证据池具备：URL 去重防止重复抓取、上下文词数限制（25000 词上限动态截断）、小文档优化（总字符<8000 时跳过嵌入压缩直接使用）。跨多条证据的综合分析记录为 Analysis 文档，引用具体证据 ID，支持比较/框架映射/场景分析等推理模式。
-
-**矛盾处理与多元视角。** 当来源间出现矛盾时，harness 保留竞争性主张及其各自归属而非静默丢弃少数观点。矛盾检测通过对同一事实点的多源证据交叉比对实现，在最终合成中显式呈现分歧并标注各方引用。用户可配置矛盾处理策略（并列呈现/权重排序/显式解决）。
-
-**任务分解与并行编排。** 支持多种分析框架指导分解（MECE/金字塔/BCG矩阵/帕累托/SWOT/价值链），复杂研究问题被拆解为带依赖关系的子任务 DAG：无依赖的子查询通过 asyncio 并发执行，有依赖的按序等待前驱完成。层级分解从高层问题→子问题→具体搜索查询，每层可独立评估完成度。支持 parallel/sequential 两种执行模式混合。
-
-**引用系统与溯源。** 全程维护 learning→URL 的精确映射。报告中每个事实性主张映射到一个或多个编号引用 `[N]`，来自经验证的证据池。尾部参考文献列表提供完整源信息（URL、标题、检索时间戳）。系统通过仅从实际引用的来源构建参考文献列表来强制引用一致性——消除孤立引用或虚假引用。支持 APA 格式和行内超链接两种引用风格。
-
-**报告生成与精确问答。** 支持两种输出模式：(1) 结构化报告——多种类型（对比评估/综述/大纲/深度研究），长报告采用分段写作（先 outline 逐节生成再拼接）；(2) 精确问答——对于有明确答案的问题（事实性问题、计算题、专业知识题），在研究完成后提炼为简洁的直接答案（可能是一个数字、一个名称、一段公式推导、或一个多选项判断），避免输出冗长报告而丧失问题解答精度。系统根据问题类型自动判断输出模式：开放探索性问题→报告，封闭事实性问题→精确答案+支撑证据。综合多层深度研究结果时，从所有搜索层的发现中提炼主题和趋势。严格遵循"仅基于检索到的证据"原则，禁止使用模型训练知识填充，确保每个主张都有证据支撑。
-
-**上下文管理与预算控制。** 上下文词数硬限（25000 词），超限时动态截断最低相关性证据。搜索过程维护 visited_urls 集合避免重复访问。接近最大搜索轮次时注入提醒要求优先完成关键证据收集而非继续扩展新方向。证据库支持跨运行共享和断点续传。可配置的深度（depth）和广度（breadth）参数控制详尽覆盖与计算成本间的权衡。
-
-**多 Agent 协作架构。** 支持 Researcher→Searcher→Reporter 三角色分工：Researcher 作为主控分析问题和规划搜索方向；多个 Searcher 并行执行搜索、抓取和证据提取；Reporter 综合所有 Searcher 结果生成最终结构化报告。每个 Searcher 独立配置搜索轮数和并发参数，可适应不同子任务的复杂度。
+- **问题分解**：将复杂研究问题拆解为可独立检索的子问题
+- **迭代检索**：多轮搜索，每轮根据前序结果的知识缺口生成新查询
+- **来源追踪**：记录每条信息的来源，维护来源列表
+- **报告生成**：将研究结果组织为结构化 markdown 报告（引言、分节、结论）
+- **引用管理**：报告中的事实性主张附带编号引用 `[N]`，尾部列出参考来源
+- **结构化输出**：`result.json` + `trajectory.jsonl`
 
 ---
 
-## 三、调用示例
+## 必须实现的扩展
 
-### Case 1：技术对比评估（多维度搜索 + 矛盾处理 + 结构化对比）
+以下扩展是骨架中**未提供实现**的，你必须自己编写代码完成。
+
+### 通用扩展（必须实现）
+
+**1. LLM 调用错误重试**
+- API 调用失败时指数退避重试（初始 2s，因子 2x，上限 30s，至少重试 3 次）
+- 区分可重试错误（超时、429 rate limit、5xx）和不可重试错误（401/403）
+- 尊重 API 返回的 retry-after 头
+- 重试耗尽后记录错误到 trajectory 并继续（不直接 crash）
+
+**2. 上下文窗口管理**
+- 监控消息历史总长度（字符数或 token 估算）
+- 超过阈值时分级压缩：Level 1 截断旧步骤的工具输出（保留前 N 字符 + "[truncated]"）→ Level 2 移除更早的完整轮次 → Level 3 用摘要替换历史
+- 始终保护 system prompt 和最近 N 轮完整对话不被压缩
+- 工具单次输出超过阈值时立即截断
+
+**3. 重复动作检测与 Doom Loop 防护**
+- 追踪最近 N 步的 action + 参数
+- 连续 3 次相同 tool + 相同参数 → 注入提示要求换策略
+- 连续 5 次仍重复 → 强制切换策略或终止
+- 在 trajectory 中标记检测到的重复事件
+
+**4. 步数预算管理与优雅结束**
+- 达到 max_steps 的 75% 时注入预算警告，要求优先保存已有成果
+- 达到步数上限时保存部分结果（而非空输出）
+- 任何未捕获异常都写入 result.json（status="error"），不应出现无 result.json 的情况
+- result.json 中明确区分 success / partial / failed / error 四种状态
+
+**5. 工具执行鲁棒性**
+- 每个工具调用设置超时（防止无限挂起）
+- 工具参数校验（缺少必填参数时返回明确错误信息而非 crash）
+- 工具执行异常捕获，返回结构化错误信息给 LLM（而非 traceback）
+- 工具输出截断（超过阈值时截断并标注 "[output truncated, N chars total]"）
+
+**6. 进度日志**
+- 每步在 stderr 打印：步数、执行的工具名、耗时、当前消息历史长度
+- 方便调试和监控 agent 运行状态
+
+### 领域特定扩展（必须实现）
+
+**7. 多跳迭代检索**
+- 搜索不是一次性的：第一轮广度搜索获得初步发现，分析知识缺口后生成后续精炼查询
+- 支持至少 2-3 轮迭代检索，每轮聚焦上一轮发现的缺口
+- 维护 visited_urls / visited_queries 集合避免重复搜索
+
+**8. 证据管理与引用系统**
+- 每条检索结果生成结构化证据卡片（来源 URL、标题、关键内容摘要、质量评分）
+- 报告中每个事实性主张映射到编号引用 `[N]`
+- 尾部参考文献列表提供完整源信息
+- 强制引用一致性：无孤立引用，无虚假引用
+
+**9. 矛盾检测与多元视角**
+- 当不同来源对同一事实给出矛盾信息时，保留双方主张并标注各自来源
+- 不静默丢弃少数观点
+- 在报告中显式呈现分歧（如 "来源 [3] 认为 X，而来源 [7] 认为 Y"）
+
+**10. 输出模式自适应**
+- 开放探索性问题 → 生成结构化报告（分节、有引用、有结论）
+- 封闭事实性问题 → 精确答案 + 支撑证据（而非冗长报告）
+- 根据问题类型自动判断输出模式
+
+---
+
+## 调用示例
+
+### Case 1：技术对比评估
 
 ```bash
-python -m harness -p "对比 QuantumScape、Toyota、Samsung SDI 截至 2025 年固态电池量产就绪度，谁最接近商用 EV 部署？" --output-dir ./output/
+python -m harness -p "对比 React、Vue、Svelte 三个前端框架在性能（首屏加载、运行时性能）、生态系统成熟度、学习曲线方面的优劣，给出选型建议" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- 任务分解（MECE 框架）：
-  - 子查询 1："QuantumScape 固态电池 2024-2025 产线时间表 量产进度"
-  - 子查询 2："Toyota 全固态电池 量产计划 合作伙伴 EV 部署"
-  - 子查询 3："Samsung SDI 全固态 试产线 产能 正极材料路线"
-  - 子查询 4："固态电池 技术对比 能量密度 循环寿命 成本 2025"
-- Round 1（广度搜索，breadth=4，并行执行）：
-  - 4 个子查询同时搜索 → 从 14 个来源提取信息
-  - QuantumScape：QS-0 预生产线 2024Q4 投产，24 层电芯良率提升至 >90%，与 PowerCo(大众子公司) 合作
-  - Toyota：2027-2028 量产目标，与 Idemitsu 合作硫化物电解质，充电 10 分钟续航 1200km 目标
-  - Samsung SDI：全固态原型 2025 年展示，硫化物电解质路线，9 分钟充至 80%
-  - 通用对比数据：能量密度 400-500 Wh/kg(固态) vs 250-300(液态当前)
-- 缺口分析：
-  - Samsung SDI 正极材料技术路线细节不足
-  - QuantumScape 预估成本数据来源不一致
-- Round 2（深度追踪，针对缺口）：
-  - 追加查询："Samsung SDI 固态电池 正极材料 NMC vs 硫化物 技术路线 2025"
-  - 追加查询："QuantumScape 固态电池 电芯成本 $/kWh 预估 分析师报告"
-- 矛盾检测与处理：
-  - 来源 [3]（投行报告）预估 QuantumScape 电芯成本 $80/kWh by 2027
-  - 来源 [7]（行业分析）预估 $120-150/kWh by 2028
-  - 保留双方主张：在报告中标注 "成本预估存在分歧：乐观预测 $80/kWh [3] vs 保守预测 $120-150/kWh [7]，差异主要来自良率假设不同"
-- 证据综合（18 条证据，去重后）：
-  - 按公司分节组织：技术路线 / 产线进度 / 合作伙伴 / 量产时间表
-  - 生成对比表格（6 维度 × 3 公司）
-  - 结论排名：Toyota（规模化路径最清晰但时间最晚）> QuantumScape（进度最快但良率风险）> Samsung SDI（技术验证阶段）
+**预期行为：**
+1. 分解为 3 个子查询：各框架性能基准、生态系统对比、学习曲线评估
+2. `search_web("React Vue Svelte performance benchmark 2024")` -> 获取性能数据
+3. `search_web("React ecosystem npm packages community size")` -> 生态系统数据
+4. `search_web("Svelte learning curve developer experience")` -> 学习曲线信息
+5. `analyze_sources(findings=..., question=...)` -> 综合分析，发现性能数据的口径差异
+6. `search_web("Svelte vs React bundle size real world comparison")` -> 补充搜索填补缺口
+7. `write_report("report.md", "Introduction", ...)` -> 逐节撰写报告
+8. `write_report("report.md", "Performance Comparison", ...)` -> 性能对比（含数据表格）
+9. `write_report("report.md", "Conclusion", ...)` -> 结论与选型建议
+10. `finish(status="success")`
 
-**产物：** `report.md`（1,800 字结构化报告：Introduction / 公司分节×3 / 对比表 / 成本争议分析 / Conclusion 含排名），`sources.json`（18 条含 URL、标题、检索时间、相关性评分、质量层级），引用 [1]-[18] 全部可解析且无孤立引用
-
----
-
-### Case 2：多跳历史因果分析（迭代深入 + 交叉验证 + 学术争论呈现）
+### Case 2：复杂事实性问题
 
 ```bash
-python -m harness -p "1997 年亚洲金融危机的主要因果因素是什么？IMF 条件性如何影响泰国与韩国的复苏时间线？" --output-dir ./output/
+python -m harness -p "哪些因素导致了 2008 年全球金融危机？次贷危机、信用评级机构、金融衍生品各自扮演了什么角色？" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- 任务分解（因果链框架）：
-  - 子问题 A："1997 亚洲金融危机 触发因素 资本流动 汇率机制"
-  - 子问题 B："IMF 泰国 1997 结构调整计划 具体条件 时间线"
-  - 子问题 C："韩国 IMF 1998 改革措施 GDP 恢复曲线"
-  - 子问题 D："泰国 vs 韩国 复苏对比 为何韩国更快"
-- Round 1（广度搜索）：
-  - 从 22 个来源收集——包含学术论文(NBER working papers)、IMF 档案文档、新闻回顾(FT/WSJ)、世界银行数据
-  - 关键发现：泰国固定汇率制崩溃 → 资本外逃 → 货币贬值 59% → 银行系统性危机
-  - IMF 条件：泰国 16 条结构调整（含金融自由化+财政紧缩），韩国 14 条（含财阀改革+劳动市场开放）
-- Round 2（缺口追踪——泰国资本管制细节）：
-  - 追加查询："Thailand 1997 capital controls timeline Baht defense reserves depletion"
-  - 获得关键数据：泰国央行在危机前 5 个月秘密消耗 $23.4B 外汇储备 defend 泰铢
-- Round 3（定量交叉验证）：
-  - 世界银行 GDP 数据：韩国 1998Q1 谷底(-6.7%) → 1999Q4 恢复至危机前水平（V 形）
-  - 泰国 1998Q2 谷底(-12.5%) → 2003 才恢复（L 形/U 形）
-  - 将 GDP 恢复曲线与 IMF 项目启动日期交叉标注
-- Round 4（学术争论整理）：
-  - 争论焦点："V 形 vs L 形复苏的决定因素"
-  - Stiglitz [4] 归因于 IMF 财政紧缩使危机恶化
-  - Radelet & Sachs [11] 归因于资本账户自由化顺序不当
-  - Fischer [16] 辩护 IMF 条件性，认为韩国快速复苏证明条件有效
-  - 保留三方视角，按各自论据和证据质量呈现
-
-**产物：** `report.md`（2,200 字：危机起源(资本流动+固定汇率+道德风险) / IMF 条件包对比表 / 复苏时间线图表描述 / 学术争论三方呈现 / 结论：制度质量和改革执行力是复苏速度的关键变量），`evidence_pool.json`（26 来源，按质量分三层：Tier 1 学术/IMF 官方, Tier 2 主流媒体, Tier 3 博客/评论），引用 [1]-[22] 无断链
+**预期行为：**
+1. 分解：次贷市场机制、信用评级失灵原因、CDO/CDS 衍生品传导链、监管缺失背景
+2. `search_web("2008 financial crisis subprime mortgage causes")` -> 次贷背景
+3. `search_web("credit rating agencies role 2008 crisis Moody's S&P")` -> 评级机构问题
+4. `search_web("CDO CDS financial derivatives 2008 systemic risk")` -> 衍生品传导机制
+5. `analyze_sources(...)` -> 发现关于"谁该负主要责任"的分歧
+6. `search_web("2008 crisis regulatory failure Glass-Steagall repeal")` -> 追踪监管因素
+7. `write_report(...)` -> 撰写报告：按因果链组织（次贷发放 -> 证券化 -> 评级失真 -> 衍生品放大 -> 系统性崩溃）
+8. `write_file("sources.json", ...)` -> 保存来源列表
+9. `finish(status="success")`
 
 ---
 
-### Case 3：技术前沿综述（并行子查询 + 证据去重 + 结构化提取）
-
-```bash
-python -m harness -p "当前 RAG 系统中减少 LLM 幻觉的主流方法有哪些？总结方法、基准和报告的改进" --output-dir ./output/
-```
-
-**行为轨迹：**
-- 任务分解（方法-基准-效果三维）：
-  - 子查询 1："RAG hallucination reduction methods retrieval augmented generation 2024 2025"
-  - 子查询 2："LLM factuality benchmarks evaluation metrics TruthfulQA FActScore"
-  - 子查询 3："chain of verification self-reflection attribution RAG accuracy improvement"
-  - 子查询 4："RAG vs fine-tuning hallucination reduction comparison survey"
-- Round 1（4 个子查询并行搜索）：
-  - 返回 31 来源（arXiv 论文 18 篇、工程博客 8 篇、基准排行榜 3 个、综述论文 2 篇）
-  - 结构化提取每条证据：方法名 / 核心思路 / 使用基准 / 报告指标改进 / 发表场所
-- 证据去重：
-  - 检测到 5 个来源以不同名称描述同一 RARR(Retrofit Attribution using Research and Revision)方法
-  - 合并为单条多出处证据，保留所有 URL
-  - 最终去重后 28 条有效证据
-- Round 2（缺口追踪）：
-  - 初始结果缺少 Chain-of-Verification(CoVe) 的具体实验数据
-  - 追加查询："Chain of Verification CoVe Meta 2024 results benchmark numbers"
-  - 获得：CoVe 在 longform QA 上 factuality +23%，在 biography generation 上 -41% hallucination rate
-- 证据组织（方法分类学）：
-  - A. 检索增强类：RAG, REALM, RETRO, Self-RAG (检索时机自主决策)
-  - B. 验证修正类：CoVe, RARR, CRITIC (后验事实核查+修正)
-  - C. 归因追踪类：AttributedQA, WebGPT (每句附来源)
-  - D. 训练策略类：DPO for factuality, RLHF with factuality reward
-  - 基准对比表：TruthfulQA / FActScore / FEVER / HaluEval 跨方法对比
-- 合成：每类方法的优势/局限/适用场景 + 开放问题（检索噪音、延迟成本、多跳推理中的级联错误）
-
-**产物：** `report.md`（2,500 字综述：方法分类学(4 类) / 每类代表方法 2-3 个含效果数据 / 基准对比表 / 趋势分析(Self-RAG 和归因追踪是主流方向) / 开放问题 3 个），`sources.json`（28 条去重证据，3 条携带多出处 URL），引用 [1]-[28] 每条关联具体方法或数据主张
-
----
-
-### Case 4：政策影响分析（法规解读 + 厂商响应 + 矛盾解决）
-
-```bash
-python -m harness -p "欧盟 AI 法案的高风险分类如何影响在欧运营的招聘工具供应商？出现了哪些合规策略？" --output-dir ./output/
-```
-
-**行为轨迹：**
-- 任务分解（利益相关者框架）：
-  - 子查询 1："EU AI Act high-risk classification employment recruitment Article 6"
-  - 子查询 2："HR tech AI vendor EU AI Act compliance response 2024 2025"
-  - 子查询 3："AI recruitment tool bias audit conformity assessment EU requirement"
-  - 子查询 4："EU AI Act transition period timeline enforcement penalties"
-- Round 1（17 来源）：
-  - 法规文本：Article 6(2) + Annex III 明确将"招聘和人员选拔"列为高风险
-  - 大厂响应：HireVue 宣布欧洲业务增加 bias audit、SAP SuccessFactors 建立 AI 治理团队
-  - 律所分析：高风险分类要求——合格评估+技术文档+人类监督+准确性指标+风险管理体系
-- 缺口分析：
-  - 缺少中小厂商数据——大厂有资源合规，SME 呢？
-  - 过渡期截止日有矛盾信息
-- Round 2（中小企业追踪）：
-  - 追加查询："SME AI recruitment tool EU AI Act compliance cost burden small vendor"
-  - 发现：合规成本预估 €200K-€500K/年（律所估算 [8]），部分小厂商宣布退出欧洲市场
-- Round 3（矛盾解决）：
-  - 矛盾：律所备忘录 [6] 声称过渡期为 24 个月（2025 年 8 月截止）
-  - 欧盟委员会 FAQ [9] 提及"高风险 AI 系统 36 个月过渡期"
-  - 追加查询定位法规原文 Article 83：确认高风险系统过渡期为 36 个月（2027 年 8 月）
-  - 在报告中显式解决："[6] 引用的 24 个月适用于通用 AI 模型义务，高风险系统的正确过渡期为 36 个月 [14]，符合 Article 83 原文"
-- 合成（区分已确认事实 vs 推测）：
-  - 已确认：法规分类、合规要求清单、大厂公开响应
-  - 推测性：SME 退出规模预测、长期市场集中度影响
-  - 供应商策略分类：退出欧洲(2 家小厂) / 合规适应(大厂) / 合作外包(中厂委托第三方审计)
-
-**产物：** `report.md`（1,900 字：法规背景(Article 6+Annex III) / 合规要求清单(6 项) / 供应商响应三分类(退出/适应/合作)含具体厂商名 / 合规成本估算(€200K-500K/年) / 过渡期矛盾解决(24m vs 36m→原文确认 36m) / 未解决歧义：罚金执行力度预测），`sources.json`（21 条，按类型标记：法规原文/厂商声明/律所分析/新闻报道），引用 [6] 与 [9] 矛盾在正文经 [14] 显式解决
-
----
-
-### Case 5：高难度专业问答（精确答案模式 + 多跳推理 + 证据链）
-
-```bash
-python -m harness -p "In the 1890s, a French mathematician proved that the three-body problem has no general closed-form solution expressible as algebraic and transcendental functions of time. Who was this mathematician, and what specific convergence issue did he identify with the series solutions that had been proposed?" --output-dir ./output/
-```
-
-**行为轨迹：**
-- 问题类型判断：封闭事实性问题（有明确答案）→ 切换至精确问答模式（非报告模式）
-- 任务分解（因果推理链）：
-  - 子查询 1："three-body problem no closed-form solution proof 1890s French mathematician"
-  - 子查询 2："series solution three-body problem convergence divergence history"
-- Round 1（定向搜索，breadth=2）：
-  - 来源 [1]（数学史百科）：Henri Poincaré, 1890, memoir submitted to King Oscar II prize
-  - 来源 [2]（学术论文）：Poincaré 证明了三体问题的解不能表示为时间的单值解析函数
-  - 来源 [3]（教科书引用）：之前 Lindstedt 和 Delaunay 提出的级数解在一般情况下发散
-- Round 2（精确细节追踪）：
-  - 追加查询："Poincaré three body problem series divergence small denominators"
-  - 来源 [5]：Poincaré 识别了"小分母问题"（small denominators/divisors）——当频率接近共振时，级数中的分母趋近于零导致项无界增长，使得形式级数解实际发散
-  - 来源 [6]（原始论文引用）：确认是 1890 年的 memoir（非 1892 年的 Les Méthodes Nouvelles），但后者包含更完整阐述
-- 答案提炼：
-  - 直接答案：Henri Poincaré
-  - 收敛问题：他识别出级数解中的"小分母问题"（problème des petits diviseurs）——当行星轨道频率接近有理比值（近共振条件）时，摄动级数的分母可任意接近零，导致级数发散而非收敛
-  - 证据链：[1] 身份确认 + [3] 级数发散事实 + [5][6] 小分母机制细节
-
-**产物：** `answer.json`（`{answer: "Henri Poincaré", detail: "He identified the small divisors problem...", confidence: 0.95, sources: [1,3,5,6]}`），`evidence_chain.json`（推理步骤 + 每步支撑证据），`sources.json`（6 条）
-
----
-
-## 四、技术栈
+## 技术要求
 
 - Python 3.11+，type hints
-- LLM 调用：`openai` SDK，OpenAI 兼容接口。环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
-- 网络请求：httpx 或 aiohttp
-- 搜索接口：通过 Tool 抽象定义（如 `search_web(query) -> results`），具体实现可对接任意搜索 API
-- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- LLM 调用：`openai` SDK，通过环境变量配置：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
+- 网络请求：可使用 `httpx`，但非必需（`search_web` 通过 LLM 实现，不需要真实网络）
+- 禁止使用：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- 必须提供 `Dockerfile`（基于 `python:3.11-slim`）和 `requirements.txt`
+- Dockerfile 中 LLM 配置通过环境变量注入，不硬编码
 
 ---
 
-## 五、环境打包
+## 最低要求清单
 
-必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
+你的 harness **必须**满足以下所有条件：
 
-- 基于 `python:3.11-slim` 或同级官方镜像
-- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`），包括 httpx 或 aiohttp 等网络库
-- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
-- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
+1. `python -m harness -p "..." --output-dir ./output/` 可运行
+2. 使用 `openai` SDK 调用 LLM（至少每个任务调用 1 次）
+3. 使用 function calling / tool calling 模式驱动工具执行
+4. 至少实现 5 个工具：search_web, analyze_sources, write_report, read_file, finish
+5. `search_web` 通过调用 LLM 获取信息（非真实网络请求）
+6. 产出 `result.json`（含 status 和 trajectory 字段）
+7. 产出 `trajectory.jsonl`（每步记录 action 和 observation）
+8. 生成 markdown 格式的研究报告文件
+9. 提供 `Dockerfile` 和 `requirements.txt`
+10. LLM API 调用有指数退避重试（至少 3 次）
+11. 消息历史超长时自动压缩（截断旧工具输出或移除旧轮次）
+12. 检测连续相同动作并注入策略切换提示
+13. 达到步数上限时保存部分结果，异常时仍输出 result.json

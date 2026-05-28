@@ -1,171 +1,474 @@
-# Agent Harness 构建任务：代码智能体（Code Agent）
+# 构建代码智能体 Harness
 
-构建一个通用的代码智能体 harness，能接受软件工程任务描述（bug 修复、功能开发、重构等），自主完成代码修改并验证结果。
+构建一个 Python 代码智能体：接收自然语言任务描述，通过 LLM 驱动的循环自主完成代码修改并验证结果。
 
 ---
 
-## 一、入口与输出
+## 接口
 
 ```bash
 python -m harness -p "任务描述" --output-dir ./output/
 ```
 
-- `-p`：自然语言任务描述（harness 自行解析并执行）
-- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
-- 工作目录中可能包含任务所需的代码仓库、数据文件等，harness 应自动发现并使用
+执行完成后在 `--output-dir` 下生成：
+- `result.json`：`{"status": "success"|"partial"|"failed", "trajectory": "trajectory.jsonl"}`
+- `trajectory.jsonl`：每行一个 JSON，记录每步的 action 和 observation
 
-`result.json` 必须包含以下字段，其余字段可自行扩展：
+---
+
+## 文件结构
+
+你必须创建以下文件结构：
+
+```
+harness/
+  __init__.py        # 空文件或简短描述
+  __main__.py        # 入口：从 agent 模块导入 main 并执行
+agent.py 或其他模块   # 主要逻辑（也可以把所有代码放在 __main__.py 中）
+Dockerfile
+requirements.txt
+```
+
+关键：`python -m harness` 要求 `harness/` 目录下有 `__main__.py` 文件。最简单的做法是把所有代码放在 `harness/__main__.py` 中。
+
+---
+
+## 代码骨架
+
+以下是**完整可运行的骨架代码**。你必须基于它构建 harness，保留核心结构（LLM 调用循环 + tool calling），按需扩展工具实现和错误处理。
+
+**⚠️ 关键约束：骨架中的以下全局变量必须保留，禁止删除、重命名或移到函数内部：**
+- `client = OpenAI(...)` — LLM 客户端实例
+- `MODEL = os.environ.get("MODEL_NAME", "gpt-4")` — 模型名称
+- `SYSTEM_PROMPT = """..."""` — 系统提示词
+- `TOOLS = [...]` — 工具定义列表
+你可以修改它们的内容，但变量名和初始化位置必须保持在模块顶层。
 
 ```python
-{
-    "status": str,       # "success" | "partial" | "failed"
-    "trajectory": str,   # JSONL trajectory 文件路径
-}
+#!/usr/bin/env python3
+"""Code Agent Harness - 自主代码修改智能体"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from openai import OpenAI
+
+# ── 配置 ─────────────────────────────────────────────
+client = OpenAI(
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    api_key=os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
+)
+MODEL = os.environ.get("MODEL_NAME", "gpt-4")
+
+SYSTEM_PROMPT = """You are a code agent. You can read files, write files, search code, and run shell commands.
+Given a task, analyze the codebase, make necessary changes, and verify your work by running tests.
+When you are done, call the 'finish' tool with the final status."""
+
+# ── 工具定义（OpenAI function calling 格式）────────────
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read contents of a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"},
+                    "start_line": {"type": "integer", "description": "Start line (1-based, optional)"},
+                    "end_line": {"type": "integer", "description": "End line (optional)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file (creates or overwrites)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "content": {"type": "string", "description": "Full file content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command and return stdout/stderr",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": "Search for a pattern in files using grep",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Search pattern (regex)"},
+                    "path": {"type": "string", "description": "Directory to search in (default '.')"},
+                    "file_pattern": {"type": "string", "description": "File glob pattern (e.g. '*.py')"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files in a directory",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path (default '.')"},
+                    "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.py')"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Signal that the task is complete",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+                    "summary": {"type": "string", "description": "Brief summary of what was done"},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+]
+
+
+# ── 工具执行 ──────────────────────────────────────────
+def execute_tool(name: str, args: dict) -> str:
+    """执行工具调用，返回结果字符串。"""
+    try:
+        if name == "read_file":
+            path = args["path"]
+            if not os.path.exists(path):
+                return f"Error: File not found: {path}"
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            start = args.get("start_line", 1) - 1
+            end = args.get("end_line", len(lines))
+            selected = lines[max(0, start):end]
+            numbered = [f"{i+start+1}: {line}" for i, line in enumerate(selected)]
+            return "".join(numbered)[:10000]
+
+        elif name == "write_file":
+            path = args["path"]
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(args["content"])
+            return f"File written: {path} ({len(args['content'])} chars)"
+
+        elif name == "run_command":
+            timeout = args.get("timeout", 60)
+            result = subprocess.run(
+                args["command"], shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            output = f"Exit code: {result.returncode}\n"
+            if result.stdout:
+                output += f"STDOUT:\n{result.stdout[:5000]}\n"
+            if result.stderr:
+                output += f"STDERR:\n{result.stderr[:3000]}\n"
+            return output
+
+        elif name == "search_code":
+            pattern = args["pattern"]
+            path = args.get("path", ".")
+            file_pattern = args.get("file_pattern", "")
+            cmd = f"grep -rn '{pattern}' {path}"
+            if file_pattern:
+                cmd += f" --include='{file_pattern}'"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            return result.stdout[:5000] if result.stdout else "No matches found."
+
+        elif name == "list_files":
+            path = args.get("path", ".")
+            pattern = args.get("pattern", "*")
+            from glob import glob
+            files = glob(os.path.join(path, pattern), recursive=True)
+            return "\n".join(sorted(files)[:100])
+
+        elif name == "finish":
+            return f"FINISH: {args.get('status', 'success')}"
+
+        else:
+            return f"Error: Unknown tool '{name}'"
+
+    except Exception as e:
+        return f"Error executing {name}: {str(e)}"
+
+
+# ── Agent 主循环 ──────────────────────────────────────
+def run_agent(task: str, output_dir: str, max_steps: int = 30):
+    """运行 agent 主循环。"""
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_path = os.path.join(output_dir, "trajectory.jsonl")
+    result_path = os.path.join(output_dir, "result.json")
+    trajectory_file = open(trajectory_path, "w", encoding="utf-8")
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
+
+    final_status = "failed"
+
+    for step in range(max_steps):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            # 记录错误并重试
+            entry = {"step": step, "error": str(e), "timestamp": time.time()}
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            time.sleep(2)
+            continue
+
+        choice = response.choices[0]
+        assistant_msg = choice.message
+
+        # 将 assistant 回复加入对话
+        messages.append(assistant_msg.model_dump())
+
+        # 如果没有 tool calls，检查是否结束
+        if not assistant_msg.tool_calls:
+            entry = {
+                "step": step,
+                "action": "text_response",
+                "content": assistant_msg.content or "",
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # 如果模型直接回复文本（没调用工具），可能是表达想法或总结
+            # 继续循环让模型调用工具
+            continue
+
+        # 执行所有 tool calls
+        for tool_call in assistant_msg.tool_calls:
+            func_name = tool_call.function.name
+            try:
+                func_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                func_args = {}
+
+            # 执行工具
+            result = execute_tool(func_name, func_args)
+
+            # 记录 trajectory
+            entry = {
+                "step": step,
+                "action": func_name,
+                "args": func_args,
+                "observation": result[:2000],
+                "timestamp": time.time(),
+            }
+            trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+            # 将工具结果加入对话
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+            # 检查是否完成
+            if func_name == "finish":
+                final_status = func_args.get("status", "success")
+                trajectory_file.close()
+                # 写 result.json
+                with open(result_path, "w") as f:
+                    json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+                return final_status
+
+    # 达到步数上限
+    trajectory_file.close()
+    with open(result_path, "w") as f:
+        json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+    return final_status
+
+
+# ── CLI 入口 ──────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Code Agent Harness")
+    parser.add_argument("-p", "--prompt", required=True, help="Task description")
+    parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max agent steps")
+    args = parser.parse_args()
+
+    print(f"Running code agent: {args.prompt[:100]}...")
+    status = run_agent(args.prompt, args.output_dir, args.max_steps)
+    print(f"Done. Status: {status}")
+    sys.exit(0 if status == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
-## 二、功能性质
+## 核心能力要求
 
-一个成熟的代码智能体 harness 是一个状态机驱动的自主执行循环，运行 Thought→Action→Observation 三段式 ReAct 模式直到任务完成或预算耗尽。
+基于上面的骨架，你需要确保 harness 具备以下能力：
 
-**执行循环与终止控制。** 主循环维护显式状态（IDLE→RUNNING→FINISHED/STUCK/ERROR），每轮：构建 prompt → 调用 LLM → 解析工具调用 → 执行 → 检查终止条件。步数预算硬限（maxSteps），达到 75% 时注入预算警告要求优先保存已有成果。Doom Loop 检测：连续 3+ 次相同 tool+params 触发策略切换提示；连续 4 次相同 action+error 判定为 stuck 并强制终止。循环在明确成功信号（测试全过、显式 finish 调用）、步数/成本上限、或不可恢复错误时终止。
-
-**代码导航与理解。** 分层发现机制：glob/find 扫描文件树结构获得布局感知，正则 grep 搜索符号和内容定位目标，定向行范围读取避免上下文溢出。高级模式包括：AST 解析生成仓库级结构概览（函数签名+类定义的 PageRank 排序摘要），LSP 集成提供 go-to-definition、find-references、hover 类型信息和诊断错误，语义搜索通过向量索引定位功能相关但命名无关的代码。
-
-**代码编辑策略。** 编辑通过精确字符串替换实现（old_string → new_string），要求匹配唯一且先读后写。当 LLM 输出与实际文件存在轻微差异时，系统尝试多级模糊匹配回退（行首尾空白忽略 → 块锚点匹配 → 空白归一化 → 缩进灵活匹配），在保证安全性的前提下提高编辑成功率。支持多文件 patch 格式（Add/Update/Delete/Move）以单次操作修改多个文件。每次编辑后自动运行 linter/formatter/LSP 诊断，若引入语法错误则回滚编辑并将诊断信息暴露给模型重试。
-
-**上下文管理与压缩。** 工具输出按字符/行数阈值截断（超长输出保存至文件并提供路径）。对话历史通过可组合处理器管道管理：旧步骤的 observation 替换为省略标记，已关闭的文件视图打标移除，最近 N 步保留完整原文。token 接近窗口上限时触发 LLM 驱动的摘要压缩（生成 Goal/Progress/Key Decisions/Next Steps 结构化摘要替换旧历史），保护最近 2 轮对话原文不被压缩。持久化指令（项目惯例、架构说明）每轮重新注入以在压缩中存活。仓库级概览（repo-map）按 token 预算动态生成，让模型始终了解项目全局结构。
-
-**错误恢复。** API 调用失败时指数退避重试（初始 2s, 因子 2x, 尊重 retry-after 头, 上限 30s）。模型输出无法解析时自动添加格式错误消息重新 query（最多 3 次）。Bash 命令执行前做语法预检（bash -n），语法错误不执行而是直接反馈。工具名大小写错误自动修正。上下文溢出不重试，直接触发紧急压缩。致命错误退出时自动提取当前 git diff 作为兜底提交。
-
-**版本管理与回滚。** 每次 LLM 编辑后可自动提交快照，支持回退到任意消息点。独立快照存储支持精确的多步回滚而不影响工作分支。worktree 隔离允许多个子任务在独立分支工作区并行执行。编辑前对脏文件先提交，确保 LLM 修改和用户修改可分别回滚。
-
-**规划与子任务分解。** 支持独立的 Plan 模式（禁止代码编辑，只分析和规划），产出结构化计划文件后切换到 Build 模式执行。复杂任务可委派给子 agent：主 agent 通过 task 工具启动子 agent，每个子 agent 有独立权限范围和工作空间，支持前台阻塞或后台异步执行+轮询。多个无依赖子任务可并行启动。
-
-**验证与质量保证。** 验证是测试驱动的：执行测试命令，捕获完整输出，将失败信息反馈给模型形成 edit→test→fix 紧密循环。Critic 评估系统在 agent 声称完成后评估质量，低于阈值自动触发修正轮次。提交前可展示 diff 要求自审（第一次 submit 展示 diff 确认，第二次才真正提交）。完整的 action-observation 对及时间戳、token 消耗写入 JSONL 轨迹文件。
+- **文件读写**：读取源代码，写入修改后的代码
+- **代码搜索**：通过 grep/glob 在项目中搜索关键词和模式
+- **命令执行**：运行测试命令（pytest、npm test 等），捕获输出
+- **编辑-测试循环**：修改代码 → 运行测试 → 如果失败则分析错误并重新修改
+- **结构化输出**：`result.json` + `trajectory.jsonl`
 
 ---
 
-## 三、调用示例
+## 必须实现的扩展
 
-### Case 1：修复失败的单元测试（edit→test→fix 循环）
+以下扩展是骨架中**未提供实现**的，你必须自己编写代码完成。
+
+### 通用扩展（必须实现）
+
+**1. LLM 调用错误重试**
+- API 调用失败时指数退避重试（初始 2s，因子 2x，上限 30s，至少重试 3 次）
+- 区分可重试错误（超时、429 rate limit、5xx）和不可重试错误（401/403）
+- 尊重 API 返回的 retry-after 头
+- 重试耗尽后记录错误到 trajectory 并继续（不直接 crash）
+
+**2. 上下文窗口管理**
+- 监控消息历史总长度（字符数或 token 估算）
+- 超过阈值时分级压缩：Level 1 截断旧步骤的工具输出（保留前 N 字符 + "[truncated]"）→ Level 2 移除更早的完整轮次 → Level 3 用摘要替换历史
+- 始终保护 system prompt 和最近 N 轮完整对话不被压缩
+- 工具单次输出超过阈值时立即截断
+
+**3. 重复动作检测与 Doom Loop 防护**
+- 追踪最近 N 步的 action + 参数
+- 连续 3 次相同 tool + 相同参数 → 注入提示要求换策略
+- 连续 5 次仍重复 → 强制切换策略或终止
+- 在 trajectory 中标记检测到的重复事件
+
+**4. 步数预算管理与优雅结束**
+- 达到 max_steps 的 75% 时注入预算警告，要求优先保存已有成果
+- 达到步数上限时保存部分结果（而非空输出）
+- 任何未捕获异常都写入 result.json（status="error"），不应出现无 result.json 的情况
+- result.json 中明确区分 success / partial / failed / error 四种状态
+
+**5. 工具执行鲁棒性**
+- 每个工具调用设置超时（防止无限挂起）
+- 工具参数校验（缺少必填参数时返回明确错误信息而非 crash）
+- 工具执行异常捕获，返回结构化错误信息给 LLM（而非 traceback）
+- 工具输出截断（超过阈值时截断并标注 "[output truncated, N chars total]"）
+
+**6. 进度日志**
+- 每步在 stderr 打印：步数、执行的工具名、耗时、当前消息历史长度
+- 方便调试和监控 agent 运行状态
+
+### 领域特定扩展（必须实现）
+
+**7. 编辑-测试-修复循环**
+- 修改代码后自动运行测试命令验证
+- 解析 pytest/unittest 输出，提取失败的测试名称和错误信息，结构化反馈给 LLM
+- 支持多次 edit→test→fix 迭代，直到测试通过或达到重试上限
+
+**8. 增量编辑**
+- 支持基于字符串匹配的局部替换（old_string → new_string），而非每次重写整个文件
+- 编辑前校验 old_string 在文件中存在且唯一
+
+**9. 分层代码导航**
+- glob/find 扫描文件树获得项目结构
+- grep 搜索符号和关键词定位目标
+- 定向行范围读取（读取文件的指定行范围，而非整个文件），避免上下文溢出
+
+**10. 命令预检**
+- bash 命令执行前做语法预检（`bash -n`），语法错误不执行直接反馈
+- 命令执行设置超时（默认 60s），防止无限挂起
+
+---
+
+## 调用示例
+
+### Case 1：修复失败的测试
 
 ```bash
-python -m harness -p "tests/test_utils.py 中的 test_parse_date 报错 ValueError: time data '2024-13-01' does not match format '%Y-%m-%d'，修复底层 bug" --output-dir ./output/
+python -m harness -p "test_app.py 中的 test_get_by_id 和 test_list_incomplete_only 失败了，修复 app.py 中的 bug" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Step 1：执行 `python -m pytest tests/test_utils.py::test_parse_date -x` 复现，捕获完整 traceback → observation 指向 `src/utils.py:47` 的 `parse_date()` 函数
-- Step 2：读取 `src/utils.py` 第 40-60 行（定向行范围读取），识别函数直接将原始输入传给 `strptime` 无月份范围校验
-- Step 3：grep 搜索 `parse_date` 在全项目中的调用点，确认公共 API 不变（3 个调用点，均传入字符串）
-- Step 4：编辑 `src/utils.py`——精确替换裸 `datetime.strptime(date_str, fmt)` 为带 ValueError 捕获和月/日边界检查的版本。编辑后自动 linter 检查通过
-- Step 5：执行 `python -m pytest tests/test_utils.py::test_parse_date -x`，通过（exit code 0）
-- Step 6：执行 `python -m pytest tests/ -x --timeout=60` 全量测试确认无回归，38 passed
-- 终止条件：测试全通过 + 显式调用 finish
+**预期行为：**
+1. `run_command("pytest test_app.py -v")` → 看到 2 个测试失败
+2. `read_file("app.py")` → 阅读源码
+3. 分析错误：`get()` 方法比较 `todo.title == todo_id` 应为 `todo.id == todo_id`
+4. `write_file("app.py", 修复后的内容)` → 修复 bug
+5. `run_command("pytest test_app.py -v")` → 可能还有失败
+6. 分析 `list_todos` 的过滤逻辑反转 → 再次修复
+7. `run_command("pytest test_app.py -v")` → 全部通过
+8. `finish(status="success")`
 
-**产物：** `src/utils.py`（修改），`trajectory.jsonl`（6 步，含每步时间戳和 token 消耗），git diff patch
-
----
-
-### Case 2：添加新 API 端点（多文件协调 + 新建文件）
+### Case 2：添加新功能
 
 ```bash
-python -m harness -p "为 FastAPI 应用添加 GET /api/v1/health 端点，返回 {status: ok, version: <from pyproject.toml>}，附带测试" --output-dir ./output/
+python -m harness -p "在 utils.py 中添加一个 calculate_statistics(numbers) 函数，返回 {mean, median, std_dev}，并在 test_utils.py 中添加测试" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Step 1：仓库结构发现——glob `**/*.py` 获得文件布局，grep `FastAPI` 定位入口 `src/server/app.py`
-- Step 2：读取 `pyproject.toml` 提取版本号 `2.3.1`；读取 `src/server/app.py` 前 30 行理解路由注册模式和 import 风格
-- Step 3：读取 `tests/` 目录结构，发现已有 `test_users.py` 使用 `TestClient` fixture 模式
-- Step 4：编辑 `src/server/app.py` 插入 `get_health()` 路由函数——version 通过 `importlib.metadata.version()` 读取，保持既有 import 风格一致
-- Step 5：新建 `tests/test_health.py`，复用已有 fixture 模式：TestClient + 断言 200 状态码 + JSON body 包含 status 和 version 字段
-- Step 6：执行 `python -m pytest tests/test_health.py -v`，通过
-- Step 7：执行 `mypy src/server/app.py` 类型检查通过（如项目有 mypy 配置）
-
-**产物：** `src/server/app.py`（修改），`tests/test_health.py`（新建），`trajectory.jsonl`（7 步）
+**预期行为：**
+1. `list_files(pattern="**/*.py")` → 了解项目结构
+2. `read_file("utils.py")` → 阅读已有代码
+3. `write_file("utils.py", 添加了新函数的内容)`
+4. `write_file("test_utils.py", 包含测试的内容)`
+5. `run_command("pytest test_utils.py -v")` → 验证通过
+6. `finish(status="success")`
 
 ---
 
-### Case 3：跨文件类型错误修复（LSP 诊断 + 上下游追踪）
-
-```bash
-python -m harness -p "mypy 报错 'Argument 1 to process_order has incompatible type Optional[Order]; expected Order' in src/checkout/handler.py:92，修复且不改公共 API" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1：读取 `src/checkout/handler.py` 第 85-100 行，定位报错位置——`get_order(order_id)` 返回值直接传给 `process_order()`
-- Step 2：grep `def get_order` 找到定义在 `src/orders/repository.py:28`，确认签名 `-> Optional[Order]`
-- Step 3：grep `def process_order` 确认签名 `(order: Order)` 且被多处调用——不能修改为接受 Optional
-- Step 4：分析约束：不能改 `get_order` 的返回类型（公共 API），不能改 `process_order` 的参数类型，只能在调用点加 guard
-- Step 5：编辑 `src/checkout/handler.py` 第 91-92 行：在调用前加 `if order is None: raise OrderNotFoundError(order_id)`，import `OrderNotFoundError`
-- Step 6：执行 `mypy src/checkout/handler.py --strict`，无报错
-- Step 7：执行 `python -m pytest tests/test_checkout/ -v`，14 passed（含已有的 None case 测试）
-
-**产物：** `src/checkout/handler.py`（修改），`trajectory.jsonl`（7 步）
-
----
-
-### Case 4：大规模重构（规划模式 + 子任务 + 多次重试）
-
-```bash
-python -m harness -p "将 src/notifications/service.py 中的邮件发送逻辑抽取为 src/notifications/email_gateway.py 中的 EmailGateway 类，所有现有测试必须继续通过" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1（分析阶段）：读取 `service.py`（148 行），识别提取目标——`send_email()`、`_build_mime_message()`、`_smtp_connect()` 三个方法及其依赖的实例变量
-- Step 2：grep 搜索所有 import 和调用这些方法的位置，发现 `tests/test_notifications.py` 中 3 个测试直接 mock 了 `_smtp_connect`
-- Step 3：制定重构计划（内部 think 步骤）：(a) 创建 EmailGateway 类封装三个方法 (b) 修改 service.py 依赖注入 (c) 更新测试 import
-- Step 4：新建 `email_gateway.py`，包含 EmailGateway 类（封装 SMTP 配置和三个方法）
-- Step 5：编辑 `service.py`——删除迁移的方法，添加 `from .email_gateway import EmailGateway`，在 `__init__` 中实例化
-- Step 6：执行测试 → **失败**：`AttributeError: 'NotificationService' has no attribute '_smtp_connect'`——测试直接 mock 了旧路径
-- Step 7（错误恢复）：读取失败测试，编辑 `tests/test_notifications.py` 更新 mock 路径为 `EmailGateway._smtp_connect`
-- Step 8：执行测试 → **失败**：`ImportError: cannot import name 'EmailGateway'`——缺少 `__init__.py` 导出
-- Step 9（第二次恢复）：编辑 `src/notifications/__init__.py` 添加 EmailGateway 导出
-- Step 10：执行全量测试，23 tests passed，无 warning
-- 预算消耗：10/30 步（33%），未触发预算警告
-
-**产物：** `email_gateway.py`（新建），`service.py`（修改），`tests/test_notifications.py`（修改），`__init__.py`（修改），`trajectory.jsonl`（10 步，含 2 次 test-fix 重试循环）
-
----
-
-### Case 5：大仓库中的 bug 定位（上下文压缩 + 语义搜索）
-
-```bash
-python -m harness -p "生产环境报错 'ConnectionPool exhausted after 30s timeout'，日志显示发生在用户并发登录高峰期。定位根因并修复" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1：grep `ConnectionPool` 在全项目搜索，找到 5 个匹配——`src/db/pool.py`, `src/db/session.py`, `src/auth/login.py`, `src/config/database.py`, `tests/test_pool.py`
-- Step 2：读取 `src/db/pool.py`，理解连接池初始化参数（max_size=10, timeout=30）
-- Step 3：读取 `src/auth/login.py`，发现 `authenticate()` 函数获取连接但在异常路径未释放（try 块中 acquire，但 except 分支 return 前未 release）
-- Step 4：grep `authenticate` 的调用频率相关信息，在 `src/auth/middleware.py` 发现每个请求都调用
-- Step 5（think）：根因确认——并发登录时，认证失败的请求走异常路径泄漏连接，高峰期累积导致池耗尽
-- Step 6：编辑 `src/auth/login.py`——将连接获取改为 `async with pool.acquire() as conn:` 上下文管理器模式，保证任何路径都释放
-- Step 7：编辑 `tests/test_auth.py` 添加并发场景测试——模拟 20 个并发认证失败请求，断言连接池未泄漏
-- Step 8：执行测试，通过
-- 上下文管理：Step 1-4 的文件读取输出在 Step 6 时已触发 observation 截断（保留最近 5 步完整），前序步骤只保留 think 记录
-
-**产物：** `src/auth/login.py`（修改），`tests/test_auth.py`（修改），`trajectory.jsonl`（8 步），`REPORT.md`（根因分析 + 修复说明）
-
----
-
-## 四、技术栈
+## 技术要求
 
 - Python 3.11+，type hints
-- LLM 调用：`openai` SDK，OpenAI 兼容接口。配置从环境变量读取：
-  - `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
-- 可用：ast、subprocess、gitpython、tree-sitter
-- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- LLM 调用：`openai` SDK，通过环境变量配置：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
+- 禁止使用：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- 必须提供 `Dockerfile`（基于 `python:3.11-slim`）和 `requirements.txt`
+- Dockerfile 中 LLM 配置通过环境变量注入，不硬编码
 
 ---
 
-## 五、环境打包
+## 最低要求清单
 
-必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
+你的 harness **必须**满足以下所有条件：
 
-- 基于 `python:3.11-slim` 或同级官方镜像
-- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`）
-- 安装系统级依赖（如需要）
-- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
-- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
+1. ✅ `python -m harness -p "..." --output-dir ./output/` 可运行
+2. ✅ 使用 `openai` SDK 调用 LLM（至少每个任务调用 1 次）
+3. ✅ 使用 function calling / tool calling 模式驱动工具执行
+4. ✅ 至少实现 4 个工具：read_file, write_file, run_command, finish
+5. ✅ 产出 `result.json`（含 status 和 trajectory 字段）
+6. ✅ 产出 `trajectory.jsonl`（每步记录 action 和 observation）
+7. ✅ 提供 `Dockerfile` 和 `requirements.txt`
+8. ✅ LLM API 调用有指数退避重试（至少 3 次）
+9. ✅ 消息历史超长时自动压缩（截断旧工具输出或移除旧轮次）
+10. ✅ 检测连续相同动作并注入策略切换提示
+11. ✅ 达到步数上限时保存部分结果，异常时仍输出 result.json

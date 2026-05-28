@@ -1,283 +1,557 @@
-# Agent Harness 构建任务：浏览器智能体（Browser Agent）
+# 构建浏览器自动化智能体 Harness
 
-构建一个通用的浏览器自动化 harness，能接受 Web 任务描述（导航、表单填写、数据提取、文件下载等），自主在浏览器中完成多步骤操作。
+构建一个浏览器自动化智能体：接收 Web 任务描述，通过 LLM 驱动的感知-决策-执行循环，使用 Playwright 自主完成网页导航、交互和数据提取。
 
 ---
 
-## 一、入口与输出
+## 接口
 
 ```bash
 python -m harness -p "任务描述" --output-dir ./output/
 ```
 
-- `-p`：自然语言任务描述（harness 自行解析并执行）
-- `--output-dir`：输出目录，执行完成后在该目录下生成 `result.json`
+执行完成后在 `--output-dir` 下生成：
+- `result.json`：`{"status": "success"|"partial"|"failed", "trajectory": "trajectory.jsonl"}`
+- `trajectory.jsonl`：每行一个 JSON，记录每步的 action 和 observation
 
-`result.json` 必须包含以下字段，其余字段可自行扩展：
+---
+
+## 文件结构
+
+你必须创建以下文件结构：
+
+```
+harness/
+  __init__.py        # 空文件或简短描述
+  __main__.py        # 入口：从主模块导入 main 并执行
+Dockerfile
+requirements.txt
+```
+
+关键：`python -m harness` 要求 `harness/` 目录下有 `__main__.py` 文件。最简单的做法是把所有代码放在 `harness/__main__.py` 中。
+
+---
+
+## 代码骨架
+
+以下是**完整可运行的骨架代码**。你必须基于它构建 harness，保留核心结构（页面状态获取 + LLM 决策 + Playwright 执行循环），按需扩展工具实现和错误处理。
+
+**⚠️ 关键约束：骨架中的以下全局变量必须保留，禁止删除、重命名或移到函数内部：**
+- `client = OpenAI(...)` — LLM 客户端实例
+- `MODEL = os.environ.get("MODEL_NAME", "gpt-4")` — 模型名称
+- `SYSTEM_PROMPT = """..."""` — 系统提示词
+- `TOOLS = [...]` — 工具定义列表
+你可以修改它们的内容，但变量名和初始化位置必须保持在模块顶层。
 
 ```python
-{
-    "status": str,       # "success" | "partial" | "failed"
-    "trajectory": str,   # JSONL trajectory 文件路径
-}
+#!/usr/bin/env python3
+"""Browser Agent Harness - 浏览器自动化智能体"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from openai import OpenAI
+from playwright.sync_api import sync_playwright
+
+# ── 配置 ─────────────────────────────────────────────
+client = OpenAI(
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    api_key=os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
+)
+MODEL = os.environ.get("MODEL_NAME", "gpt-4")
+
+SYSTEM_PROMPT = """You are a browser automation agent. You can navigate web pages, click elements, fill forms, and extract data.
+Each step you receive the current page state (title, URL, simplified content). Decide your next action by calling a tool.
+When the task is complete, call 'finish' with the result."""
+
+# ── 工具定义（OpenAI function calling 格式）────────────
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "navigate",
+            "description": "Navigate to a URL",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to navigate to"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": "Click an element on the page by CSS selector",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector of the element to click"},
+                },
+                "required": ["selector"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fill",
+            "description": "Fill a form input with text",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector of the input element"},
+                    "value": {"type": "string", "description": "Text value to fill in"},
+                },
+                "required": ["selector", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "extract_text",
+            "description": "Extract text content from an element, or the entire page if no selector given",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string", "description": "CSS selector (optional, defaults to body)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_page_content",
+            "description": "Get a simplified representation of the current page (title, text, links, form inputs) that fits in LLM context",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screenshot",
+            "description": "Take a screenshot of the current page",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Filename for the screenshot (default: screenshot.png)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "Signal that the task is complete",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+                    "summary": {"type": "string", "description": "Brief summary of the result"},
+                },
+                "required": ["status"],
+            },
+        },
+    },
+]
+
+
+# ── 页面状态获取 ────────────────────────────────────────
+def get_page_state(page) -> str:
+    """获取当前页面的简化表示，包含标题、文本、链接和表单输入。"""
+    try:
+        title = page.title()
+        url = page.url
+
+        # 提取页面文本内容（截断）
+        text_content = page.evaluate("() => document.body?.innerText || ''")
+        text_content = text_content[:3000]
+
+        # 提取所有链接
+        links = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('a[href]')).slice(0, 50).map(a => ({
+                text: (a.innerText || '').trim().substring(0, 80),
+                href: a.href
+            })).filter(l => l.text.length > 0);
+        }""")
+
+        # 提取所有表单输入
+        inputs = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('input, textarea, select, button')).slice(0, 30).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                type: el.type || '',
+                name: el.name || '',
+                id: el.id || '',
+                placeholder: el.placeholder || '',
+                value: el.value || '',
+                text: (el.innerText || '').trim().substring(0, 50),
+                selector: el.id ? '#' + el.id : (el.name ? el.tagName.toLowerCase() + '[name=\"' + el.name + '\"]' : '')
+            }));
+        }""")
+
+        state = f"=== Page State ===\nTitle: {title}\nURL: {url}\n\n"
+        state += f"--- Text Content (truncated) ---\n{text_content}\n\n"
+
+        if links:
+            state += "--- Links ---\n"
+            for link in links[:30]:
+                state += f"  [{link['text']}] -> {link['href']}\n"
+            state += "\n"
+
+        if inputs:
+            state += "--- Form Elements ---\n"
+            for inp in inputs:
+                selector_hint = inp['selector'] or f"{inp['tag']}.{inp['type']}"
+                state += f"  <{inp['tag']} type='{inp['type']}' name='{inp['name']}' id='{inp['id']}' placeholder='{inp['placeholder']}'> selector: {selector_hint}\n"
+
+        return state[:6000]
+    except Exception as e:
+        return f"Error getting page state: {e}"
+
+
+# ── 工具执行 ──────────────────────────────────────────
+def execute_tool(name: str, args: dict, page, output_dir: str) -> str:
+    """执行工具调用，返回结果字符串。"""
+    try:
+        if name == "navigate":
+            page.goto(args["url"], wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1000)
+            return f"Navigated to {page.url}\n\n{get_page_state(page)}"
+
+        elif name == "click":
+            selector = args["selector"]
+            page.click(selector, timeout=5000)
+            page.wait_for_timeout(1000)
+            return f"Clicked: {selector}\n\n{get_page_state(page)}"
+
+        elif name == "fill":
+            selector = args["selector"]
+            value = args["value"]
+            page.fill(selector, value, timeout=5000)
+            return f"Filled '{selector}' with '{value}'"
+
+        elif name == "extract_text":
+            selector = args.get("selector", "body")
+            text = page.text_content(selector, timeout=5000) or ""
+            return text[:5000]
+
+        elif name == "get_page_content":
+            return get_page_state(page)
+
+        elif name == "screenshot":
+            filename = args.get("filename", "screenshot.png")
+            filepath = os.path.join(output_dir, filename)
+            page.screenshot(path=filepath, full_page=False)
+            return f"Screenshot saved: {filepath}"
+
+        elif name == "write_file":
+            path = args["path"]
+            os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(args["content"])
+            return f"File written: {path} ({len(args['content'])} chars)"
+
+        elif name == "finish":
+            return f"FINISH: {args.get('status', 'success')}"
+
+        else:
+            return f"Error: Unknown tool '{name}'"
+
+    except Exception as e:
+        return f"Error executing {name}: {str(e)}"
+
+
+# ── Agent 主循环 ──────────────────────────────────────
+def run_agent(task: str, output_dir: str, max_steps: int = 30):
+    """运行 agent 主循环。"""
+    os.makedirs(output_dir, exist_ok=True)
+    trajectory_path = os.path.join(output_dir, "trajectory.jsonl")
+    result_path = os.path.join(output_dir, "result.json")
+    trajectory_file = open(trajectory_path, "w", encoding="utf-8")
+
+    final_status = "failed"
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(viewport={"width": 1280, "height": 720})
+        page = context.new_page()
+
+        # 初始页面状态
+        initial_state = f"Browser ready. Awaiting your first action.\nTask: {task}"
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": initial_state},
+        ]
+
+        for step in range(max_steps):
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                )
+            except Exception as e:
+                entry = {"step": step, "error": str(e), "timestamp": time.time()}
+                trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                time.sleep(2)
+                continue
+
+            choice = response.choices[0]
+            assistant_msg = choice.message
+
+            # 将 assistant 回复加入对话
+            messages.append(assistant_msg.model_dump())
+
+            # 如果没有 tool calls，继续循环
+            if not assistant_msg.tool_calls:
+                entry = {
+                    "step": step,
+                    "action": "text_response",
+                    "content": assistant_msg.content or "",
+                    "timestamp": time.time(),
+                }
+                trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                continue
+
+            # 执行所有 tool calls
+            for tool_call in assistant_msg.tool_calls:
+                func_name = tool_call.function.name
+                try:
+                    func_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    func_args = {}
+
+                # 执行工具
+                result = execute_tool(func_name, func_args, page, output_dir)
+
+                # 记录 trajectory
+                entry = {
+                    "step": step,
+                    "action": func_name,
+                    "args": func_args,
+                    "observation": result[:2000],
+                    "timestamp": time.time(),
+                }
+                trajectory_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+                # 将工具结果加入对话
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+
+                # 检查是否完成
+                if func_name == "finish":
+                    final_status = func_args.get("status", "success")
+                    trajectory_file.close()
+                    browser.close()
+                    with open(result_path, "w") as f:
+                        json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+                    return final_status
+
+        # 达到步数上限
+        trajectory_file.close()
+        browser.close()
+
+    with open(result_path, "w") as f:
+        json.dump({"status": final_status, "trajectory": trajectory_path}, f, indent=2)
+    return final_status
+
+
+# ── CLI 入口 ──────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="Browser Agent Harness")
+    parser.add_argument("-p", "--prompt", required=True, help="Task description")
+    parser.add_argument("--output-dir", default="./output", help="Output directory")
+    parser.add_argument("--max-steps", type=int, default=30, help="Max agent steps")
+    args = parser.parse_args()
+
+    print(f"Running browser agent: {args.prompt[:100]}...")
+    status = run_agent(args.prompt, args.output_dir, args.max_steps)
+    print(f"Done. Status: {status}")
+    sys.exit(0 if status == "success" else 1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ---
 
-## 二、功能性质
+## 核心能力要求
 
-一个成熟的浏览器代理 harness 运行感知-思考-行动循环，在压缩的页面表示上进行推理和操作，自主完成多步骤 Web 任务。
+基于上面的骨架，你需要确保 harness 具备以下能力：
 
-**页面状态感知与 DOM 压缩。** 不摄入原始 DOM（通常 50k+ 节点），而是构建可访问性树摘要：每个可交互元素分配稳定的数字索引，不可见和装饰性节点被裁剪，将数万节点的 DOM 压缩为数百行结构化文本供 LLM 推理。支持 Shadow DOM 穿透（为嵌套组件内部元素分配索引）、跨 iframe 全局唯一索引、paint order 过滤（移除被遮挡的不可见元素）。新出现的元素与上一步对比后特殊标记，帮助 LLM 识别页面变化。DOM 文本超出长度限制时截断（保留前 N 个可交互元素），Agent 可通过滚动获取更多。
-
-**动作执行与等待机制。** 每个循环中 agent 输出一个 JSON 动作（click/fill/scroll/navigate/switch_tab/close_tab/extract_content/search_page/screenshot/wait/done），harness 通过 CDP 或 Playwright 执行。支持索引点击（基于可访问性树中的稳定索引）和坐标点击（基于截图分析的视口坐标，含 LLM 截图尺寸→实际视口的坐标转换）。执行后等待 network-idle/element-ready 信号，然后捕获新的页面快照作为下一轮观察。动态内容通过显式等待谓词和退避重试处理。
-
-**多标签页管理。** 每个标签页以唯一标识追踪，支持创建新标签页、切换、关闭。点击链接后自动检测是否打开了新标签页并切换过去。每步向 LLM 呈现完整的标签页状态列表（URL+标题+活跃标记），确保 Agent 始终了解所有打开页面的状态。支持跨标签页的数据收集——在多个站点分别提取信息后汇总。
-
-**子目标分解与动态计划。** 复杂任务被分解为可变计划（3-10 个子目标），每个子目标有状态标记（pending/current/done/skipped）。计划在执行中动态更新：每完成一个里程碑自动推进，遭遇失败后可修改策略。简单任务直接执行，复杂任务 LLM 输出初始计划后按序推进。计划可视化（checklist 标记）注入 LLM 上下文帮助追踪进度。
-
-**任务状态维护与记忆。** 跨页面状态通过持久任务记忆维护——已完成子目标的滚动摘要加当前目标——确保上下文不因页面切换丢失。每步 LLM 输出结构化自评估：上一步是否达成目标 + 当前记忆摘要 + 下一步目标。完整的动作历史记录每步的浏览器状态快照和执行结果，格式化为评估+记忆+目标+结果的事件流供 LLM 参考。
-
-**长链控制流与循环检测。** 循环检测器追踪重复动作：5 次相同动作发出警告，8 次强烈警告，12 次要求必须切换策略。页面停滞检测：连续 5 步页面内容指纹无变化时警告。步数预算管理：达到 75% 时注入提示要求优先保存已有成果；最后一步可用动作限制为只有 done，强制输出已收集的结果。连续 N 次失败后可触发计划重制。Fallback LLM：主模型速率限制时自动切换备用模型。
-
-**上下文压缩。** 对于长任务（50+ 步），按步数或字符数阈值触发压缩：将旧步骤历史总结为摘要（标记为未验证上下文），保留最近 N 步完整信息。DOM 文本按最大长度截断。压缩后 Agent 仍可通过 memory 字段保持关键信息的连续性。
-
-**错误恢复与弹窗处理。** 动作失败时 agent 收到结构化错误信息，重新获取页面快照后选择替代路径——对同一元素连续失败 2-3 次后升级策略（滚动使元素可视、换选择器、返回上一页）。弹窗/模态框/Cookie 横幅通过 DOM 变化观察器自动检测，非阻塞地关闭后恢复主流程。浏览器连接断开后自动重连。页面加载失败自动重试。API 调用失败采用指数退避重试（最大 3 次，随机抖动）。
-
-**数据提取与结构化输出。** 提取的数据跨步骤累积，支持页面内容搜索（JS 搜索 DOM 文本）和 CSS 选择器查询。分页数据通过循环检测"下一页"按钮并迭代提取直到按钮消失/禁用。任务完成时输出为结构化 JSON，附带 JSONL 轨迹和带时间戳的截图供审计。
+- **页面导航**：打开 URL、等待加载完成、处理重定向
+- **表单填写**：定位输入框、选择器、复选框，填写并提交表单
+- **数据提取**：获取页面文本、表格数据、链接列表，返回结构化结果
+- **多页面工作流**：跨页面操作（登录 -> 导航 -> 操作 -> 提取结果）
+- **截图捕获**：在关键步骤保存页面截图用于审计
+- **结构化输出**：`result.json` + `trajectory.jsonl`
 
 ---
 
-## 三、调用示例
+## 必须实现的扩展
 
-### Case 1：跨站比价（多标签页 + 弹窗处理 + 数据汇总）
+以下扩展是骨架中**未提供实现**的，你必须自己编写代码完成。
+
+### 通用扩展（必须实现）
+
+**1. LLM 调用错误重试**
+- API 调用失败时指数退避重试（初始 2s，因子 2x，上限 30s，至少重试 3 次）
+- 区分可重试错误（超时、429 rate limit、5xx）和不可重试错误（401/403）
+- 尊重 API 返回的 retry-after 头
+- 重试耗尽后记录错误到 trajectory 并继续（不直接 crash）
+
+**2. 上下文窗口管理**
+- 监控消息历史总长度（字符数或 token 估算）
+- 超过阈值时分级压缩：Level 1 截断旧步骤的工具输出（保留前 N 字符 + "[truncated]"）→ Level 2 移除更早的完整轮次 → Level 3 用摘要替换历史
+- 始终保护 system prompt 和最近 N 轮完整对话不被压缩
+- 工具单次输出超过阈值时立即截断
+
+**3. 重复动作检测与 Doom Loop 防护**
+- 追踪最近 N 步的 action + 参数
+- 连续 3 次相同 tool + 相同参数 → 注入提示要求换策略
+- 连续 5 次仍重复 → 强制切换策略或终止
+- 在 trajectory 中标记检测到的重复事件
+
+**4. 步数预算管理与优雅结束**
+- 达到 max_steps 的 75% 时注入预算警告，要求优先保存已有成果
+- 达到步数上限时保存部分结果（而非空输出）
+- 任何未捕获异常都写入 result.json（status="error"），不应出现无 result.json 的情况
+- result.json 中明确区分 success / partial / failed / error 四种状态
+
+**5. 工具执行鲁棒性**
+- 每个工具调用设置超时（防止无限挂起）
+- 工具参数校验（缺少必填参数时返回明确错误信息而非 crash）
+- 工具执行异常捕获，返回结构化错误信息给 LLM（而非 traceback）
+- 工具输出截断（超过阈值时截断并标注 "[output truncated, N chars total]"）
+
+**6. 进度日志**
+- 每步在 stderr 打印：步数、执行的工具名、耗时、当前消息历史长度
+- 方便调试和监控 agent 运行状态
+
+### 领域特定扩展（必须实现）
+
+**7. 智能等待策略**
+- 操作后等待页面稳定（网络空闲 / 特定元素出现 / DOM 变化停止），而非固定 sleep
+- 支持可配置的等待超时
+- 等待超时后返回当前页面状态（而非 crash）
+
+**8. 页面停滞检测**
+- 连续 N 步页面内容指纹无变化时警告 LLM
+- 与重复动作检测配合：重复操作 + 页面无变化 = 强制换策略
+
+**9. 失败截图与诊断**
+- 工具执行失败时自动截图保存（用于事后调试）
+- 截图文件名包含步数和错误类型（如 `step_5_click_failed.png`）
+
+**10. 选择器容错**
+- CSS 选择器定位失败时尝试备选策略：
+  - 通过文本内容匹配（`text=...`）
+  - 通过可访问性属性（`role=...`, `aria-label=...`）
+  - 获取页面当前所有可交互元素列表供 LLM 重新选择
+
+---
+
+## 调用示例
+
+### Case 1：导航到页面，填写表单并提交
 
 ```bash
-python -m harness -p "比较 Sony WH-1000XM5 在 amazon.com 和 bestbuy.com 的价格，返回 JSON 包含 {site, price, in_stock}" --output-dir ./output/
+python -m harness -p "打开 http://example.com/register，在表单中填写用户名 testuser、邮箱 test@example.com、密码 Pass123，点击注册按钮，确认注册成功" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Step 1：计划生成——
-  ```
-  [>] 在 Amazon 搜索并提取价格和库存
-  [ ] 在 Best Buy 搜索并提取价格和库存
-  [ ] 汇总为目标 JSON 格式
-  ```
-- Step 2（navigate）：导航到 amazon.com，等待页面加载完成
-- Step 3（DOM 快照）：可访问性树呈现搜索框（index 7: `<input name="field-keywords"/>`），输入 "Sony WH-1000XM5"，按 Enter
-- Step 4（等待+识别）：等待搜索结果网格渲染（检测到新元素出现），在可访问性树中识别首个匹配产品链接——按产品名文本匹配过滤，排除广告标记结果
-- Step 5（点击+提取）：点击进入 PDP（产品详情页），等待价格区域渲染。从快照提取：
-  - 价格：`$278.00`（index 23: `<span class="a-price-whole">278</span>`）
-  - 库存状态：`In Stock`（index 31: `<span>In Stock</span>`）
-  - 自评估："Amazon 价格已获取 ✓"
-- Step 6（新标签页）：navigate("https://www.bestbuy.com", new_tab=true)
-  - 标签页状态更新：[tab_a3f2(Amazon PDP), *tab_b7c1(Best Buy)]
-- Step 7（Cookie 弹窗处理）：
-  - DOM 变化检测到 Cookie consent 模态框覆盖页面
-  - 自动识别 "Accept All" 按钮（index 4），点击关闭
-  - 恢复主流程
-- Step 8（搜索）：在 Best Buy 搜索框输入产品名，等待结果
-- Step 9（提取）：进入 PDP，提取价格 `$279.99` 和库存 `Available for shipping`
-- Step 10（汇总+done）：
-  ```json
-  [
-    {"site": "amazon.com", "price": "$278.00", "in_stock": true},
-    {"site": "bestbuy.com", "price": "$279.99", "in_stock": true}
-  ]
-  ```
-  - 计划更新：所有项标记 [x] done
+**预期行为：**
+1. `navigate("http://example.com/register")` -> 页面加载，获取页面状态
+2. `get_page_content()` -> 识别表单元素：`input#username`, `input#email`, `input#password`, `button[type=submit]`
+3. `fill("#username", "testuser")` -> 填写用户名
+4. `fill("#email", "test@example.com")` -> 填写邮箱
+5. `fill("#password", "Pass123")` -> 填写密码
+6. `click("button[type=submit]")` -> 提交表单，页面跳转到成功页
+7. `extract_text(".success-message")` -> 提取确认文本 "注册成功"
+8. `finish(status="success", summary="注册完成，确认页显示注册成功")`
 
-**产物：** `result.json`（比价数据 JSON），`trajectory.jsonl`（10 步，含每步 DOM 快照摘要和动作），`screenshots/`（Amazon PDP + Best Buy PDP 各一张）
-
----
-
-### Case 2：多页面表单提交含文件上传（认证 + 表单映射 + 会话恢复）
+### Case 2：跨分页提取表格数据
 
 ```bash
-python -m harness -p "在 portal.example.gov 用环境变量中的凭证登录，进入'新申请'页面，用 ./applicant.json 填写所有必填项，上传 ./id_scan.pdf，提交" --output-dir ./output/
+python -m harness -p "打开 http://example.com/products，提取所有产品的名称和价格，翻页直到最后一页，结果写入 products.csv" --output-dir ./output/
 ```
 
-**行为轨迹：**
-- Step 1（计划）：
-  ```
-  [>] 登录 portal.example.gov
-  [ ] 导航到"新申请"页面
-  [ ] 填写表单必填项
-  [ ] 上传身份证文件
-  [ ] 提交并获取确认编号
-  ```
-- Step 2（登录）：导航到登录页，等待表单渲染。DOM 快照显示：
-  - index 5: `<input id="username" required/>`
-  - index 6: `<input id="password" type="password" required/>`
-  - index 8: `<button type="submit">Sign In</button>`
-- Step 3（填写凭证）：从环境变量读取 `GOV_USERNAME` 和 `GOV_PASSWORD`，fill(index=5, value=username)，fill(index=6, value=password)，click(index=8)
-- Step 4（等待仪表盘）：等待 URL 变更为 `/dashboard`，确认登录成功
-- Step 5（导航）：在 DOM 快照的导航菜单中定位"新申请"链接（index 14: `<a href="/applications/new">新申请</a>`），点击
-- Step 6（表单发现）：等待表单渲染，DOM 快照显示 12 个输入元素（7 个 required 标记）。读取 `applicant.json` 内容：
-  ```json
-  {"name": "张伟", "id_number": "110101199001011234", "phone": "13800138000", "address": "北京市朝阳区...", "email": "zhang@example.com"}
-  ```
-- Step 7（表单填写）：按可访问性树中的字段标签映射：
-  - "姓名" → index 20, fill("张伟")
-  - "身份证号" → index 21, fill("110101199001011234")
-  - "联系电话" → index 22, fill("13800138000")
-  - "地址" → index 23, fill("北京市朝阳区...")
-  - "电子邮箱" → index 24, fill("zhang@example.com")
-  - "申请类型" → index 25 (select), 选择匹配选项文本
-  - "紧急程度" → index 26 (radio), click 选中对应项
-- Step 8（文件上传）：检测 index 28 为 `<input type="file">`，上传 `./id_scan.pdf`，等待文件名确认文本出现（"id_scan.pdf 已上传"）
-- Step 9（提交）：点击"提交申请"按钮（index 30），等待确认页渲染
-- Step 10（提取确认）：从确认页提取申请编号："APP-2024-88712"
-  - **异常路径处理**：如中途检测到 URL 重定向回登录页（会话超时），自动重新执行 Step 2-3 认证流程，然后从最后成功的子目标恢复（不重填已提交的表单，而是检查是否有草稿保存）
-
-**产物：** `result.json`（`{status: "success", reference_id: "APP-2024-88712"}`），`trajectory.jsonl`（10-14 步），`screenshots/`（表单填写完成截图 + 确认页截图）
+**预期行为：**
+1. `navigate("http://example.com/products")` -> 打开产品列表页
+2. `get_page_content()` -> 识别表格结构和分页控件
+3. `extract_text("table")` -> 提取第 1 页表格数据（25 行）
+4. `click("a.next-page")` -> 翻到第 2 页
+5. `extract_text("table")` -> 提取第 2 页数据
+6. （重复翻页+提取，直到下一页按钮不存在）
+7. `write_file("products.csv", "name,price\n...")` -> 汇总写入 CSV
+8. `finish(status="success", summary="共提取 3 页 75 条产品数据")`
 
 ---
 
-### Case 3：分页表格数据提取（循环检测 + 筛选操作 + CSV 导出）
-
-```bash
-python -m harness -p "在 crunchbase.com/lists/unicorn-companies 提取 2020 年后成立的所有公司的名称、估值、国家，导出 CSV" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1（计划）：
-  ```
-  [>] 导航到目标页面并应用筛选
-  [ ] 逐页提取表格数据
-  [ ] 去重并导出 CSV
-  ```
-- Step 2（导航）：打开目标 URL，等待表格渲染
-- Step 3（筛选操作）：在 DOM 快照中识别筛选控件区域，点击"Founded Date"筛选器（index 15），等待筛选面板展开
-- Step 4（设置筛选）：在年份输入框中填入"2021"作为最小值，点击"Apply"按钮，等待表格刷新（通过 DOM 变化检测——行数从 1200+ 变为新值）
-- Step 5（首页提取）：解析 DOM 快照中表格行的重复模式——每行包含：
-  - 公司名（链接文本）
-  - 估值（数字+单位）
-  - 国家（文本）
-  - 成立年份（数字）
-  - 提取当前可见的 25 行数据
-- Step 6（分页循环开始）：
-  - 识别分页控件：index 47 为"下一页"按钮（`<button aria-label="Next page">`）
-  - 检查按钮状态：enabled → 点击
-  - 等待表格内容更新（DOM 指纹变化）
-  - 提取第 2 页 25 行
-  - 记忆更新："已提取 50 行，共 N 页"
-- Step 7-18（循环继续）：
-  - 每步：click(next_page) → wait(DOM change) → extract(rows)
-  - 步数到达 75% 预算警告：注入"优先保存已有数据"
-  - 循环终止条件：下一页按钮变为 disabled（`aria-disabled="true"`）
-  - 页面停滞检测：如连续 2 次点击后 DOM 无变化 → 尝试滚动到底部再检查 → 确认是最后一页
-- Step 19（数据处理+输出）：
-  - 汇总所有页数据（6 页 × 25 行 = 148 行）
-  - 去重：按公司名去重，发现 2 条重复（跨页边界重复），最终 146 条
-  - 写入 CSV：columns = [name, valuation, country, founded_year]
-
-**产物：** `unicorns_post2020.csv`（146 行数据），`result.json`（`{status: "success", rows: 146, pages_scraped: 6}`），`trajectory.jsonl`（19 步），每页首次加载的截图
-
----
-
-### Case 4：带条件分支的多步工作流（动态决策 + 计划修改）
-
-```bash
-python -m harness -p "在 github.com 检查 anthropics/claude-code 仓库是否有标签为 bug 且评论超过 10 条的 open issue。如有则收集标题和 URL；如没有则改为搜索全站 'browser automation bug' issues" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1（计划——含条件分支）：
-  ```
-  [>] 导航到目标仓库 issues 页并应用筛选
-  [ ] 检查是否存在评论>10的 bug issue
-  [ ] 分支A: 收集匹配 issues  |  分支B: 全站搜索替代
-  [ ] 格式化输出
-  ```
-- Step 2（导航）：navigate("https://github.com/anthropics/claude-code/issues?q=is:open+label:bug")，等待 issue 列表渲染
-- Step 3（列表分析）：解析 DOM 快照中 issue 列表——每个 issue 行包含标题、标签、评论数。扫描可见 issues 的评论数元数据：
-  - "Fix WebSocket reconnection" — 3 comments
-  - "Memory leak in long sessions" — 7 comments
-  - "Browser detection fails on Firefox" — 2 comments
-  - 无评论 > 10 的 issue
-- Step 4（翻页确认）：检查是否有更多页——如有下一页按钮，继续翻页检查；如只有 1 页结果，确认无匹配
-- Step 5（条件判断——触发分支 B）：
-  - 自评估："无评论>10的 bug issue，触发备选路径"
-  - 计划更新：
-    ```
-    [x] 导航到目标仓库 issues 页并应用筛选
-    [x] 检查是否存在评论>10的 bug issue — 结果:无
-    [-] 分支A: 收集匹配 issues (跳过)
-    [>] 分支B: 全站搜索 'browser automation bug'
-    [ ] 格式化输出
-    ```
-- Step 6（全站搜索）：navigate("https://github.com/search?q=browser+automation+bug&type=issues&state=open")，等待搜索结果
-- Step 7（提取 Top-10）：从搜索结果列表提取前 10 条 issue 的标题和 URL：
-  - 每条记录：{title, url, repo, comments_count}
-  - 按 comments_count 降序排列
-- Step 8（done）：输出结构化结果
-  ```json
-  {
-    "source": "github_global_search",
-    "reason": "No bug issues with >10 comments found in anthropics/claude-code",
-    "issues": [
-      {"title": "Puppeteer automation breaks on SPA navigation", "url": "https://github.com/user/repo/issues/234", "repo": "user/repo", "comments": 45},
-      ...
-    ]
-  }
-  ```
-
-**产物：** `result.json`（搜索结果 JSON，含来源说明和条件分支理由），`trajectory.jsonl`（8 步，含分支决策点标注），关键页面截图
-
----
-
-### Case 5：复杂 SPA 交互——电商下单流程（Shadow DOM + 动态加载 + 多步确认）
-
-```bash
-python -m harness -p "在 shop.example.com 搜索 'mechanical keyboard'，筛选价格 $50-$100 且评分 4+ 星，将第一个结果加入购物车，进入结账页面但不提交支付，截图结账摘要" --output-dir ./output/
-```
-
-**行为轨迹：**
-- Step 1（计划）：
-  ```
-  [>] 搜索产品并应用筛选
-  [ ] 选择第一个匹配结果加入购物车
-  [ ] 进入结账页面
-  [ ] 截图结账摘要（不提交）
-  ```
-- Step 2（搜索）：导航到 shop.example.com，在搜索框输入 "mechanical keyboard"，提交搜索
-- Step 3（筛选——Shadow DOM 场景）：
-  - DOM 快照显示筛选面板使用了 Web Components（Shadow DOM）
-  - 可访问性树穿透 Shadow DOM，为内部的价格滑块和评分选择器分配索引
-  - 填写价格范围：min=50(index 33), max=100(index 34)
-  - 点击 4+ 星筛选按钮(index 37)
-  - 等待产品列表刷新（DOM 内容变化检测）
-- Step 4（选择产品）：新出现的产品卡片标记为 `*[index 41-55]`（新元素标记），点击第一个产品卡片的"Add to Cart"按钮
-- Step 5（购物车确认）：
-  - 检测到悬浮购物车弹窗出现（DOM mutation）
-  - 等待弹窗渲染完成
-  - 验证产品已在购物车中（弹窗内显示产品名和数量）
-  - 点击"Proceed to Checkout"
-- Step 6（结账页面）：等待结账表单渲染，确认页面 URL 包含 `/checkout`
-  - 不填写任何支付信息（按任务要求"不提交支付"）
-- Step 7（截图）：对结账摘要区域执行 screenshot，保存为 `checkout_summary.png`
-  - done(result="结账摘要已截图，产品：Keychron K6 $79.99，含运费和税")
-
-**产物：** `result.json`（`{status: "success", product: "Keychron K6", price: "$79.99"}`），`checkout_summary.png`，`trajectory.jsonl`（7 步），关键状态截图序列
-
----
-
-## 四、技术栈
+## 技术要求
 
 - Python 3.11+，type hints
-- LLM 调用：`openai` SDK，OpenAI 兼容接口。环境变量：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
-- 浏览器自动化：Playwright（推荐 async API）
-- 禁止：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- LLM 调用：`openai` SDK，通过环境变量配置：`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`
+- 浏览器自动化：`playwright`（使用 `playwright.sync_api`）
+- 禁止使用：LangChain / LlamaIndex / AutoGen / anthropic SDK
+- 必须提供 `Dockerfile`（基于 `python:3.11-slim`）和 `requirements.txt`
+- Dockerfile 中 LLM 配置通过环境变量注入，不硬编码
+- **Dockerfile 必须包含 Playwright 及浏览器的安装**：
+  ```dockerfile
+  RUN pip install playwright && playwright install --with-deps chromium
+  ```
 
 ---
 
-## 五、环境打包
+## 最低要求清单
 
-必须提供 `Dockerfile`，确保 harness 在任意环境中可一键运行：
+你的 harness **必须**满足以下所有条件：
 
-- 基于 `python:3.11-slim` 或同级官方镜像
-- 安装所有 Python 依赖（推荐同时生成 `requirements.txt`）
-- 安装 Playwright 及其浏览器依赖（`playwright install --with-deps chromium`）
-- LLM 相关配置通过环境变量注入（`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME`），不硬编码在镜像中
-- 容器启动后可直接执行 `python -m harness -p "..." --output-dir /output/`
+1. `python -m harness -p "..." --output-dir ./output/` 可运行
+2. 使用 `openai` SDK 调用 LLM（至少每个任务调用 1 次）
+3. 使用 function calling / tool calling 模式驱动工具执行
+4. 使用 `playwright` 进行浏览器自动化（启动浏览器、导航、交互）
+5. 至少实现 6 个工具：navigate, click, fill, extract_text, get_page_content, finish
+6. `get_page_content` 返回简化页面表示（标题 + 文本 + 链接列表 + 表单元素），而非原始 DOM
+7. 产出 `result.json`（含 status 和 trajectory 字段）
+8. 产出 `trajectory.jsonl`（每步记录 action 和 observation）
+9. 提供 `Dockerfile` 和 `requirements.txt`
+10. Dockerfile 中安装 `playwright` 及 Chromium：`pip install playwright && playwright install --with-deps chromium`
+11. LLM API 调用有指数退避重试（至少 3 次）
+12. 消息历史超长时自动压缩（截断旧工具输出或移除旧轮次）
+13. 检测连续相同动作并注入策略切换提示
+14. 达到步数上限时保存部分结果，异常时仍输出 result.json
