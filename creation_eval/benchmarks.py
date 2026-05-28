@@ -1770,8 +1770,15 @@ def base_row(
     entry: dict[str, Any],
     result: HarnessRunResult,
 ) -> dict[str, Any]:
+    if validation.pre_bmk_gate_mode == "off" or validation.pre_bmk_gate_pass is None:
+        end_to_end_score = result.score
+    elif validation.pre_bmk_gate_pass:
+        end_to_end_score = result.score
+    else:
+        end_to_end_score = 0.0
     return {
         "generation_model": artifact.generation_model,
+        "creation_profile": validation.creation_profile,
         "domain": artifact.domain,
         "harness_task_id": artifact.task_id,
         "harness_path": str(artifact.path),
@@ -1782,8 +1789,15 @@ def base_row(
         "import_ok": validation.import_ok,
         "cli_probe_ok": validation.cli_probe_ok,
         "adapter_status": validation.adapter_status,
+        "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
+        "gate_pass": validation.pre_bmk_gate_pass,
+        "gate_failure_reason": validation.pre_bmk_failure_reason,
+        "toy_task_score": validation.pre_bmk_toy_task_score,
+        "static_check_pass": validation.pre_bmk_static_pass,
+        "artifact_check_pass": validation.pre_bmk_artifact_pass,
         "eval_status": result.status,
         "score": result.score,
+        "end_to_end_score": end_to_end_score,
         "score_breakdown": result.score_breakdown,
         "pass_rate": result.pass_rate,
         "win_rate": result.win_rate,

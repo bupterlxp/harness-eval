@@ -11,8 +11,10 @@
    - `claude-code`：启动 Docker 容器，内置 Claude Code + [claude-code-router](https://github.com/musistudio/claude-code-router)
    - `codex`：调用本机 Codex CLI，在临时 workspace 里生成 harness
 3. Claude Code 路径会经过 model-proxy 透明代理 LLM 请求，记录 token 用量和交互轮次
-4. Agent 在临时 workspace 中工作
-5. 任务完成后，收集输出产物和 metrics
+4. 按 `--creation-profile` 注入 scaffold 设定，让模型在固定 interface/tool contract 下生成 harness
+5. Agent 在临时 workspace 中工作
+6. 任务完成后，收集输出产物和 metrics
+7. 如果指定 `--eval-after`，先做 pre-BMK validation gate，再进入下游 BMK scoring
 
 ---
 
@@ -24,8 +26,9 @@
 
 1. **调研**（`research/`）：分析各领域生产级 agent 的实现模式，提炼共性架构
 2. **提示词设计**（`prompts/`）：将调研结论转化为结构化 prompt，定义功能要求和调用示例
-3. **生成**（`run.py`）：将 prompt 喂给 meta harness（Claude Code Docker 或本机 Codex CLI），生成完整 harness
-4. **验证/评测**（`run_creation_eval.py`）：检查产物是否符合架构约束，并把 generated harness 接到 downstream BMK
+3. **生成**（`run.py`）：将 `system prompt + creation profile + task prompt` 喂给 meta harness（Claude Code Docker 或本机 Codex CLI），生成完整 harness
+4. **Pre-BMK validation**（`creation_eval/pre_bmk_validation/`）：先做静态检查和 toy task，不改变真实 BMK 分数
+5. **验证/评测**（`run_creation_eval.py`）：检查产物是否符合架构约束，并把 generated harness 接到 downstream BMK
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -64,11 +67,41 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 
 ## 提示词设计
 
+### 主实验方案：main runtime/eval + scaffold/test infra + BMK scoring contract
+
+当前主实验采用 hybrid 方案：
+
+- **main runtime/eval**：保留 `run.py -> run_creation_eval.py -> eval_matrix.yaml -> creation_eval/benchmarks.py` 的完整生成和下游 BMK 评测主链路；
+- **lxp scaffold/test infra**：在 generation 侧加入 `creation_profile`，在 eval 前加入 pre-BMK validation gate；
+- **main BMK scoring contract**：真实分数仍由 SWE-bench、TerminalBench、MLE-bench、DAComp、WritingBench、EQbench3、DeepResearch/BrowseComp、TheAgentCompany 等 adapter 产生，validation gate 不伪造分数。
+
+推荐主 profile 是 `interface_tool`。它固定 CLI、tool API contract、logging、result schema 和预算边界，模型只生成 harness 的 decision layer：control loop、context packing、state tracking、tool policy、verifier、retry/recovery 和 final artifact construction。
+
+可选 profile：
+
+| Profile | 用途 |
+|---|---|
+| `freeform` | 最弱 scaffold，用于 ablation；只给目标和输出契约。 |
+| `interface` | 固定 CLI/schema，但不提供工具 contract。 |
+| `interface_tool` | 主实验默认；固定 interface + tool contract。 |
+| `full_loop` | 强 scaffold / upper bound；给完整 loop 结构但仍要求真实策略。 |
+
+`--pre-bmk-gate` 有三档：
+
+| Gate | 行为 |
+|---|---|
+| `off` | 不做 pre-BMK validation。 |
+| `soft` | 记录 gate 结果，但仍进入 downstream BMK；适合 pilot 和失败分析。 |
+| `hard` | gate 失败就不跑 expensive BMK，`end_to_end_score=0`。 |
+
+summary 会同时输出 `score` 和 `end_to_end_score`。`score` 是 downstream BMK 的真实分数；`end_to_end_score` 会把 gate 失败样本计为 0，用于衡量端到端 yield。
+
 ### 两层结构
 
 ```
 prompts/
 ├── system_prompt.md          # 通用架构约束（ETCSLV），所有 harness 共享
+├── creation/profiles/        # freeform/interface/interface_tool/full_loop profile
 ├── code_agent_harness.md     # 代码智能体：bug 修复、功能开发、重构
 ├── data_analysis_harness.md  # 数据分析：统计分析、可视化、数据工程 pipeline
 ├── writing_harness.md        # 创意写作：长篇小说、情感角色扮演、批评-修改循环
@@ -258,6 +291,8 @@ python3 run.py
 python3 run.py \
   --run-id code-claude-opus-example \
   --meta-harness claude-code \
+  --creation-profile interface_tool \
+  --pre-bmk-gate soft \
   --base-url "$BASE_URL" \
   --api-key "$API_KEY" \
   --model-name "$MODEL_NAME" \
@@ -309,6 +344,8 @@ export CLAUDE_CODE_THINKING_EFFORT=max
 python3 run.py \
   --run-id code-gpt55-create-opus-eval \
   --meta-harness claude-code \
+  --creation-profile interface_tool \
+  --pre-bmk-gate soft \
   --base-url "https://openrouter.ai/api/v1/chat/completions" \
   --api-key "$OPENROUTER_API_KEY" \
   --model-name "openai/gpt-5.5" \
@@ -331,6 +368,7 @@ python3 run.py \
 python3 run.py \
   --run-id code-codex-gpt55-example \
   --meta-harness codex \
+  --creation-profile interface_tool \
   --model-name GPT5.5 \
   --reasoning-effort xhigh \
   --task-id code-agent-harness
@@ -350,6 +388,8 @@ python3 run.py --list-model-aliases
 # 只生成/评测代码 harness，并跑 SWE-bench Pro + Terminal 2.0
 python3 run.py config.yaml \
   --task-id code-agent-harness \
+  --creation-profile interface_tool \
+  --pre-bmk-gate soft \
   --eval-after \
   --eval-domain code \
   --eval-bench swebench_pro,terminal_2_bench
@@ -357,6 +397,8 @@ python3 run.py config.yaml \
 # 只生成/评测写作 harness，并跑 Writing-bench + EQbench3
 python3 run.py config.yaml \
   --task-id writing-harness \
+  --creation-profile interface_tool \
+  --pre-bmk-gate soft \
   --eval-after \
   --eval-domain writing \
   --eval-bench writing_bench,eqbench3
@@ -371,6 +413,7 @@ python3 run.py config.yaml \
 python3.12 run_creation_eval.py \
   --generation-output outputs/opus45 \
   --run-id opus45-dryrun \
+  --pre-bmk-gate soft \
   --dry-run
 ```
 
@@ -381,7 +424,8 @@ uv venv .venv --python /opt/homebrew/bin/python3.12
 uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/opus45 \
-  --python-bin "$PWD/.venv/bin/python"
+  --python-bin "$PWD/.venv/bin/python" \
+  --pre-bmk-gate soft
 ```
 
 常用筛选：

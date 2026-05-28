@@ -7,6 +7,7 @@ from typing import Any
 
 SUMMARY_FIELDS = [
     "generation_model",
+    "creation_profile",
     "domain",
     "harness_task_id",
     "harness_path",
@@ -17,8 +18,15 @@ SUMMARY_FIELDS = [
     "import_ok",
     "cli_probe_ok",
     "adapter_status",
+    "pre_bmk_gate_mode",
+    "gate_pass",
+    "gate_failure_reason",
+    "toy_task_score",
+    "static_check_pass",
+    "artifact_check_pass",
     "eval_status",
     "score",
+    "end_to_end_score",
     "score_breakdown",
     "pass_rate",
     "win_rate",
@@ -56,6 +64,15 @@ class ValidationResult:
     stdout_path: str = ""
     stderr_path: str = ""
     raw_result_path: str = ""
+    creation_profile: str = ""
+    pre_bmk_gate_mode: str = "off"
+    pre_bmk_gate_pass: bool | None = None
+    pre_bmk_gate_status: str = "not_run"
+    pre_bmk_toy_task_score: float | None = None
+    pre_bmk_static_pass: bool | None = None
+    pre_bmk_artifact_pass: bool | None = None
+    pre_bmk_failure_reason: str = ""
+    pre_bmk_report_path: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
 

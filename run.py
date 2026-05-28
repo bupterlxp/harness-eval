@@ -60,6 +60,9 @@ def default_config() -> dict:
         "tasks_file": "./tasks.jsonl",
         "system_prompt_file": "./prompts/system_prompt.md",
         "include_system_prompt": True,
+        "creation_profile": os.environ.get("CREATION_PROFILE", "interface_tool"),
+        "creation_profile_dir": "./prompts/creation/profiles",
+        "pre_bmk_gate": os.environ.get("PRE_BMK_GATE", "soft"),
     }
 
 
@@ -111,6 +114,8 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "codex_extra_args": args.codex_extra_args,
         "tasks_file": args.tasks_file,
         "system_prompt_file": args.system_prompt,
+        "creation_profile": args.creation_profile,
+        "pre_bmk_gate": args.pre_bmk_gate,
         "max_concurrent": args.max_concurrent,
         "timeout_minutes": args.timeout_minutes,
     }
@@ -127,6 +132,33 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         config["output_dir"] = str(Path(str(config.get("output_dir", "./outputs"))) / args.run_id)
     config["run_id"] = args.run_id
     return config
+
+
+def normalize_creation_profile(value: str | None) -> str:
+    profile = (value or "interface_tool").strip().lower().replace("-", "_")
+    aliases = {
+        "interface_tool": "interface_tool",
+        "interfacetool": "interface_tool",
+        "interface": "interface",
+        "freeform": "freeform",
+        "full_loop": "full_loop",
+        "fullloop": "full_loop",
+    }
+    if profile not in aliases:
+        raise ValueError(
+            f"Unsupported creation_profile={value!r}. "
+            "Supported values: freeform, interface, interface_tool, full_loop."
+        )
+    return aliases[profile]
+
+
+def load_creation_profile_prompt(config: dict) -> tuple[str, str]:
+    profile = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    profile_dir = Path(str(config.get("creation_profile_dir") or "./prompts/creation/profiles"))
+    profile_path = profile_dir / f"{profile}.md"
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"creation profile prompt not found: {profile_path}")
+    return profile, profile_path.read_text(encoding="utf-8").strip()
 
 
 def resolve_config_models(config: dict) -> dict:
@@ -205,9 +237,13 @@ def compose_prompt(prompt: str, config: dict) -> str:
     if not system_path.is_file():
         raise FileNotFoundError(f"system_prompt_file not found: {system_path}")
     system_prompt = system_path.read_text(encoding="utf-8").strip()
+    creation_profile, profile_prompt = load_creation_profile_prompt(config)
     task_prompt = prompt.strip()
     return (
         f"{system_prompt}\n\n"
+        "---\n\n"
+        f"# Creation Profile: {creation_profile}\n\n"
+        f"{profile_prompt}\n\n"
         "---\n\n"
         "# Task Prompt\n\n"
         f"{task_prompt}\n"
@@ -456,6 +492,8 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         "status": status,
         "run_id": config.get("run_id"),
         "meta_harness": config.get("meta_harness", "claude-code"),
+        "creation_profile": config.get("creation_profile", "interface_tool"),
+        "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
         "generation_model_input": config.get("model_name_input"),
         "generation_model": config.get("model_name"),
         "eval_model_input": config.get("eval_model_name_input"),
@@ -544,6 +582,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tasks-file", default=None, help="JSONL task file for harness creation.")
     parser.add_argument("--system-prompt", default=None, help="System prompt prepended to each task prompt.")
+    parser.add_argument(
+        "--creation-profile",
+        default=None,
+        choices=["freeform", "interface", "interface_tool", "interface-tool", "full_loop", "full-loop"],
+        help="Harness creation profile. Main experiment default: interface_tool.",
+    )
+    parser.add_argument(
+        "--pre-bmk-gate",
+        default=None,
+        choices=["off", "soft", "hard"],
+        help="Pre-BMK validation gate used by --eval-after. soft records failures but still runs BMK; hard skips failed harnesses.",
+    )
     parser.add_argument("--no-system-prompt", action="store_true", help="Do not prepend system prompt.")
     parser.add_argument("--max-concurrent", type=int, default=None)
     parser.add_argument("--timeout-minutes", type=int, default=None)
@@ -633,6 +683,7 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
     command.extend(["--run-id", eval_run_id])
     if args.eval_dry_run:
         command.append("--dry-run")
+    command.extend(["--pre-bmk-gate", str(config.get("pre_bmk_gate") or "soft")])
 
     print("\nRunning downstream BMK eval:")
     print(" ".join(command))
@@ -642,6 +693,8 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
 def main():
     args = parse_args()
     config = resolve_config_models(apply_cli_overrides(load_config(args.config), args))
+    config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    config["pre_bmk_gate"] = str(config.get("pre_bmk_gate") or "soft")
 
     if args.list_model_aliases:
         print_model_aliases(config)

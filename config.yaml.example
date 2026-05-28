@@ -50,6 +50,17 @@ model_aliases:
 system_prompt_file: "./prompts/system_prompt.md"
 include_system_prompt: true
 
+# 主实验 creation profile。推荐 interface_tool：
+# 固定 CLI/tool/logging/result schema，模型生成 control loop/context/verifier/recovery。
+# 可选：freeform / interface / interface_tool / full_loop
+creation_profile: "interface_tool"
+
+# 进入下游 BMK 前的 validation gate：
+# - off: 不做 pre-BMK validation
+# - soft: 记录 gate 结果，但仍继续跑 downstream BMK，适合 pilot
+# - hard: gate 失败则不进入 expensive BMK，end_to_end_score 记 0
+pre_bmk_gate: "soft"
+
 # Docker settings
 max_concurrent: 4
 timeout_minutes: 30
