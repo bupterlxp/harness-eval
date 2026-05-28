@@ -57,20 +57,30 @@ else
     rm -rf .git
 fi
 
-echo "=== Starting ccr service ==="
-ccr start &
-sleep 2
+if [ "${CLAUDE_NATIVE_ANTHROPIC:-}" = "1" ]; then
+    echo "=== Using native Anthropic endpoint for Claude Code ==="
+    export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-${BASE_URL}}"
+    export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-${API_KEY}}"
+    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}"
+    export CLAUDE_MODEL_NAME="${ANTHROPIC_MODEL:-${MODEL_NAME}}"
+else
+    echo "=== Starting ccr service ==="
+    ccr start &
+    sleep 2
 
-echo "=== Starting model proxy ==="
-WORKSPACE=/workspace UPSTREAM_BASE_URL="${BASE_URL}" UPSTREAM_API_KEY="${API_KEY}" node /model-proxy.js &
-sleep 1
+    echo "=== Starting model proxy ==="
+    WORKSPACE=/workspace UPSTREAM_BASE_URL="${BASE_URL}" UPSTREAM_API_KEY="${API_KEY}" node /model-proxy.js &
+    sleep 1
 
-export ANTHROPIC_BASE_URL="http://127.0.0.1:3457"
-export ANTHROPIC_AUTH_TOKEN="placeholder"
-export OPENAI_BASE_URL="http://127.0.0.1:3457/v1"
-export OPENAI_API_KEY="sk-placeholder"
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:3457"
+    export ANTHROPIC_AUTH_TOKEN="placeholder"
+    export ANTHROPIC_API_KEY="placeholder"
+    export OPENAI_BASE_URL="http://127.0.0.1:3457/v1"
+    export OPENAI_API_KEY="sk-placeholder"
+    export CLAUDE_MODEL_NAME="${CLAUDE_MODEL_NAME:-claude-sonnet-4-6}"
+fi
+
 export MODEL_NAME="${MODEL_NAME}"
-export CLAUDE_MODEL_NAME="${CLAUDE_MODEL_NAME:-claude-sonnet-4-6}"
 export CLAUDE_REASONING_EFFORT="${CLAUDE_REASONING_EFFORT:-}"
 export NO_PROXY="127.0.0.1"
 export DISABLE_TELEMETRY="true"

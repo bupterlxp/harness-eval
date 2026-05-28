@@ -23,6 +23,43 @@ python -m harness -p "任务描述" --output-dir ./output/
 }
 ```
 
+### Code BMK 必须满足的执行契约
+
+这个 harness 会直接接入 SWE-Bench / TerminalBench 类代码任务。任务的真实产物在工作目录里，而不是只写一份回答文档。因此必须做到：
+
+- 支持 `--workdir`、`--work-dir`、`--workspace`，并把它作为代码仓库根目录；未传时使用当前目录；
+- 所有文件读写、测试命令、补丁应用都必须发生在工作目录内；
+- 如果任务明确要求创建或修改某个路径，例如 `/app/gpt2.c`、`src/foo.py`、`tests/test_x.py`，完成前必须检查这些路径存在且内容非空；
+- 对 SWE 风格任务，必须产出可应用的 patch 或直接修改工作目录文件；对 Terminal 风格任务，必须创建题目要求的最终文件；
+- 禁止把最终答案只写到 `response.md`、`REPORT.md` 或 `result.json` 后声明成功；
+- `success` 的最低条件是：任务要求的文件存在、语法/编译/测试命令已尽力运行、验证结果写入 `result.json`；
+- 如果测试依赖缺失或无法运行，仍要保存代码修改、patch 和失败日志，状态为 `partial`，不能丢失产物。
+- 如果任务中出现明确输出路径，例如 `/app/gpt2.c` 或 `tests/foo.py`，必须在前 3 个执行步骤内创建该文件的 best-effort 初版，后续步骤再迭代改进；禁止只探索环境直到预算耗尽。
+- 当任务要求写一个可编译程序时，即使完整实现很难，也要先写一个能通过编译的最小版本，再逐步补全功能。不能因为不确定完整算法而不创建文件。
+
+### Code harness 内置工具最低要求
+
+必须实现并在执行循环中真实使用以下工具，不能只声明名字：
+
+- `list_files` / `read_file` / `search_text`：定位仓库内容；
+- `write_file` / `edit_file` / `apply_patch`：创建或修改文件；
+- `run_command`：运行测试、编译、lint 或题目给出的验证命令；
+- `finish`：只在后置条件满足后结束。
+
+所有工具调用前后都要写入 `trajectory.jsonl`。LLM 只负责决策和生成修改方案，文件修改必须由工具实际落地。
+
+`verify_artifacts` 或等价校验必须检查显式目标文件是否存在、是否非空、是否至少通过语法/编译级验证。目标文件缺失时必须返回失败，不能把 `response.md` 或自然语言说明当作任务完成。
+
+### Anthropic/OpenAI 转发兼容
+
+代码智能体经常多轮调用 LLM，必须保证每次请求的 `messages`：
+
+- 最后一条永远是 `user`；
+- 不使用 assistant prefill；
+- 连续同角色消息先合并；
+- 把工具 observation 作为 `user` 消息追加；
+- API 报错时最多重试 3 次，之后降级为基于任务描述的 best-effort 文件修改，不允许直接无产物失败。
+
 ---
 
 ## 二、功能性质

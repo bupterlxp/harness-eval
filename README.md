@@ -279,6 +279,30 @@ export API_KEY="$OPENROUTER_API_KEY"
 export MODEL_NAME="anthropic/claude-opus-4.7"
 ```
 
+如果使用内部 Anthropic-native endpoint，而不是 OpenAI-compatible chat completions endpoint，则走 Claude Code 原生 Anthropic 配置：
+
+```bash
+export CLAUDE_NATIVE_ANTHROPIC=1
+export ANTHROPIC_BASE_URL="https://your-anthropic-endpoint"
+export ANTHROPIC_AUTH_TOKEN="$YOUR_TOKEN"
+export ANTHROPIC_MODEL="your-opus-model-id"
+export CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1
+export CLAUDE_CODE_THINKING=adaptive
+export CLAUDE_CODE_THINKING_EFFORT=max
+
+.venv/bin/python run.py \
+  --run-id code-opus47-max \
+  --meta-harness claude-code \
+  --base-url "$ANTHROPIC_BASE_URL" \
+  --api-key "$ANTHROPIC_AUTH_TOKEN" \
+  --model-name "$ANTHROPIC_MODEL" \
+  --claude-model-name "$ANTHROPIC_MODEL" \
+  --reasoning-effort max \
+  --task-id code-agent-harness
+```
+
+`max` 档会直接传给 Claude Code `--effort max`。如果上游网关因为超时或并发限流失败，可以把 `CLAUDE_CODE_THINKING_EFFORT` 和 `--reasoning-effort` 临时降到 `high`，但要在 run id 或实验记录里标明。
+
 如果想把写 harness 的模型和被测 harness 的模型分开，例如用 Claude Code 这个 meta harness 调两个不同后端模型：
 
 ```bash
@@ -388,12 +412,40 @@ python3.12 run_creation_eval.py \
 可直接接入的 runner 会运行；缺数据、缺服务、缺 API key 或还没有 generated-harness agent adapter 的项会在
 `missing_dependencies` 中明确记录为 `skipped/*`。
 
+### Creation 侧 BMK 可评分契约
+
+2026-05-28 起，creation prompt 不再只要求“结构完整”，还显式要求“可被下游 BMK 评分”。核心约束写在 `prompts/system_prompt.md`、`prompts/code_agent_harness.md`、`prompts/data_analysis_harness.md`：
+
+- 统一 CLI 必须兼容 `-p/--prompt`、`--output-dir`、`--workdir/--work-dir/--workspace`、`--max-steps/--max-turns`；
+- 每次运行必须写出 `result.json`、`trajectory.jsonl`、stdout/stderr 日志和任务真实产物；
+- 禁止只输出固定模板、文件列表、步骤列表或 `response.md` 后声明成功；
+- Code harness 遇到明确目标路径时，必须尽早创建 best-effort 文件，例如 TerminalBench 里的 `/app/gpt2.c`；
+- Data harness 遇到 MLE-Bench 必须产出同 schema 的 `submission.csv`，不能 no submission；
+- DAComp 报告必须包含真实计算结果：风险指标、风险分层、授信额度、利率规则、结论表和机器可读汇总。
+
+这部分是为了区分两类失败：
+
+- **eval runner 问题**：依赖缺失、服务未启动、adapter 不兼容、官方 evaluator 报错；
+- **creation 质量问题**：generated harness 能启动，但没有做出可评分产物，或产物只是模板/兜底内容。
+
+如果是后者，应该优先改 `prompts/` 或提供更强 scaffold，而不是改 downstream BMK 分数逻辑。
+
 代码类 BMK 目前已经接入 generated harness：
 
 - `swebench_pro`: 通过 `harness_house/benchmarks` 的 SWE-bench/OpenHands workspace 启动实例，把 generated code harness 上传进 repo workspace，运行后抽取 `git diff`，再调用 `swebench-eval` 得到真实 resolved/pass rate。
 - `terminal_2_bench`: 通过 Harbor `--agent-import-path` 注册 `GeneratedHarnessAgent`，在 TerminalBench task container 内上传并运行 generated code harness，再用现有 `terminalbench-eval` 汇总 verifier 结果。
 
 这两个 runner 不伪造分数；Docker/Harbor 启动超时、generated harness adapter 失败、官方 evaluator 缺镜像等都会写成 `failed/*` 或明确的依赖缺失。
+
+2026-05-28 小样本验证记录：
+
+| BMK | Run ID | 结果 | 结论 |
+|---|---|---:|---|
+| Terminal 2.0 | `regen-code-opus47-max-promptfix-terminal2-20260528` | unresolved，`0/1` | Harbor 和 verifier 已真实启动；generated code harness 30 步耗尽，未完成 `/app/gpt2.c`，属于 creation 质量问题。 |
+| MLE-bench | `regen-data-opus47-high-promptfix-dataeval-20260528` | `score=0.82299` | generated data harness 产出有效 `submission.csv`，可以 pilot。 |
+| DAComp | `regen-data-opus47-high-promptfix-dataeval-20260528` | `score=0.0` | runner 和 judge 已真实运行；generated data harness 只写浅层模板报告，属于 creation 质量问题。 |
+
+上述结果的统一输出在 `eval_results/<run_id>/summary.csv`。`eval_results/` 默认被 `.gitignore` 忽略，不会提交到仓库。
 
 截图中的非代码类 BMK 也已 registry 化并接到 generated harness：
 

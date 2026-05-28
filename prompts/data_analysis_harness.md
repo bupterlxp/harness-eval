@@ -23,6 +23,64 @@ python -m harness -p "任务描述" --output-dir ./output/
 }
 ```
 
+### Data BMK 必须满足的执行契约
+
+这个 harness 会直接接入 MLE-Bench / DAComp 类数据任务，分数取决于真实产物而不是解释文本。必须做到：
+
+- 支持 `--workdir`、`--work-dir`、`--workspace`，并把它作为数据和任务文件根目录；
+- 支持 `--max-steps`、`--max-turns`；
+- 自动发现工作目录中的 `*.csv`、`*.tsv`、`*.json`、`*.parquet`、`*.xlsx`、`*.sqlite`、`*.db`、`train*`、`test*`、`sample_submission*`、`README*`、`instructions*`；
+- 所有最终产物必须写入 `--output-dir`，同时在 `result.json` 中记录绝对路径；
+- 运行失败也必须写出 `result.json`、`trajectory.jsonl`、错误日志和 best-effort 报告，不能只返回异常。
+
+### MLE-Bench 产物要求
+
+如果发现 `sample_submission.csv` 或任务说明要求提交文件，必须：
+
+- 读取 sample submission 的列名和行数；
+- 生成同 schema 的 `submission.csv`，路径写入 `result.json.submission_path`；
+- 如果模型或训练流程失败，使用可解释的 baseline 兜底，例如多数类、均值、中位数、按训练集统计填充，不能 no submission；
+- 在 `REPORT.md` 中说明使用的数据、特征、模型或兜底策略。
+
+### DAComp 产物要求
+
+如果任务是开放式数据分析或报告生成，必须：
+
+- 生成 `REPORT.md`，包含问题理解、数据检查、关键计算、结论和局限；
+- 至少输出一个机器可读结果文件，例如 `analysis_summary.json` 或 `metrics.csv`；
+- 如果有可视化需求，图片保存到 `--output-dir` 并在报告中引用；
+- `result.json` 至少包含 `report_path`、`artifacts`、`status`、`trajectory`、`error`。
+
+对于 DAComp 信贷/经营数据类任务，`REPORT.md` 的最低可评分内容必须包括：
+
+- 企业级指标表或汇总表：收入规模、成本/利润代理、收入稳定性、上下游集中度、作废/红冲发票比例、现有信用等级；
+- 风险分层规则：至少给出 A/B/C 或 Low/Medium/High 风险分层公式或阈值；
+- 授信额度分配方案：总额度必须等于题目给定预算，例如 RMB 100 million，并说明每个等级或企业的分配逻辑；
+- 利率定价方案：结合 churn rate 和风险等级，给出利率区间或每档利率；
+- 结论表：每个风险层的企业数量、额度占比、建议利率、预期风险说明；
+- 至少一个可复查的机器可读产物，例如 `credit_allocation.csv`、`risk_scores.csv`、`analysis_summary.json`。
+
+禁止以下低质量报告通过校验：
+
+- 只列出发现了哪些文件；
+- 只列出执行了哪些 step；
+- 没有数据计算结果；
+- 没有授信额度和利率规则；
+- 没有把总额度约束落实到数值；
+- 没有引用任何生成的表格、CSV 或图表。
+
+如果 LLM 调用失败，允许写 `partial` 报告留痕，但 `verify_artifacts` 必须返回失败，不能把模板报告当成可提交答案。不要实现固定的“fallback flow complete”路径作为正常结束条件。
+
+### 数据分析工具最低要求
+
+必须实现并在执行循环中真实使用以下工具，不能只声明名字：
+
+- 文件发现和 schema 摘要工具；
+- Python 代码执行工具，带超时、异常捕获和 stdout/stderr 记录；
+- dataframe 摘要工具，禁止把完整大表塞进 prompt；
+- 报告/CSV/图片写入工具；
+- 产物校验工具，结束前检查提交文件或报告是否存在。
+
 ---
 
 ## 二、功能性质

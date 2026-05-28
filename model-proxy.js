@@ -164,6 +164,155 @@ function buildUpstreamOptions(targetUrl, method, headers, bodyLength) {
   };
 }
 
+function isAnthropicNativeUrl(targetUrl) {
+  return String(targetUrl || '').includes('/anthropic');
+}
+
+function anthropicMessagesUrl(targetUrl) {
+  const base = String(targetUrl || '').replace(/\/$/, '');
+  if (base.endsWith('/v1/messages') || base.endsWith('/messages')) {
+    return base;
+  }
+  return `${base}/v1/messages`;
+}
+
+function textFromContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (part?.type === 'text') return part.text || '';
+      if (part?.text) return part.text;
+      return '';
+    }).join('');
+  }
+  return content == null ? '' : String(content);
+}
+
+function openAiToAnthropicPayload(bodyText) {
+  const payload = JSON.parse(bodyText || '{}');
+  const systemParts = [];
+  const messages = [];
+  for (const msg of payload.messages || []) {
+    const role = msg.role === 'assistant' ? 'assistant' : 'user';
+    if (msg.role === 'system') {
+      systemParts.push(textFromContent(msg.content));
+      continue;
+    }
+    messages.push({ role, content: textFromContent(msg.content) });
+  }
+  const next = {
+    model: MODEL_NAME,
+    max_tokens: payload.max_tokens || payload.max_completion_tokens || 4096,
+    messages,
+  };
+  if (systemParts.length) next.system = systemParts.join('\n\n');
+  if (payload.temperature !== undefined) next.temperature = payload.temperature;
+  if (payload.top_p !== undefined) next.top_p = payload.top_p;
+  return next;
+}
+
+function anthropicToOpenAiCompletion(rawBody, stream) {
+  let parsed;
+  try {
+    parsed = JSON.parse(rawBody || '{}');
+  } catch (e) {
+    return { statusCode: 502, body: JSON.stringify({ error: { message: rawBody || 'invalid anthropic response' } }) };
+  }
+  const text = (parsed.content || []).map((part) => part?.text || '').join('');
+  const promptTokens = parsed.usage?.input_tokens || 0;
+  const completionTokens = parsed.usage?.output_tokens || 0;
+  const response = {
+    id: parsed.id || `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: parsed.model || MODEL_NAME,
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: text },
+        finish_reason: parsed.stop_reason || 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+  };
+  if (!stream) {
+    return { statusCode: 200, body: JSON.stringify(response), contentType: 'application/json' };
+  }
+  const chunk = {
+    id: response.id,
+    object: 'chat.completion.chunk',
+    created: response.created,
+    model: response.model,
+    choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
+  };
+  const finalChunk = {
+    id: response.id,
+    object: 'chat.completion.chunk',
+    created: response.created,
+    model: response.model,
+    choices: [{ index: 0, delta: {}, finish_reason: response.choices[0].finish_reason }],
+    usage: response.usage,
+  };
+  return {
+    statusCode: 200,
+    contentType: 'text/event-stream',
+    body: `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(finalChunk)}\n\ndata: [DONE]\n\n`,
+  };
+}
+
+function handleAnthropicNativeProvider(req, res, originalBody) {
+  let openAiPayload;
+  let anthropicPayload;
+  try {
+    openAiPayload = JSON.parse(originalBody || '{}');
+    anthropicPayload = openAiToAnthropicPayload(originalBody);
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `Invalid request JSON: ${e.message}` } }));
+    return;
+  }
+  const stream = Boolean(openAiPayload.stream);
+  const shapedBody = Buffer.from(JSON.stringify(anthropicPayload));
+  const options = buildUpstreamOptions(
+    anthropicMessagesUrl(UPSTREAM_BASE_URL),
+    'POST',
+    {
+      'content-type': 'application/json',
+      'x-api-key': UPSTREAM_API_KEY,
+      'anthropic-version': '2023-06-01',
+      authorization: `Bearer ${UPSTREAM_API_KEY}`,
+    },
+    shapedBody.length,
+  );
+  const transport = options.protocol === 'https:' ? require('https') : http;
+  const upstreamReq = transport.request(options, (upstreamRes) => {
+    const chunks = [];
+    upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf-8');
+      if (upstreamRes.statusCode < 200 || upstreamRes.statusCode >= 300) {
+        res.writeHead(upstreamRes.statusCode || 502, { 'Content-Type': 'application/json' });
+        res.end(rawBody);
+        return;
+      }
+      const converted = anthropicToOpenAiCompletion(rawBody, stream);
+      res.writeHead(converted.statusCode, { 'Content-Type': converted.contentType || 'application/json' });
+      res.end(converted.body);
+    });
+  });
+  upstreamReq.on('error', (err) => {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `Anthropic upstream proxy error: ${err.message}` } }));
+  });
+  upstreamReq.write(shapedBody);
+  upstreamReq.end();
+}
+
 function shapeProviderRequest(bodyText) {
   let payload;
   try {
@@ -205,6 +354,10 @@ const providerProxy = http.createServer((req, res) => {
   req.on('data', (chunk) => reqChunks.push(chunk));
   req.on('end', () => {
     const originalBody = Buffer.concat(reqChunks).toString('utf-8');
+    if (isAnthropicNativeUrl(UPSTREAM_BASE_URL)) {
+      handleAnthropicNativeProvider(req, res, originalBody);
+      return;
+    }
     const shapedBody = shapeProviderRequest(originalBody);
     const options = buildUpstreamOptions(UPSTREAM_BASE_URL, req.method, req.headers, shapedBody.length);
     const transport = options.protocol === 'https:' ? require('https') : http;

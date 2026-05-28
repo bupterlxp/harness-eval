@@ -83,7 +83,14 @@ def configure_eval_llm(
         raise ValueError("Missing eval LLM config: " + ", ".join(missing))
 
     if provider_proxy:
-        upstream_url = normalize_chat_completions_url(resolved_base_url)
+        # OpenAI-compatible providers want /chat/completions. The TikTok/ModelHub
+        # Anthropic endpoint is native Claude Messages API; model-proxy translates
+        # OpenAI chat requests to /v1/messages itself, so do not append the
+        # OpenAI suffix here.
+        if "/anthropic" in resolved_base_url.lower():
+            upstream_url = resolved_base_url.rstrip("/")
+        else:
+            upstream_url = normalize_chat_completions_url(resolved_base_url)
         host_base = f"http://127.0.0.1:{provider_proxy_port}/v1"
         container_base = f"http://host.docker.internal:{provider_proxy_port}/v1"
         os.environ.update(

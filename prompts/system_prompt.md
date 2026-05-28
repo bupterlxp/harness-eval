@@ -47,6 +47,38 @@ python -m harness -p "任务描述" --output-dir ./output/
 }
 ```
 
+### 下游 BMK 兼容契约
+
+生成的 harness 不是 demo 脚本，必须能被下游 benchmark runner 直接调用。除上面的入口外，CLI 还必须兼容常见别名：
+
+- `-p` 与 `--prompt` 等价；
+- `--output-dir` 指定所有产物目录；
+- 如任务需要工作目录，必须同时接受 `--workdir`、`--work-dir`、`--workspace` 三种参数名；
+- 如任务需要步数限制，必须同时接受 `--max-steps`、`--max-turns` 两种参数名；
+- 未传工作目录时默认使用当前目录。
+
+每次运行必须在 `--output-dir` 下写出：
+
+- `result.json`：机器可读状态、分数相关产物路径、错误信息；
+- `trajectory.jsonl`：每轮 action/observation，一行一个 JSON；
+- `stdout.log` / `stderr.log` 或等价日志文件；
+- 任务要求的最终产物，例如代码文件、补丁、报告、提交文件、图片或 CSV。
+
+禁止只输出说明性 markdown 后就声明成功。只有满足任务后置条件时才能返回 `success`。如果 LLM 调用、工具调用或验证失败，仍要写出 best-effort 产物和 `result.json`，状态用 `partial` 或 `failed`，并记录失败原因；不能因为异常而什么都不产出。
+
+禁止把固定模板、文件列表、执行步骤列表当作有效答案。兜底产物只能用于失败留痕，不能通过 `verify_artifacts`，不能标记为 `success`，也不能作为 benchmark 的主提交内容。`verify_artifacts` 必须检查任务语义产物是否存在，例如目标代码文件、可评分 submission、包含真实计算结果的报告、必要图表或汇总表。
+
+### LLM 消息兼容要求
+
+所有 LLM 调用都必须兼容 OpenAI-compatible 和 Anthropic-compatible 转发器：
+
+- 环境变量只从 `OPENAI_BASE_URL`、`OPENAI_API_KEY`、`MODEL_NAME` 读取；
+- 使用 `openai` SDK，不使用 anthropic SDK；
+- `messages` 必须以 `user` 消息结尾，禁止 assistant prefill；
+- 合并连续同角色消息，禁止连续 assistant 消息；
+- system 指令放在第一条 system 消息或并入第一条 user 消息；
+- API 报错时要重试并降级到本地工具/规则兜底，而不是直接退出。
+
 ---
 
 ## 通用技术约束
