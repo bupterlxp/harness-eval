@@ -45,6 +45,11 @@ def normalize_openai_base_url(url: str) -> str:
     return url
 
 
+def is_exact_provider_endpoint(url: str) -> bool:
+    lower = url.lower()
+    return "/v2/crawl" in lower
+
+
 def configure_eval_llm(
     *,
     harness_eval_root: Path,
@@ -87,7 +92,7 @@ def configure_eval_llm(
         # Anthropic endpoint is native Claude Messages API; model-proxy translates
         # OpenAI chat requests to /v1/messages itself, so do not append the
         # OpenAI suffix here.
-        if "/anthropic" in resolved_base_url.lower():
+        if "/anthropic" in resolved_base_url.lower() or is_exact_provider_endpoint(resolved_base_url):
             upstream_url = resolved_base_url.rstrip("/")
         else:
             upstream_url = normalize_chat_completions_url(resolved_base_url)

@@ -61,6 +61,15 @@ creation_profile: "interface_tool"
 # - hard: gate 失败则不进入 expensive BMK，end_to_end_score 记 0
 pre_bmk_gate: "soft"
 
+# Self-evolve 默认设置。run_self_evolve.py 仍然可以用命令行覆盖这些项。
+# mode=goal: 给 harness 一个目标，让它根据 BMK 分数/轨迹自我迭代。
+# mode=commit: 给一串 human-commit 转写任务，让 agent 实现同等功能，再和 human reference 比较。
+self_evolve:
+  mode: "goal"
+  rounds: 3
+  goal: "Improve the generated harness so it scores higher on the selected downstream benchmark while preserving the standard CLI and artifact contract."
+  evolution_tasks_file: "./self_evolve_tasks.example.jsonl"
+
 # Docker settings
 max_concurrent: 4
 timeout_minutes: 30

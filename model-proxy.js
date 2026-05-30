@@ -11,7 +11,7 @@ const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL;
 const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY;
 const OPENROUTER_VERBOSITY = process.env.OPENROUTER_VERBOSITY || '';
 const OPENROUTER_REASONING_ENABLED = process.env.OPENROUTER_REASONING_ENABLED === 'true';
-const METRICS_PATH = path.join(process.env.WORKSPACE || '/workspace', 'metrics.json');
+const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 
 // Rough estimate: 1 token ≈ 4 chars for English, ≈ 2 chars for Chinese
 const CHARS_PER_TOKEN = 3.5;
@@ -32,6 +32,7 @@ const metrics = {
 
 function saveMetrics() {
   try {
+    fs.mkdirSync(path.dirname(METRICS_PATH), { recursive: true });
     fs.writeFileSync(METRICS_PATH, JSON.stringify(metrics, null, 2));
   } catch (e) {
     console.error('Failed to save metrics:', e.message);
@@ -332,9 +333,14 @@ function shapeProviderRequest(bodyText) {
     payload.verbosity = OPENROUTER_VERBOSITY;
   }
 
-  // Claude 4.7 ignores these sampling parameters. Removing them keeps the
-  // provider payload explicit and avoids provider-specific compatibility issues.
-  if (String(MODEL_NAME).includes('claude-opus-4.7')) {
+  // Some provider endpoints reject non-default sampling parameters instead of
+  // ignoring them. Removing them keeps judge calls compatible with exact-model
+  // endpoints such as GPT-5.5 and Claude Opus 4.7.
+  const stripsSamplingParams = [
+    'claude-opus-4.7',
+    'gpt-5.5',
+  ].some((name) => String(MODEL_NAME).includes(name));
+  if (stripsSamplingParams) {
     delete payload.temperature;
     delete payload.top_p;
     delete payload.top_k;

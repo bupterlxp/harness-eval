@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from .schema import HarnessArtifact, ValidationResult
+from .scaffold_runtime import apply_scaffold_pythonpath, find_scaffold_program
 from .utils import read_json, run_command
 
 
@@ -102,10 +103,70 @@ def _install_requirements(artifact_path: Path, python_bin: str, result: Validati
             str(requirements),
         ],
         cwd=artifact_path,
-        timeout=max(timeout, 300),
+        timeout=min(max(timeout, 60), 180),
     )
     if install.returncode != 0:
-        result.errors.append(f"requirements_install_failed: {install.stderr.strip() or install.stdout.strip()}")
+            result.errors.append(f"requirements_install_failed: {install.stderr.strip() or install.stdout.strip()}")
+
+
+def _help_probe_ok(probe) -> bool:
+    if probe.returncode == 0:
+        return True
+    output = f"{probe.stdout}\n{probe.stderr}".lower()
+    # Some generated CLIs catch argparse's SystemExit(0) incorrectly and
+    # return 2 after printing valid help. Treat that as a runnable CLI, while
+    # keeping real argparse errors invalid.
+    return probe.returncode == 2 and "usage:" in output and "options:" in output and "error:" not in output
+
+
+def _validate_scaffold_artifact(
+    artifact: HarnessArtifact,
+    result: ValidationResult,
+    python_bin: str,
+    timeout: int,
+    program_path: Path,
+) -> ValidationResult:
+    syntax = run_command([python_bin, "-m", "py_compile", str(program_path)], timeout=timeout)
+    result.syntax_ok = syntax.returncode == 0
+    if not result.syntax_ok:
+        result.errors.append(f"syntax_check_failed: {syntax.stderr.strip() or syntax.stdout.strip()}")
+
+    env = os.environ.copy()
+    shim_dir = Path(__file__).resolve().parent / "shims"
+    apply_scaffold_pythonpath(env, artifact.path, program_path)
+    env["PYTHONPATH"] = os.pathsep.join([str(shim_dir), env.get("PYTHONPATH", "")])
+    import_code = (
+        "from pathlib import Path; "
+        "from harness_scaffold.adapters.generated_harness_adapter import load_program; "
+        f"load_program(Path({str(program_path)!r})); "
+        "print('ok')"
+    )
+    imported = run_command([python_bin, "-c", import_code], cwd=artifact.path, env=env, timeout=timeout)
+    result.import_ok = imported.returncode == 0
+    if not result.import_ok:
+        missing = _missing_module(imported.stderr)
+        if missing:
+            result.missing_dependencies.append(missing)
+        result.errors.append(f"scaffold_import_check_failed: {imported.stderr.strip() or imported.stdout.strip()}")
+
+    probe = run_command(
+        [python_bin, "-m", "harness_scaffold.adapters.cli", "--help"],
+        cwd=artifact.path,
+        env=env,
+        timeout=30,
+    )
+    result.cli_probe_ok = probe.returncode == 0 and "harness_scaffold.adapters.cli" in probe.stdout
+    if not result.cli_probe_ok:
+        result.errors.append(f"scaffold_cli_probe_failed: {probe.stderr.strip() or probe.stdout.strip()}")
+
+    result.meta["scaffold_program"] = str(program_path)
+    if result.generation_status != "success":
+        result.adapter_status = "invalid_generation_status"
+    elif result.syntax_ok and result.import_ok and result.cli_probe_ok:
+        result.adapter_status = "ready"
+    else:
+        result.adapter_status = "invalid"
+    return result
 
 
 def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int = 60) -> ValidationResult:
@@ -134,6 +195,10 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
     )
 
     harness_dir = artifact.path / "harness"
+    scaffold_program = find_scaffold_program(artifact.path)
+    if not harness_dir.is_dir() and scaffold_program is not None:
+        return _validate_scaffold_artifact(artifact, result, python_bin, timeout, scaffold_program)
+
     if not harness_dir.is_dir():
         result.errors.append("missing harness/ directory")
         result.adapter_status = "invalid"
@@ -144,10 +209,11 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
     if not result.syntax_ok:
         result.errors.append(f"syntax_check_failed: {syntax.stderr.strip() or syntax.stdout.strip()}")
 
-    _install_requirements(artifact.path, python_bin, result, timeout)
-
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(artifact.path)
+    shim_dir = Path(__file__).resolve().parent / "shims"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(artifact.path), str(shim_dir), env.get("PYTHONPATH", "")]
+    )
     import_code = "import harness; print('ok')"
     imported = run_command([python_bin, "-c", import_code], cwd=artifact.path, env=env, timeout=timeout)
     result.import_ok = imported.returncode == 0
@@ -155,7 +221,13 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
         missing = _missing_module(imported.stderr)
         if missing:
             result.missing_dependencies.append(missing)
-        result.errors.append(f"import_check_failed: {imported.stderr.strip() or imported.stdout.strip()}")
+            _install_requirements(artifact.path, python_bin, result, timeout)
+            imported = run_command([python_bin, "-c", import_code], cwd=artifact.path, env=env, timeout=timeout)
+            result.import_ok = imported.returncode == 0
+            if not result.import_ok:
+                result.errors.append(f"import_check_failed: {imported.stderr.strip() or imported.stdout.strip()}")
+        else:
+            result.errors.append(f"import_check_failed: {imported.stderr.strip() or imported.stdout.strip()}")
 
     cli_commands = [
         [python_bin, "-m", "harness", "--help"],
@@ -163,7 +235,7 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
     ]
     for command in cli_commands:
         probe = run_command(command, cwd=artifact.path, env=env, timeout=30)
-        if probe.returncode == 0:
+        if _help_probe_ok(probe):
             result.cli_probe_ok = True
             break
         missing = _missing_module(probe.stderr)

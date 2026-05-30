@@ -33,6 +33,10 @@ from creation_eval.model_aliases import (
     resolve_codex_model_alias,
     resolve_model_alias,
 )
+from creation_eval.scaffold_runtime import scaffold_source_available, vendor_scaffold_dir
+
+
+SCAFFOLD_USAGE_SOURCE = Path(__file__).resolve().parent / "vendor" / "CLAUDE_CODE_SCAFFOLD_USAGE.md"
 
 
 def default_config() -> dict:
@@ -137,6 +141,8 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
 def normalize_creation_profile(value: str | None) -> str:
     profile = (value or "interface_tool").strip().lower().replace("-", "_")
     aliases = {
+        "claude_code_scaffold": "claude_code_scaffold",
+        "claudecodescaffold": "claude_code_scaffold",
         "interface_tool": "interface_tool",
         "interfacetool": "interface_tool",
         "interface": "interface",
@@ -147,7 +153,7 @@ def normalize_creation_profile(value: str | None) -> str:
     if profile not in aliases:
         raise ValueError(
             f"Unsupported creation_profile={value!r}. "
-            "Supported values: freeform, interface, interface_tool, full_loop."
+            "Supported values: freeform, interface, interface_tool, full_loop, claude_code_scaffold."
         )
     return aliases[profile]
 
@@ -250,7 +256,16 @@ def compose_prompt(prompt: str, config: dict) -> str:
     )
 
 
-def build_docker_image():
+def build_docker_image(force: bool = False):
+    if not force:
+        existing = subprocess.run(
+            ["docker", "image", "inspect", "harness-eval:latest"],
+            capture_output=True,
+            text=True,
+        )
+        if existing.returncode == 0:
+            print("Docker image harness-eval:latest already exists; skipping build.")
+            return
     print("Building Docker image...")
     subprocess.run(
         ["docker", "build", "-t", "harness-eval", "."],
@@ -311,6 +326,28 @@ def prepare_workspace(task: dict, workspace: str):
                 shutil.copytree(src, dest)
             else:
                 shutil.copy2(src, dest)
+
+    install_scaffold_resources(ws, task["_config"])
+
+
+def install_scaffold_resources(workspace: Path, config: dict) -> None:
+    if normalize_creation_profile(str(config.get("creation_profile") or "interface_tool")) != "claude_code_scaffold":
+        return
+    if not scaffold_source_available():
+        raise FileNotFoundError(
+            f"claude_code_scaffold profile requires vendored scaffold at {vendor_scaffold_dir()}"
+        )
+
+    dest = workspace / "harness_scaffold"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(
+        vendor_scaffold_dir(),
+        dest,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    if SCAFFOLD_USAGE_SOURCE.is_file():
+        shutil.copy2(SCAFFOLD_USAGE_SOURCE, workspace / "CLAUDE_CODE_SCAFFOLD.md")
 
 
 def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
@@ -493,6 +530,9 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         "run_id": config.get("run_id"),
         "meta_harness": config.get("meta_harness", "claude-code"),
         "creation_profile": config.get("creation_profile", "interface_tool"),
+        "scaffold_source": "vendor/harness_scaffold"
+        if config.get("creation_profile") == "claude_code_scaffold"
+        else None,
         "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
         "generation_model_input": config.get("model_name_input"),
         "generation_model": config.get("model_name"),
@@ -585,7 +625,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--creation-profile",
         default=None,
-        choices=["freeform", "interface", "interface_tool", "interface-tool", "full_loop", "full-loop"],
+        choices=[
+            "freeform",
+            "interface",
+            "interface_tool",
+            "interface-tool",
+            "full_loop",
+            "full-loop",
+            "claude_code_scaffold",
+            "claude-code-scaffold",
+        ],
         help="Harness creation profile. Main experiment default: interface_tool.",
     )
     parser.add_argument(

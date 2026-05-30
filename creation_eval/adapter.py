@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .schema import HarnessRunResult
+from .scaffold_runtime import apply_scaffold_pythonpath, find_scaffold_program
 from .utils import best_python_bin, copytree_filtered, run_command, write_json
 
 
@@ -306,12 +309,56 @@ def _install_real_search_patch(workspace: Path) -> None:
     (workspace / "sitecustomize.py").write_text(REAL_SEARCH_SITECUSTOMIZE, encoding="utf-8")
 
 
+REQUIREMENT_IMPORT_ALIASES = {
+    "beautifulsoup4": "bs4",
+    "opencv-python": "cv2",
+    "pillow": "PIL",
+    "python-dotenv": "dotenv",
+    "pyyaml": "yaml",
+    "scikit-learn": "sklearn",
+}
+
+
+def _requirement_import_name(line: str) -> str | None:
+    line = line.strip()
+    if not line or line.startswith("#") or line.startswith(("-", "--")):
+        return None
+    package = re.split(r"[<>=!~;\[\s]", line, maxsplit=1)[0].strip()
+    if not package:
+        return None
+    package_lower = package.lower().replace("_", "-")
+    return REQUIREMENT_IMPORT_ALIASES.get(package_lower, package_lower.replace("-", "_"))
+
+
+def _missing_requirement_imports(requirements: Path) -> list[str]:
+    missing: list[str] = []
+    for line in requirements.read_text(encoding="utf-8", errors="replace").splitlines():
+        import_name = _requirement_import_name(line)
+        if not import_name:
+            continue
+        if importlib.util.find_spec(import_name) is None:
+            missing.append(import_name)
+    return missing
+
+
 def _install_requirements(workspace: Path, python_bin: str, timeout: int) -> dict[str, Any] | None:
     requirements = workspace / "requirements.txt"
     if not requirements.is_file():
         return None
+    missing_imports = _missing_requirement_imports(requirements)
+    if not missing_imports:
+        return {
+            "command": [python_bin, "-m", "pip", "install", "-r", str(requirements)],
+            "returncode": 0,
+            "elapsed_sec": 0.0,
+            "stdout_tail": "skipped; all declared imports are already importable",
+            "stderr_tail": "",
+            "missing_imports": [],
+        }
     env = os.environ.copy()
     env.setdefault("PIP_BREAK_SYSTEM_PACKAGES", "1")
+    install_timeout = int(os.environ.get("HARNESS_EVAL_REQUIREMENTS_INSTALL_TIMEOUT", "90"))
+    install_timeout = max(15, min(install_timeout, 120, timeout))
     result = run_command(
         [
             python_bin,
@@ -325,7 +372,7 @@ def _install_requirements(workspace: Path, python_bin: str, timeout: int) -> dic
         ],
         cwd=workspace,
         env=env,
-        timeout=max(timeout, 300),
+        timeout=install_timeout,
     )
     return {
         "command": [python_bin, "-m", "pip", "install", "-r", str(requirements)],
@@ -333,6 +380,7 @@ def _install_requirements(workspace: Path, python_bin: str, timeout: int) -> dic
         "elapsed_sec": result.elapsed_sec,
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
+        "missing_imports": missing_imports,
     }
 
 
@@ -669,6 +717,159 @@ def _commands_for_domain(
     return commands
 
 
+def _scaffold_config(domain: str, timeout: int) -> dict[str, Any]:
+    try:
+        max_steps = int(
+            os.environ.get("HARNESS_EVAL_MAX_STEPS")
+            or os.environ.get(f"HARNESS_EVAL_{domain.upper()}_MAX_STEPS", "")
+            or 50
+        )
+    except ValueError:
+        max_steps = 50
+    allow_network = domain in {"research", "browser"} or os.environ.get("HARNESS_EVAL_ALLOW_NETWORK") == "1"
+    return {
+        "policy": {
+            "max_steps": max_steps,
+            "max_seconds": max(1, timeout),
+            "max_tool_seconds": min(max(30, timeout), 300),
+            "allow_network": allow_network,
+            "allow_shell": True,
+            "allow_destructive_fs": True,
+        },
+        "llm": {
+            "provider": "openai_like",
+            "model": os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL") or "",
+            "base_url": os.environ.get("OPENAI_BASE_URL") or os.environ.get("BASE_URL") or "https://api.openai.com/v1",
+            "api_key": os.environ.get("OPENAI_API_KEY") or os.environ.get("API_KEY") or "",
+        },
+        "include_optional_tools": True,
+    }
+
+
+def _run_scaffold_program(
+    workspace: Path,
+    program_path: Path,
+    domain: str,
+    prompt: str,
+    output_dir: Path,
+    task_work_dir: Path,
+    python_bin: str,
+    timeout: int,
+    env: dict[str, str],
+    attempts: list[dict[str, Any]],
+) -> HarnessRunResult | None:
+    run_output_dir = workspace / "adapter_scaffold_output"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    task_json = run_output_dir / "task.json"
+    config_json = run_output_dir / "config.json"
+    stdout_path = output_dir / "adapter_stdout.log"
+    stderr_path = output_dir / "adapter_stderr.log"
+    raw_result_path = output_dir / "adapter_result.json"
+
+    write_json(
+        task_json,
+        {
+            "task_id": f"{domain}-generated-harness",
+            "prompt": prompt,
+            "workdir": str(task_work_dir),
+            "domain": domain,
+            "benchmark_id": "harness-eval-adapter",
+            "metadata": {"adapter": "scaffold"},
+        },
+    )
+    write_json(config_json, _scaffold_config(domain, timeout))
+    apply_scaffold_pythonpath(env, workspace, program_path)
+
+    command = [
+        python_bin,
+        "-m",
+        "harness_scaffold.adapters.cli",
+        "--task-json",
+        str(task_json),
+        "--program",
+        str(program_path),
+        "--out-dir",
+        str(run_output_dir),
+        "--config",
+        str(config_json),
+    ]
+    result = run_command(command, cwd=workspace, env=env, timeout=timeout)
+    stdout_path.write_text(result.stdout, encoding="utf-8")
+    stderr_path.write_text(result.stderr, encoding="utf-8")
+    attempts.append(
+        {
+            "phase": "scaffold_cli",
+            "command": command,
+            "program": str(program_path),
+            "returncode": result.returncode,
+            "elapsed_sec": result.elapsed_sec,
+            "stdout_tail": result.stdout[-4000:],
+            "stderr_tail": result.stderr[-4000:],
+        }
+    )
+
+    response_source = run_output_dir / "response.md"
+    response_text = response_source.read_text(encoding="utf-8", errors="replace") if response_source.exists() else ""
+    artifacts_dir = output_dir / "artifacts"
+    if artifacts_dir.exists():
+        shutil.rmtree(artifacts_dir)
+    shutil.copytree(run_output_dir, artifacts_dir, dirs_exist_ok=True)
+
+    if result.returncode == 0:
+        response_path = output_dir / "response.md"
+        response_path.write_text(response_text or result.stdout.strip(), encoding="utf-8")
+        write_json(
+            raw_result_path,
+            {
+                "status": "success",
+                "domain": domain,
+                "adapter": "scaffold",
+                "program": str(program_path),
+                "selected_file": str(response_path),
+                "artifacts_dir": str(artifacts_dir),
+                "response_chars": len(response_text),
+                "attempts": attempts,
+            },
+        )
+        return HarnessRunResult(
+            status="success",
+            score=1.0,
+            pass_rate=1.0,
+            score_breakdown={"adapter_smoke": True, "adapter": "scaffold", "response_chars": len(response_text)},
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            raw_result_path=str(raw_result_path),
+        )
+
+    if result.returncode == 124:
+        status = "failed/timeout"
+        error = f"Scaffold generated program timed out after {timeout}s"
+    else:
+        status = "failed"
+        error = "Scaffold generated program invocation failed"
+    write_json(
+        raw_result_path,
+        {
+            "status": status,
+            "domain": domain,
+            "adapter": "scaffold",
+            "program": str(program_path),
+            "artifacts_dir": str(artifacts_dir),
+            "attempts": attempts,
+        },
+    )
+    return HarnessRunResult(
+        status="adapter_failed",
+        score=0.0,
+        pass_rate=0.0,
+        score_breakdown={"adapter_smoke": True, "adapter": "scaffold"},
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        raw_result_path=str(raw_result_path),
+        error=error,
+    )
+
+
 def run_generated_harness(
     harness_path: Path,
     domain: str,
@@ -696,7 +897,10 @@ def run_generated_harness(
         run_output_dir.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(workspace) + os.pathsep + env.get("PYTHONPATH", "")
+        shim_dir = Path(__file__).resolve().parent / "shims"
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(workspace), str(shim_dir), env.get("PYTHONPATH", "")]
+        )
         env.setdefault("OPENAI_BASE_URL", env.get("SEED2LITE_BASE_URL", env.get("BASE_URL", "")))
         env.setdefault("OPENAI_API_KEY", env.get("SEED2LITE_API_KEY", env.get("API_KEY", "")))
         env.setdefault("MODEL_NAME", env.get("SEED2LITE_MODEL_ID", env.get("MODEL_ID", "")))
@@ -725,6 +929,20 @@ def run_generated_harness(
                     raw_result_path=str(raw_result_path),
                     error="Generated harness requirements installation failed",
                 )
+        scaffold_program = find_scaffold_program(workspace)
+        if scaffold_program is not None and not (workspace / "harness").is_dir():
+            return _run_scaffold_program(
+                workspace,
+                scaffold_program,
+                domain,
+                prompt,
+                output_dir,
+                task_work_dir,
+                python_bin,
+                timeout,
+                env,
+                attempts,
+            )
         for command in _commands_for_domain(domain, python_bin, prompt, workspace, task_work_dir, run_output_dir):
             result = run_command(command, cwd=task_work_dir, env=env, timeout=timeout)
             attempts.append(
@@ -738,6 +956,25 @@ def run_generated_harness(
             )
             stdout_path.write_text(result.stdout, encoding="utf-8")
             stderr_path.write_text(result.stderr, encoding="utf-8")
+            if result.returncode == 124:
+                write_json(
+                    raw_result_path,
+                    {
+                        "status": "failed/timeout",
+                        "domain": domain,
+                        "attempts": attempts,
+                    },
+                )
+                return HarnessRunResult(
+                    status="adapter_failed",
+                    score=0.0,
+                    pass_rate=0.0,
+                    score_breakdown={"adapter_smoke": True, "timeout": timeout},
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    raw_result_path=str(raw_result_path),
+                    error=f"Generated harness command timed out after {timeout}s",
+                )
             if result.returncode == 0:
                 latest = _latest_text_file(run_output_dir, started_at) or _latest_text_file(workspace, started_at)
                 response_text = ""
@@ -779,6 +1016,20 @@ def run_generated_harness(
                     stderr_path=str(stderr_path),
                     raw_result_path=str(raw_result_path),
                 )
+
+        if scaffold_program is not None:
+            return _run_scaffold_program(
+                workspace,
+                scaffold_program,
+                domain,
+                prompt,
+                output_dir,
+                task_work_dir,
+                python_bin,
+                timeout,
+                env,
+                attempts,
+            )
 
         write_json(raw_result_path, {"status": "failed", "domain": domain, "attempts": attempts})
         return HarnessRunResult(
@@ -839,7 +1090,10 @@ def main() -> None:
     response_path.write_text(response, encoding="utf-8")
     print(f"Successfully created project folder at '{project_dir}'")
     print(f"Successfully created file '{response_path.name}'")
-    print(response)
+    # Downstream writing runners read response.md from the announced project
+    # directory. Keep stdout small so multi-turn benchmarks do not feed the
+    # adapter payload back into later turns or block on a large pipe.
+    print(f"Generated harness response written to '{response_path}' ({len(response)} chars)")
     print(
         "KIMI_WRITER_USAGE_JSON: "
         + json.dumps({"scope": "final", "totals": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}})

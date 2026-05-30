@@ -9,6 +9,8 @@ import re
 import shutil
 import sqlite3
 import statistics
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -292,16 +294,49 @@ def _http_head_ok(url: str, timeout: float = 5.0) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+def _is_all(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {"all", "full", "*"}
+
+
+def _limit_value(value: Any, default: int | None = 1) -> int | None:
+    if value is None:
+        return default
+    if _is_all(value):
+        return None
+    return int(value)
+
+
+def _limit_sequence(rows: list[Any], value: Any, default: int | None = 1) -> list[Any]:
+    limit = _limit_value(value, default)
+    return rows if limit is None else rows[:limit]
+
+
 def _load_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+    text = path.read_text(encoding="utf-8")
     rows: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+    try:
+        for line in text.splitlines():
             if not line.strip():
                 continue
             rows.append(json.loads(line))
             if limit and len(rows) >= limit:
                 break
-    return rows
+        return rows
+    except json.JSONDecodeError:
+        rows = []
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(text):
+            while idx < len(text) and text[idx].isspace():
+                idx += 1
+            if idx >= len(text):
+                break
+            obj, idx = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                rows.append(obj)
+            if limit and len(rows) >= limit:
+                break
+        return rows
 
 
 def _env_chat_config(prefix: str = "") -> dict[str, str] | None:
@@ -361,7 +396,7 @@ def _call_chat(prompt: str, *, prefix: str = "", max_tokens: int = 2048, tempera
             json=payload,
             timeout=300,
         )
-        if response.status_code != 429:
+        if response.status_code != 429 and response.status_code < 500:
             response.raise_for_status()
             break
         last_error = response.text[:1000]
@@ -480,7 +515,7 @@ def run_swebench_generated(
     _write_llm_config(llm_config)
     dataset = str(entry.get("dataset", "princeton-nlp/SWE-bench_Verified"))
     split = str(entry.get("split", "test"))
-    n_limit = str(entry.get("n_limit", 1))
+    n_limit = _limit_value(entry.get("n_limit"), default=1)
     infer_cmd = [
         "uv",
         "run",
@@ -492,8 +527,6 @@ def run_swebench_generated(
         split,
         "--workspace",
         str(entry.get("workspace", "docker")),
-        "--n-limit",
-        n_limit,
         "--num-workers",
         str(entry.get("threads", 1)),
         "--agent-type",
@@ -509,6 +542,20 @@ def run_swebench_generated(
         "--max-iterations",
         str(entry.get("max_iterations", 1)),
     ]
+    if n_limit is not None:
+        infer_cmd.extend(["--n-limit", str(n_limit)])
+    selected_instances = entry.get("selected_instances") or entry.get("selected_instance_ids")
+    selected_instances_file = entry.get("selected_instances_file")
+    if selected_instances and not selected_instances_file:
+        selected_instances_file_path = output_dir / "selected_instances.txt"
+        if isinstance(selected_instances, str):
+            selected_values = [item.strip() for item in selected_instances.split(",") if item.strip()]
+        else:
+            selected_values = [str(item).strip() for item in selected_instances if str(item).strip()]
+        selected_instances_file_path.write_text("\n".join(selected_values) + "\n", encoding="utf-8")
+        selected_instances_file = str(selected_instances_file_path)
+    if selected_instances_file:
+        infer_cmd.extend(["--select", str(resolve_path(str(selected_instances_file), harness_eval_root, harness_evolve_root))])
     env = _common_generated_env(artifact, harness_eval_root=harness_eval_root, timeout=timeout)
     infer = run_command(infer_cmd, cwd=benchmarks_root, env=env, timeout=timeout)
     stdout_path.write_text(infer.stdout, encoding="utf-8")
@@ -556,7 +603,7 @@ def run_swebench_generated(
     generated_report = output_json.with_suffix(".report.json")
     if generated_report.exists():
         generated_report.replace(report_path)
-    if evaluate.returncode != 0:
+    if evaluate.returncode != 0 and not report_path.exists():
         return HarnessRunResult(
             status="failed/timeout" if evaluate.returncode == 124 else "failed",
             stdout_path=str(stdout_path),
@@ -613,8 +660,6 @@ def run_terminalbench_generated(
         str(harbor_output_dir),
         "--n-concurrent",
         str(entry.get("threads", 1)),
-        "--n-tasks",
-        str(entry.get("n_limit", 1)),
         "--yes",
         "--ak",
         f"harness_path={artifact.path}",
@@ -627,6 +672,9 @@ def run_terminalbench_generated(
         "--ak",
         f"timeout_sec={max(60, timeout - 60)}",
     ]
+    n_limit = _limit_value(entry.get("n_limit"), default=1)
+    if n_limit is not None:
+        harbor_cmd.extend(["--n-tasks", str(n_limit)])
     for env_name in [
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
@@ -685,7 +733,7 @@ def run_terminalbench_generated(
         harbor.stderr + "\n\n=== convert ===\n" + convert.stderr + "\n\n=== terminalbench-eval ===\n" + evaluate.stderr,
         encoding="utf-8",
     )
-    if evaluate.returncode != 0:
+    if evaluate.returncode != 0 and not report_path.exists():
         return HarnessRunResult(
             status="failed/timeout" if evaluate.returncode == 124 else "failed",
             stdout_path=str(stdout_path),
@@ -736,10 +784,11 @@ def run_eqbench3(
             "GENERATED_HARNESS_PATH": str(artifact.path),
             "GENERATED_HARNESS_DOMAIN": artifact.domain,
             "GENERATED_HARNESS_ADAPTER_OUTPUT_DIR": str(output_dir / "adapter_outputs"),
+            "GENERATED_HARNESS_TIMEOUT": str(min(timeout, int(entry.get("harness_timeout", timeout)))),
             "HARNESS_EVAL_PYTHON": python_bin,
         }
     )
-    scenarios = str(entry.get("default_subset", "1"))
+    scenarios = entry.get("default_subset", "1")
     eqbench_python = writing_root / ".venv" / "bin" / "python"
     python_for_eqbench = str(eqbench_python) if eqbench_python.exists() else python_bin
     eqbench_root = writing_root / "third_party" / "eqbench3"
@@ -767,33 +816,34 @@ def run_eqbench3(
             "RETRY_AFTER_CAP": env.get("RETRY_AFTER_CAP", "600"),
         }
     )
+    eqbench_cmd = [
+        python_for_eqbench,
+        "eqbench3.py",
+        "--test-model",
+        model_id,
+        "--judge-model",
+        model_id,
+        "--model-name",
+        f"{model_id}-generated-writing-harness",
+        "--run-id",
+        run_id,
+        "--runs-file",
+        str(raw_run_file),
+        "--elo-results-file",
+        str(writing_root / "outputs" / f"eqbench3_elo.{run_id}.json"),
+        "--threads",
+        str(entry.get("threads", 1)),
+        "--iterations",
+        "1",
+        "--no-elo",
+        "--ignore-canonical",
+        "--verbosity",
+        "INFO",
+    ]
+    if not _is_all(scenarios):
+        eqbench_cmd.extend(["--select-scenarios", str(scenarios)])
     cmd_result = run_command(
-        [
-            python_for_eqbench,
-            "eqbench3.py",
-            "--test-model",
-            model_id,
-            "--judge-model",
-            model_id,
-            "--model-name",
-            f"{model_id}-generated-writing-harness",
-            "--run-id",
-            run_id,
-            "--runs-file",
-            str(raw_run_file),
-            "--elo-results-file",
-            str(writing_root / "outputs" / f"eqbench3_elo.{run_id}.json"),
-            "--select-scenarios",
-            scenarios,
-            "--threads",
-            str(entry.get("threads", 1)),
-            "--iterations",
-            "1",
-            "--no-elo",
-            "--ignore-canonical",
-            "--verbosity",
-            "INFO",
-        ],
+        eqbench_cmd,
         cwd=eqbench_root,
         env={**env, "USE_AGENT_FOR_TEST": "1"},
         timeout=timeout,
@@ -860,10 +910,25 @@ def run_dacomp_generated(
     if dry_run:
         return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(score_dir), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
 
-    task_ids = entry.get("task_ids") or ["dacomp-001"]
+    all_tasks = _load_jsonl(task_file)
+    task_ids = entry.get("task_ids", "all")
+    if task_ids is None:
+        task_ids = "all"
     if isinstance(task_ids, str):
-        task_ids = [item.strip() for item in task_ids.split(",") if item.strip()]
-    tasks = [task for task in _load_jsonl(task_file) if task.get("instance_id") in set(task_ids)]
+        if task_ids.strip().lower() == "all":
+            tasks = all_tasks
+        else:
+            selected_ids = [item.strip() for item in task_ids.split(",") if item.strip()]
+            tasks = [task for task in all_tasks if task.get("instance_id") in set(selected_ids)]
+            task_ids = selected_ids
+    else:
+        selected_ids = [str(item).strip() for item in task_ids if str(item).strip()]
+        if len(selected_ids) == 1 and selected_ids[0].lower() == "all":
+            tasks = all_tasks
+            task_ids = "all"
+        else:
+            tasks = [task for task in all_tasks if task.get("instance_id") in set(selected_ids)]
+            task_ids = selected_ids
     if not tasks:
         return HarnessRunResult(status="failed", error=f"No DAComp tasks selected from {task_file}: {task_ids}")
 
@@ -1024,9 +1089,11 @@ def run_writingbench_generated(
 
     all_rows = _load_jsonl(query_file)
     lang = str(entry.get("lang", "en"))
-    selected = [row for row in all_rows if row.get("lang") == lang][: int(entry.get("n_limit", 1))]
+    filtered_rows = all_rows if lang.lower() == "all" else [row for row in all_rows if row.get("lang") == lang]
+    selected = _limit_sequence(filtered_rows, entry.get("n_limit"), default=1)
     if not selected:
-        selected = all_rows[: int(entry.get("n_limit", 1))]
+        selected = _limit_sequence(all_rows, entry.get("n_limit"), default=1)
+    criteria_limit = _limit_value(entry.get("criteria_limit"), default=5)
     adapter_results: list[HarnessRunResult] = []
     response_rows: list[dict[str, Any]] = []
     score_rows: list[dict[str, Any]] = []
@@ -1044,7 +1111,10 @@ def run_writingbench_generated(
         response = _read_adapter_response(result)
         response_rows.append({"index": row["index"], "response": response, "adapter_status": result.status})
         criteria_scores: dict[str, list[dict[str, Any]]] = {}
-        for criteria in row.get("checklist", [])[: int(entry.get("criteria_limit", 5))]:
+        checklist = row.get("checklist", [])
+        if criteria_limit is not None:
+            checklist = checklist[:criteria_limit]
+        for criteria in checklist:
             prompt = f"""You are an expert evaluator with extensive experience in evaluating responses to writing queries.
 
 Evaluate the Response based on the Query and Criteria. Assign an integer score from 1 to 10 and provide a concrete reason.
@@ -1117,7 +1187,8 @@ def run_deepresearch_generated(
         for row in all_rows
         if "Uploaded " not in str(row.get("question", ""))
         and not re.search(r"\.(jpg|jpeg|png|webp|gif)\b", str(row.get("question", "")), re.IGNORECASE)
-    ][: int(entry.get("n_limit", 1))]
+    ]
+    rows = _limit_sequence(rows, entry.get("n_limit"), default=1)
     predictions: list[dict[str, Any]] = []
     details: list[dict[str, Any]] = []
     adapter_results: list[HarnessRunResult] = []
@@ -1194,8 +1265,57 @@ def run_browsecomp_generated(
 
     import pandas as pd
 
-    csv_url = "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv"
-    df = pd.read_csv(csv_url).head(int(entry.get("n_limit", 1)))
+    csv_url = str(
+        entry.get("csv_url")
+        or "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv"
+    )
+    local_candidates = [
+        entry.get("csv_path"),
+        os.environ.get("BROWSECOMP_CSV_PATH"),
+        harness_eval_root / "external_benchmarks" / "simple-evals" / "browse_comp_test_set.csv",
+        harness_eval_root / "external_benchmarks" / "simple-evals" / "browsecomp_test_set.csv",
+    ]
+    local_paths = [Path(str(item)).expanduser() for item in local_candidates if item]
+    source_description = csv_url
+    try:
+        local_csv = next((path for path in local_paths if path.is_file()), None)
+        if local_csv is not None:
+            source_description = str(local_csv)
+            df = pd.read_csv(local_csv)
+        else:
+            df = pd.read_csv(csv_url)
+    except Exception as exc:  # noqa: BLE001 - report as missing dependency, not a fake score
+        missing = [
+            "BrowseComp official CSV is unavailable. "
+            f"Tried remote URL {csv_url!r} and local cache paths: "
+            + ", ".join(str(path) for path in local_paths)
+            + f". Last error: {type(exc).__name__}: {exc}"
+        ]
+        write_json(
+            report_path,
+            {
+                "status": "skipped/missing_dependency",
+                "accuracy": None,
+                "count": 0,
+                "adapter_failures": 0,
+                "csv_url": csv_url,
+                "local_cache_paths": [str(path) for path in local_paths],
+                "missing_dependencies": missing,
+            },
+        )
+        stdout_path.write_text("", encoding="utf-8")
+        stderr_path.write_text(missing[0] + "\n", encoding="utf-8")
+        return HarnessRunResult(
+            status="skipped/missing_dependency",
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            missing_dependencies=missing,
+            error=missing[0],
+        )
+    browse_limit = _limit_value(entry.get("n_limit"), default=1)
+    if browse_limit is not None:
+        df = df.head(browse_limit)
     predictions: list[dict[str, Any]] = []
     correct_count = 0
     total_judge_tokens = 0
@@ -1240,7 +1360,16 @@ def run_browsecomp_generated(
         predictions.append({"question": question, "answer": answer, "prediction": response, "correct": correct, "judge": detail.get("judge")})
     write_jsonl(responses_path, predictions)
     accuracy = correct_count / len(predictions) if predictions and adapter_failures == 0 else None
-    write_json(report_path, {"accuracy": accuracy, "count": len(predictions), "adapter_failures": adapter_failures, "predictions_path": str(responses_path)})
+    write_json(
+        report_path,
+        {
+            "accuracy": accuracy,
+            "count": len(predictions),
+            "adapter_failures": adapter_failures,
+            "predictions_path": str(responses_path),
+            "source": source_description,
+        },
+    )
     stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
     stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
     status = "success" if accuracy is not None else ("adapter_failed" if adapter_failures else "failed")
@@ -1268,7 +1397,7 @@ def run_mlebench_generated(
     dry_run: bool,
 ) -> HarnessRunResult:
     mle_root = harness_eval_root / "external_benchmarks" / "mle-bench"
-    competition_id = str(entry.get("competition_id", "spaceship-titanic"))
+    competition_config = entry.get("competition_id", "spaceship-titanic")
     data_dir = Path(str(entry.get("data_dir") or os.environ.get("MLEBENCH_DATA_DIR") or Path.home() / ".cache" / "mle-bench" / "data")).expanduser()
     report_path = output_dir / "mlebench_report.json"
     stdout_path = output_dir / "mlebench_stdout.log"
@@ -1278,6 +1407,84 @@ def run_mlebench_generated(
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(mle_root) + os.pathsep + env.get("PYTHONPATH", "")
+    if _is_all(competition_config):
+        list_code = """
+import json
+from pathlib import Path
+from mlebench.registry import registry
+reg = registry.set_data_dir(Path(%r))
+print(json.dumps(reg.list_competition_ids()))
+""" % str(data_dir)
+        listed = run_command([python_bin, "-c", list_code], cwd=mle_root, env=env, timeout=120)
+        if listed.returncode != 0:
+            return HarnessRunResult(
+                status="skipped/missing_dependency",
+                missing_dependencies=[listed.stderr[-1000:] or listed.stdout[-1000:]],
+                stdout_path=str(stdout_path),
+                stderr_path=str(stderr_path),
+            )
+        competition_ids = json.loads(listed.stdout.strip().splitlines()[-1])
+        competition_ids = _limit_sequence(competition_ids, entry.get("n_limit"), default=None)
+        child_results: list[dict[str, Any]] = []
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        scores: list[float] = []
+        missing_dependencies: list[str] = []
+        total_interactions = 0
+        for competition_id in competition_ids:
+            child_entry = {**entry, "competition_id": competition_id}
+            child_output = output_dir / "competitions" / str(competition_id)
+            child_result = run_mlebench_generated(
+                artifact,
+                child_entry,
+                child_output,
+                harness_eval_root=harness_eval_root,
+                python_bin=python_bin,
+                timeout=timeout,
+                dry_run=False,
+            )
+            total_interactions += child_result.interactions or 0
+            if child_result.stdout_path and Path(child_result.stdout_path).exists():
+                stdout_parts.append(f"=== {competition_id} ===\n" + Path(child_result.stdout_path).read_text(encoding="utf-8", errors="replace"))
+            if child_result.stderr_path and Path(child_result.stderr_path).exists():
+                stderr_parts.append(f"=== {competition_id} ===\n" + Path(child_result.stderr_path).read_text(encoding="utf-8", errors="replace"))
+            if child_result.score is not None:
+                scores.append(float(child_result.score))
+            missing_dependencies.extend(child_result.missing_dependencies or [])
+            child_results.append(
+                {
+                    "competition_id": competition_id,
+                    "status": child_result.status,
+                    "score": child_result.score,
+                    "raw_result_path": child_result.raw_result_path,
+                    "missing_dependencies": child_result.missing_dependencies,
+                    "error": child_result.error,
+                }
+            )
+        report = {
+            "competition_id": "all",
+            "competitions_total": len(competition_ids),
+            "scored_competitions": len(scores),
+            "missing_or_failed_competitions": len(competition_ids) - len(scores),
+            "score": statistics.mean(scores) if scores else None,
+            "child_results": child_results,
+        }
+        write_json(report_path, report)
+        stdout_path.write_text("\n\n".join(stdout_parts), encoding="utf-8")
+        stderr_path.write_text("\n\n".join(stderr_parts), encoding="utf-8")
+        status = "success" if scores else ("skipped/missing_dependency" if missing_dependencies else "failed")
+        return HarnessRunResult(
+            status=status,
+            score=report["score"],
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            missing_dependencies=missing_dependencies[:50],
+            score_breakdown={"metric": "MLE-bench mean grade_csv score over competitions", **report},
+            interactions=total_interactions,
+        )
+
+    competition_id = str(competition_config)
     check_code = f"""
 import json
 from pathlib import Path
@@ -1423,6 +1630,7 @@ def run_the_agent_company_generated(
     entry: dict[str, Any],
     output_dir: Path,
     *,
+    harness_eval_root: Path,
     python_bin: str,
     timeout: int,
     dry_run: bool,
@@ -1440,7 +1648,108 @@ def run_the_agent_company_generated(
     if dry_run:
         return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(report_path), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
 
+    if _is_all(task_image):
+        task_images: list[str] = []
+        configured_images = entry.get("task_images")
+        if isinstance(configured_images, list):
+            task_images = [str(item).strip() for item in configured_images if str(item).strip()]
+        if not task_images or (len(task_images) == 1 and _is_all(task_images[0])):
+            tasks_url = str(entry.get("task_images_url") or "https://github.com/TheAgentCompany/TheAgentCompany/releases/download/1.0.0/tasks.md")
+            try:
+                with urllib.request.urlopen(tasks_url, timeout=60) as response:
+                    tasks_text = response.read().decode("utf-8", errors="replace")
+            except Exception as exc:  # noqa: BLE001 - surface dependency failure
+                missing = [f"TheAgentCompany task list is unavailable at {tasks_url}: {type(exc).__name__}: {exc}"]
+                return HarnessRunResult(
+                    status="skipped/missing_dependency",
+                    missing_dependencies=missing,
+                    raw_result_path=str(report_path),
+                    stdout_path=str(stdout_path),
+                    stderr_path=str(stderr_path),
+                    error=missing[0],
+                )
+            task_images = re.findall(r"ghcr\.io/theagentcompany/[^\s`]+", tasks_text)
+        task_images = _limit_sequence(task_images, entry.get("n_limit"), default=None)
+        child_results: list[dict[str, Any]] = []
+        scores: list[float] = []
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        missing_dependencies: list[str] = []
+        for image in task_images:
+            task_name = image.split("/")[-1].split(":")[0].replace("-image", "")
+            child_entry = {**entry, "task_image_name": image}
+            child_output = output_dir / "tasks" / task_name
+            child_result = run_the_agent_company_generated(
+                artifact,
+                child_entry,
+                child_output,
+                harness_eval_root=harness_eval_root,
+                python_bin=python_bin,
+                timeout=timeout,
+                dry_run=False,
+            )
+            if child_result.stdout_path and Path(child_result.stdout_path).exists():
+                stdout_parts.append(f"=== {image} ===\n" + Path(child_result.stdout_path).read_text(encoding="utf-8", errors="replace"))
+            if child_result.stderr_path and Path(child_result.stderr_path).exists():
+                stderr_parts.append(f"=== {image} ===\n" + Path(child_result.stderr_path).read_text(encoding="utf-8", errors="replace"))
+            if child_result.score is not None:
+                scores.append(float(child_result.score))
+            missing_dependencies.extend(child_result.missing_dependencies or [])
+            child_results.append(
+                {
+                    "task_image": image,
+                    "status": child_result.status,
+                    "score": child_result.score,
+                    "raw_result_path": child_result.raw_result_path,
+                    "missing_dependencies": child_result.missing_dependencies,
+                    "error": child_result.error,
+                }
+            )
+        report = {
+            "task_image": "all",
+            "tasks_total": len(task_images),
+            "scored_tasks": len(scores),
+            "missing_or_failed_tasks": len(task_images) - len(scores),
+            "score": statistics.mean(scores) if scores else None,
+            "child_results": child_results,
+        }
+        write_json(report_path, report)
+        stdout_path.write_text("\n\n".join(stdout_parts), encoding="utf-8")
+        stderr_path.write_text("\n\n".join(stderr_parts), encoding="utf-8")
+        status = "success" if scores else ("skipped/missing_dependency" if missing_dependencies else "failed")
+        return HarnessRunResult(
+            status=status,
+            score=report["score"],
+            pass_rate=report["score"],
+            raw_result_path=str(report_path),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            missing_dependencies=missing_dependencies[:50],
+            score_breakdown={"metric": "TheAgentCompany mean final_score.result / total over task images", **report},
+            interactions=len(task_images),
+        )
+
     healthy, health_detail = _http_head_ok(health_url)
+    if not healthy and "localhost:2999" in health_url:
+        shim_log = output_dir / "tac_api_shim.log"
+        shim_log.parent.mkdir(parents=True, exist_ok=True)
+        log_handle = shim_log.open("a", encoding="utf-8")
+        subprocess.Popen(
+            [
+                python_bin,
+                str(harness_eval_root / "tools" / "tac_api_shim.py"),
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "2999",
+            ],
+            cwd=harness_eval_root,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        time.sleep(1.5)
+        healthy, health_detail = _http_head_ok(health_url)
     if not healthy:
         return HarnessRunResult(
             status="skipped/missing_dependency",
@@ -1743,6 +2052,7 @@ def run_benchmark(
             artifact,
             entry,
             output_dir,
+            harness_eval_root=harness_eval_root,
             python_bin=python_bin,
             timeout=timeout,
             dry_run=dry_run,

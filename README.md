@@ -499,15 +499,15 @@ python3.12 run_creation_eval.py \
 | `dacomp` | `dacomp_generated` | 将 DAComp SQLite 导出为 CSV，generated data harness 产出报告，再复用 DAComp `llm_judge.py/get_score.py`。 |
 | `writing_bench` | `writingbench_generated` | 接官方 `X-PLUG/WritingBench` query/checklist，generated writing harness 产出回答，再用 OpenAI-compatible judge 打 criterion 分。 |
 | `eqbench3` | `eqbench3` | 复用现有 EQ-Bench3/Kimi-writer wrapper，并将 `KIMI_WRITER_PATH` 指向 generated harness adapter。 |
-| `deepresearch_bench` | `deepresearch_generated` | 用本地 HLE-style task，generated research harness 产出 answer，再用 short-answer judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
-| `browsecomp` | `browsecomp_generated` | 下载 OpenAI simple-evals BrowseComp encrypted CSV，解密一条题，generated research harness 回答，再用 judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback 做本地单样本 bring-up。 |
-| `the_agent_company` | `the_agent_company_generated` | 将 generated browser harness 接到 TheAgentCompany task image；需要官方服务栈先在本机或远端启动，包括 RocketChat、ownCloud、GitLab、Plane 等服务。 |
+| `deepresearch_bench` | `deepresearch_generated` | 用本地 HLE-style text-only 全量任务，generated research harness 产出 answer，再用 short-answer judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback。 |
+| `browsecomp` | `browsecomp_generated` | 下载 OpenAI simple-evals BrowseComp encrypted CSV，全量解密题目，generated research harness 回答，再用 judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback。 |
+| `the_agent_company` | `the_agent_company_generated` | 将 generated browser harness 接到 TheAgentCompany 官方全量 task image 列表；需要官方服务栈先在本机或远端启动，包括 RocketChat、ownCloud、GitLab、Plane 等服务。 |
 
 Research 类 BMK 不接受 generated harness 自带的 mock/LLM-simulated search 作为正式分数。adapter 会在临时运行目录中给 generated research harness 注入真实联网搜索工具：有 Serper/Tavily/API key 时走 API provider，没有 key 时走 Bing/DuckDuckGo HTML fallback。论文级稳定复现实验建议配置正式 search API key；本地一两条任务验证可以先用 fallback。
 
-本地单样本验证目标是让每个可运行 BMK 产出真实 summary score，而不是 full run。写作类评测只保留 `writing_bench` 和 `eqbench3`。`mle_bench` 的代码路径已接通，但真跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data。
+当前默认 registry 已切到 full run：所有支持全量数据的 BMK 默认不再限制为 1 条。写作类评测只保留 `writing_bench` 和 `eqbench3`。`mle_bench` 的代码路径已接通，但全量跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data；未 prepare 的 competition 会被标成明确依赖缺失，不伪造分数。
 
-### 非代码四类 harness 的单任务验证命令
+### 非代码四类 harness 的全量验证命令
 
 生成端和评测端都已经参数化。下面示例用 `claude-code` 作为 meta harness，后端 generation LLM 和 eval LLM 都走 OpenRouter 的 Opus 4.7 最强推理档。把 `--model-name`、`--eval-model-name` 或 `--meta-harness` 替换即可切换到 GPT5.5、Seed2.0、Qwen3.7、Gemini3.1、K2.6、GLM5.1、Claude4.7 或 Codex 路径。
 
@@ -533,7 +533,7 @@ export EVAL_API_KEY="$OPENROUTER_API_KEY"
 然后执行：
 
 ```bash
-# Writing：Writing-bench + EQbench3，各 1 个任务
+# Writing：Writing-bench + EQbench3，全量任务
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-opus47-max-final-20260523 \
   --domain writing \
@@ -543,7 +543,7 @@ export EVAL_API_KEY="$OPENROUTER_API_KEY"
   --eval-model-name "anthropic/claude-opus-4.7" \
   --eval-reasoning-effort max
 
-# Data：MLE-bench + DAComp；MLE 需要 Kaggle credential 和 prepared data，DAComp 可直接跑单任务
+# Data：MLE-bench + DAComp；MLE 需要 Kaggle credential 和 prepared data，DAComp 默认跑全量 100 题
 HARNESS_EVAL_DATA_MAX_TURNS=8 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-opus47-max-final-20260523 \
   --domain data_analysis \
@@ -553,7 +553,7 @@ HARNESS_EVAL_DATA_MAX_TURNS=8 .venv/bin/python run_creation_eval.py \
   --eval-model-name "anthropic/claude-opus-4.7" \
   --eval-reasoning-effort max
 
-# Research：DeepResearch bench + BrowseComp，各 1 个任务
+# Research：DeepResearch bench + BrowseComp，全量任务
 HARNESS_EVAL_RESEARCH_MAX_STEPS=8 \
 HARNESS_EVAL_RESEARCH_BREADTH=2 \
 HARNESS_EVAL_RESEARCH_DEPTH=1 \
@@ -760,7 +760,7 @@ export CLAUDE_MODEL_NAME="$MODEL_NAME"
 
 ### 跑数据分析 BMK
 
-MLE-bench 需要先准备 Kaggle 数据。`~/.kaggle/kaggle.json` 需要存在，且对应 Kaggle competition rules 已接受。
+MLE-bench 需要先准备 Kaggle 数据。`~/.kaggle/kaggle.json` 需要存在，且对应 Kaggle competition rules 已接受。下面只展示单个 competition 的 prepare 方式；当前 `eval_matrix.yaml` 默认会尝试全量 registered competitions，未 prepare 的 competition 会在结果里标明 missing dependency。
 
 ```bash
 .venv/bin/python -m mlebench.cli prepare \
@@ -784,7 +784,7 @@ export HARNESS_EVAL_DATA_MAX_TURNS=8
 
 ### 跑 TheAgentCompany 浏览器 BMK
 
-官方 TheAgentCompany setup 在 Linux 上依赖 host networking。Mac Docker 本地 smoke 时，先启动真实服务栈，再用本仓库的本地 shim 提供 task image 初始化时需要的 reset/health API。
+官方 TheAgentCompany setup 在 Linux 上依赖 host networking。Mac Docker 本地运行时，先启动真实服务栈，再用本仓库的本地 shim 提供 task image 初始化时需要的 reset/health API。
 
 ```bash
 # 1. 启动真实服务栈
@@ -811,7 +811,92 @@ export TAC_SERVICE_HEALTH_URL="http://localhost:2999/api/healthcheck/rocketchat"
   --eval-reasoning-effort max
 ```
 
-当前 TheAgentCompany V1 接的是 `admin-arrange-meeting-rooms` 一个真实 task image。分数来自 task image 自带的 `/utils/eval.py`，不是手写规则。
+当前 TheAgentCompany 默认从官方 `tasks.md` 拉取全量 task image 列表逐个运行。分数来自每个 task image 自带的 `/utils/eval.py`，不是手写规则。
+
+---
+
+## Self-Evolve + Eval
+
+`run_self_evolve.py` 用于 Harness-Evolve 的第二阶段：从一个已经生成出来的 harness 出发，让 meta harness 继续修改它，并在每轮修改后直接接入现有 downstream BMK eval。
+
+它支持两个 RQ：
+
+| Mode | 对应研究问题 | 输入 | 输出 |
+|---|---|---|---|
+| `commit` | agent 能否实现 human commit 里同等的 harness 功能改进 | human commit 转写出来的任务指令 JSONL | 每轮 agent-evolved harness + 下游 BMK 分数，可选 human reference 同跑 |
+| `goal` | 给一个目标，比如“在对应 BMK 上高分”，harness 能否根据 eval signal 自己迭代 | base generated harness + goal + eval summary | 每轮 self-evolved harness + learning curve |
+
+这条线复用 main eval spine，不单独造评测器：
+
+```text
+base generated harness
+-> self-evolve edit round by Claude Code / Codex
+-> snapshot as standard generation artifact
+-> run_creation_eval.py
+-> summary.csv / summary.jsonl
+```
+
+### 目标驱动自我迭代
+
+下面例子从一个 code harness creation 产物开始，让 Claude Code + Opus 4.7 max 改 harness，并用同一个 Opus 4.7 max 作为被测 harness 的 eval LLM，跑 SWE/Terminal 的小集：
+
+```bash
+export BASE_URL="https://openrouter.ai/api/v1/chat/completions"
+export API_KEY="$OPENROUTER_API_KEY"
+
+.venv/bin/python run_self_evolve.py config.yaml \
+  --mode goal \
+  --run-id code-self-evolve-opus47-goal \
+  --base-generation-output outputs/code-interface-tool-pilot/code-agent-harness \
+  --meta-harness claude-code \
+  --model-name Claude4.7 \
+  --reasoning-effort max \
+  --eval-model-name Claude4.7 \
+  --eval-reasoning-effort max \
+  --eval-domain code \
+  --eval-bench swebench_pro,terminal_2_bench \
+  --rounds 3 \
+  --goal "Improve this code harness so it achieves higher downstream BMK score by making real edits, running validators, and recovering from failed commands."
+```
+
+输出在：
+
+```text
+self_evolve_outputs/<run-id>/
+├── artifacts/round_000_base/<task-id>/
+├── artifacts/round_001_.../<task-id>/
+├── eval_results/
+├── prompts/
+├── logs/
+├── rounds.csv
+└── summary.json
+```
+
+### Human-commit comparable evolution
+
+`commit` 模式用于“跟人比较”的 RQ。输入文件只放任务指令，不放 human diff。human reference 如果已经打包成标准 generation artifact，可以用 `--human-generation-output` 同配置跑一遍下游 BMK。
+
+```bash
+.venv/bin/python run_self_evolve.py config.yaml \
+  --mode commit \
+  --run-id code-self-evolve-human-commit \
+  --base-generation-output outputs/code-interface-tool-pilot/code-agent-harness \
+  --evolution-tasks-file self_evolve_tasks.example.jsonl \
+  --max-tasks 2 \
+  --meta-harness codex \
+  --model-name GPT5.5 \
+  --reasoning-effort xhigh \
+  --eval-model-name GPT5.5 \
+  --eval-domain code \
+  --eval-bench terminal_2_bench
+```
+
+参数化关系：
+
+- `--meta-harness claude-code|codex`：谁来驱动 harness 修改。
+- `--model-name` / `--reasoning-effort`：self-evolve 阶段的 meta LLM，例如 `Claude4.7`、`GPT5.5`、`Seed2.0`。
+- `--eval-model-name` / `--eval-reasoning-effort`：evolved harness 在 downstream BMK 解题时调用的 LLM。
+- `--pre-bmk-gate soft|hard|off`：每轮 eval 前是否跑 pre-BMK validation。
 
 ---
 
@@ -823,6 +908,7 @@ harness-eval/
 ├── REPORT.md                 # 详细评测报告
 ├── run.py                    # harness generation 入口，支持 claude-code / codex
 ├── run_creation_eval.py      # generated harness -> downstream BMK eval 入口
+├── run_self_evolve.py        # generated harness -> self-evolve rounds -> downstream BMK eval
 ├── eval_matrix.yaml          # downstream BMK registry
 ├── generated_harness_adapter.py
 ├── harbor_generated_harness_agent.py
@@ -833,6 +919,7 @@ harness-eval/
 ├── tools/tac_api_shim.py     # Mac Docker 本地 TheAgentCompany reset/health shim
 ├── config.yaml.example       # 配置模板
 ├── tasks.jsonl               # 任务定义
+├── self_evolve_tasks.example.jsonl
 ├── prompts/                  # 提示词
 │   ├── system_prompt.md      # 通用架构约束
 │   ├── code_agent_harness.md

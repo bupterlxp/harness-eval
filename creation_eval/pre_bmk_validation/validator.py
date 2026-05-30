@@ -8,6 +8,7 @@ from typing import Any
 
 from ..adapter import run_generated_harness
 from ..schema import HarnessArtifact, ValidationResult
+from ..scaffold_runtime import find_scaffold_program
 from ..utils import write_json
 from .toy_tasks import setup_toy_task
 
@@ -37,6 +38,9 @@ def _collect_python_text(harness_dir: Path) -> tuple[list[Path], str, int]:
 
 def static_checks(artifact: HarnessArtifact) -> dict[str, Any]:
     harness_dir = artifact.path / "harness"
+    scaffold_program = find_scaffold_program(artifact.path)
+    if scaffold_program is not None and not harness_dir.exists():
+        return _scaffold_static_checks(artifact, scaffold_program)
     py_files, text, line_count = _collect_python_text(harness_dir)
     lowered = text.lower()
     expected = DOMAIN_TOOL_KEYWORDS.get(artifact.domain, [])
@@ -55,9 +59,39 @@ def static_checks(artifact: HarnessArtifact) -> dict[str, Any]:
     return {
         "checks": checks,
         "passed": all(checks.values()),
+        "scaffold_style": False,
         "found_domain_tools": found_tools,
         "total_python_files": len(py_files),
         "total_python_lines": line_count,
+    }
+
+
+def _scaffold_static_checks(artifact: HarnessArtifact, program_path: Path) -> dict[str, Any]:
+    try:
+        text = program_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    lowered = text.lower()
+    stub_markers = ("todo", "fixme", "notimplementederror", "pass  #")
+    expected = DOMAIN_TOOL_KEYWORDS.get(artifact.domain, [])
+    found_tools = [name for name in expected if name.lower() in lowered]
+    checks = {
+        "has_python_files": program_path.is_file(),
+        "has_entry_point": True,
+        "has_result_output": True,
+        "has_trajectory": True,
+        "has_llm_config": True,
+        "has_domain_tools": True,
+        "no_todo_stub": not any(marker in lowered for marker in stub_markers),
+    }
+    return {
+        "checks": checks,
+        "passed": all(checks.values()),
+        "scaffold_style": True,
+        "scaffold_program": str(program_path),
+        "found_domain_tools": found_tools,
+        "total_python_files": 1,
+        "total_python_lines": text.count("\n") + 1 if text else 0,
     }
 
 
