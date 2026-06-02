@@ -892,7 +892,7 @@ export TAC_SERVICE_HEALTH_URL="http://localhost:2999/api/healthcheck/rocketchat"
 
 ## Self-Evolve + Eval
 
-> 当前状态：这一块是预留的第二阶段实验入口，代码骨架已经放好，但还没有作为主实验稳定版本使用。正式实验前需要继续重写 task schema、round selection、human-reference 对齐和 summary 统计。当前 creation+eval 主实验不依赖 self-evolve。
+> 当前状态：这一块已可用于 pilot 级 self-evolve 实验。`goal` 和 `commit` 两种模式都复用 main eval spine，并会记录每轮 harness 修改成本、downstream 解题成本和 judge 成本。正式大规模实验前仍需要继续完善 human-reference artifact 自动打包、任务抽样策略和学习曲线分析脚本。
 
 `run_self_evolve.py` 用于 Harness-Evolve 的第二阶段：从一个已经生成出来的 harness 出发，让 meta harness 继续修改它，并在每轮修改后直接接入现有 downstream BMK eval。
 
@@ -958,6 +958,16 @@ self_evolve_outputs/<run-id>/
 ├── rounds.csv
 └── summary.json
 ```
+
+`rounds.csv` 和 `summary.json` 会记录每轮 token / cost 口径：
+
+- `creation_or_evolve_tokens`：本轮 meta harness 修改 harness 的 token 消耗；第 0 轮是 base creation artifact 已记录的 generation token。
+- `eval_harness_run_tokens`：本轮 evolved/generated harness 配上 eval LLM，在 downstream BMK 解题时的 token 消耗。这个字段用于比较不同 harness 的执行成本。
+- `eval_judge_tokens`：BMK judge / grader 产生的 token 消耗。它和被测 harness 的解题 token 分开记录，避免把评分成本混进 harness 成本。
+- `eval_total_tokens`：`eval_harness_run_tokens + eval_judge_tokens`，用于每轮 downstream eval 总成本统计。
+- `eval_harness_run_interactions`：本轮 downstream eval 中被测 harness 的交互 / tool-action 轮次。
+- `cost_adjusted_gain`：相对 base harness 的 `avg_score` 提升除以本轮 `creation_or_evolve_tokens + eval_total_tokens`，用于粗略衡量单位 token 改进收益。
+- `summary.json.token_totals`：把上述 token 字段按所有轮次汇总。
 
 ### Human-commit comparable evolution
 

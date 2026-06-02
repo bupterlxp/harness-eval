@@ -17,6 +17,7 @@ from typing import Any
 
 from creation_eval.utils import load_env_file, read_json, write_json
 from creation_eval.validator import discover_harness_artifacts
+from creation_eval.token_usage import merge_token_usages, normalize_usage
 from run import (
     build_docker_image,
     load_config,
@@ -70,6 +71,30 @@ SKIP_COPY_NAMES = {
     ".mypy_cache",
 }
 
+JUDGE_TOKEN_KEYS = {
+    "judge_tokens",
+    "judge_total_tokens",
+    "llm_judge_tokens",
+    "evaluator_tokens",
+    "grader_tokens",
+}
+
+NESTED_USAGE_KEYS = ("metrics", "usage", "token_usage", "llm_usage")
+DIRECT_TOKEN_KEYS = {
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "reasoning_tokens",
+    "agent_total_tokens",
+    "agent_input_tokens",
+    "agent_output_tokens",
+    "agent_reasoning_tokens",
+    "harness_run_tokens",
+    "tokens",
+}
+
 
 def now_run_id() -> str:
     return datetime.now().strftime("self-evolve-%Y%m%d-%H%M%S")
@@ -88,6 +113,176 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def as_number(value: Any) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            return float(value) if "." in value else int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def maybe_json(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def token_total(usage: dict[str, Any] | None) -> int | None:
+    if not usage:
+        return None
+    value = as_number(usage.get("total_tokens"))
+    if value is None:
+        prompt = as_number(usage.get("prompt_tokens") or usage.get("input_tokens"))
+        completion = as_number(usage.get("completion_tokens") or usage.get("output_tokens"))
+        if prompt is not None or completion is not None:
+            value = (prompt or 0) + (completion or 0)
+    return int(value) if value is not None else None
+
+
+def sum_numeric(values: list[Any]) -> int | None:
+    total = 0
+    found = False
+    for value in values:
+        number = as_number(value)
+        if number is None:
+            continue
+        total += int(number)
+        found = True
+    return total if found else None
+
+
+def sum_nested_token_keys(value: Any, keys: set[str]) -> int | None:
+    value = maybe_json(value)
+    total = 0
+    found = False
+    if isinstance(value, dict):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if lowered in keys:
+                number = as_number(item)
+                if number is not None:
+                    total += int(number)
+                    found = True
+                    continue
+            nested = sum_nested_token_keys(item, keys)
+            if nested is not None:
+                total += nested
+                found = True
+    elif isinstance(value, list):
+        for item in value:
+            nested = sum_nested_token_keys(item, keys)
+            if nested is not None:
+                total += nested
+                found = True
+    return total if found else None
+
+
+def row_token_usage(row: dict[str, Any]) -> dict[str, Any]:
+    breakdown = maybe_json(row.get("harness_run_token_breakdown"))
+    usage = normalize_usage(breakdown) if isinstance(breakdown, dict) else {}
+    explicit_total = as_number(row.get("harness_run_tokens"))
+    if explicit_total is not None and usage.get("total_tokens") is None:
+        usage = {**usage, "total_tokens": int(explicit_total)}
+    return usage
+
+
+def aggregate_eval_tokens(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    harness_usages = [row_token_usage(row) for row in rows]
+    harness_breakdown = merge_token_usages(harness_usages)
+    harness_tokens = token_total(harness_breakdown)
+    if harness_tokens is None:
+        harness_tokens = sum_numeric([row.get("harness_run_tokens") for row in rows])
+
+    judge_tokens = 0
+    judge_found = False
+    for row in rows:
+        nested = sum_nested_token_keys(row.get("score_breakdown"), JUDGE_TOKEN_KEYS)
+        if nested is not None:
+            judge_tokens += nested
+            judge_found = True
+
+    interactions = sum_numeric([row.get("harness_run_interactions") for row in rows])
+    total = None
+    if harness_tokens is not None or judge_found:
+        total = int(harness_tokens or 0) + int(judge_tokens if judge_found else 0)
+
+    return {
+        "eval_harness_run_tokens": harness_tokens,
+        "eval_harness_run_token_breakdown": harness_breakdown,
+        "eval_judge_tokens": judge_tokens if judge_found else None,
+        "eval_total_tokens": total,
+        "eval_harness_run_interactions": interactions,
+    }
+
+
+def token_usage_from_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    for key in NESTED_USAGE_KEYS:
+        usage = data.get(key)
+        if isinstance(usage, dict):
+            normalized = normalize_usage(usage)
+            if token_total(normalized) is not None:
+                return normalized
+    if any(key in data for key in DIRECT_TOKEN_KEYS):
+        normalized = normalize_usage(data)
+        if token_total(normalized) is not None:
+            return normalized
+    return {}
+
+
+def artifact_generation_usage(artifact_dir: Path) -> dict[str, Any]:
+    usages: list[dict[str, Any]] = []
+    for path in (artifact_dir / "meta.json", artifact_dir / "metrics.json"):
+        data = read_json(path)
+        if not isinstance(data, dict):
+            continue
+        usage = token_usage_from_mapping(data)
+        if usage:
+            usages.append(usage)
+    return merge_token_usages(usages)
+
+
+def metrics_summary_from_file(metrics_path: Path) -> dict[str, Any]:
+    if not metrics_path.exists():
+        return {}
+    metrics = read_json(metrics_path)
+    if not isinstance(metrics, dict):
+        return {}
+    summary = {
+        "total_requests": metrics.get("total_requests", 0),
+        "total_input_tokens": metrics.get("total_input_tokens", 0),
+        "total_output_tokens": metrics.get("total_output_tokens", 0),
+        "total_cache_read_tokens": metrics.get("total_cache_read_tokens", 0),
+        "total_cache_creation_tokens": metrics.get("total_cache_creation_tokens", 0),
+        "effective_requests": metrics.get("effective_requests", 0),
+        "effective_input_tokens": metrics.get("effective_input_tokens", 0),
+        "effective_output_tokens": metrics.get("effective_output_tokens", 0),
+        "retry_requests": metrics.get("retry_requests", 0),
+        "usage_source": metrics.get("usage_source"),
+    }
+    summary["total_tokens"] = int(summary.get("total_input_tokens") or 0) + int(summary.get("total_output_tokens") or 0)
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def cost_adjusted_gain(score: Any, baseline_score: Any, tokens: Any) -> float | None:
+    score_value = as_number(score)
+    baseline_value = as_number(baseline_score)
+    token_value = as_number(tokens)
+    if score_value is None or baseline_value is None or token_value is None or token_value <= 0:
+        return None
+    return float(score_value - baseline_value) / float(token_value)
 
 
 def copy_tree_contents(src: Path, dst: Path) -> None:
@@ -317,6 +512,13 @@ def snapshot_artifact(
             "stderr": stderr[-5000:] if stderr else "",
         }
     )
+    metrics_summary = metrics_summary_from_file(artifact_dir / "metrics.json")
+    if metrics_summary:
+        meta["metrics"] = metrics_summary
+    elif round_index > 0:
+        # Avoid carrying the base creation metrics into later self-evolve
+        # snapshots when the meta harness did not emit per-round usage.
+        meta.pop("metrics", None)
     write_json(artifact_dir / "meta.json", meta)
     return artifact_dir
 
@@ -341,6 +543,7 @@ def summarize_eval(eval_dir: Path, returncode: int) -> dict[str, Any]:
     for row in rows:
         status = str(row.get("eval_status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
+    token_summary = aggregate_eval_tokens(rows)
     return {
         "returncode": returncode,
         "eval_dir": str(eval_dir),
@@ -350,6 +553,7 @@ def summarize_eval(eval_dir: Path, returncode: int) -> dict[str, Any]:
         "status_counts": statuses,
         "avg_score": sum(scores) / len(scores) if scores else None,
         "avg_end_to_end_score": sum(e2e_scores) / len(e2e_scores) if e2e_scores else None,
+        **token_summary,
         "rows_preview": rows[:5],
     }
 
@@ -452,6 +656,12 @@ def write_round_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "eval_status",
         "avg_score",
         "avg_end_to_end_score",
+        "creation_or_evolve_tokens",
+        "eval_harness_run_tokens",
+        "eval_judge_tokens",
+        "eval_total_tokens",
+        "eval_harness_run_interactions",
+        "cost_adjusted_gain",
         "status_counts",
         "summary_csv",
     ]
@@ -599,8 +809,11 @@ def main() -> int:
         round_index=0,
         round_name="base",
     )
+    baseline_generation_usage = artifact_generation_usage(baseline_artifact)
+    baseline_generation_tokens = token_total(baseline_generation_usage)
     baseline_eval = run_downstream_eval(baseline_artifact, "round_000_base", args, config, run_root)
     previous_eval_summary = baseline_eval
+    baseline_score = baseline_eval.get("avg_score")
     round_rows.append(
         {
             "round": 0,
@@ -611,6 +824,14 @@ def main() -> int:
             "eval_status": baseline_eval.get("status"),
             "avg_score": baseline_eval.get("avg_score"),
             "avg_end_to_end_score": baseline_eval.get("avg_end_to_end_score"),
+            "creation_or_evolve_tokens": baseline_generation_tokens,
+            "creation_or_evolve_token_breakdown": baseline_generation_usage,
+            "eval_harness_run_tokens": baseline_eval.get("eval_harness_run_tokens"),
+            "eval_harness_run_token_breakdown": baseline_eval.get("eval_harness_run_token_breakdown"),
+            "eval_judge_tokens": baseline_eval.get("eval_judge_tokens"),
+            "eval_total_tokens": baseline_eval.get("eval_total_tokens"),
+            "eval_harness_run_interactions": baseline_eval.get("eval_harness_run_interactions"),
+            "cost_adjusted_gain": None,
             "status_counts": json.dumps(baseline_eval.get("status_counts", {}), ensure_ascii=False),
             "summary_csv": baseline_eval.get("summary_csv"),
         }
@@ -642,6 +863,9 @@ def main() -> int:
         prompt_path.write_text(prompt, encoding="utf-8")
         write_round_context(workspace, prompt, previous_eval_summary)
 
+        stale_metrics = workspace / "metrics.json"
+        if stale_metrics.exists():
+            stale_metrics.unlink()
         started = time.time()
         status, stdout, stderr = run_generation(
             f"{base_artifact.task_id}-evolve-{index}",
@@ -666,8 +890,11 @@ def main() -> int:
             stdout=stdout,
             stderr=stderr,
         )
+        evolve_usage = artifact_generation_usage(artifact_path)
+        evolve_tokens = token_total(evolve_usage)
         eval_summary = run_downstream_eval(artifact_path, f"round_{index:03d}_{round_name}", args, config, run_root)
         previous_eval_summary = eval_summary
+        total_round_tokens = sum_numeric([evolve_tokens, eval_summary.get("eval_total_tokens")])
         round_rows.append(
             {
                 "round": index,
@@ -679,6 +906,14 @@ def main() -> int:
                 "eval_status": eval_summary.get("status"),
                 "avg_score": eval_summary.get("avg_score"),
                 "avg_end_to_end_score": eval_summary.get("avg_end_to_end_score"),
+                "creation_or_evolve_tokens": evolve_tokens,
+                "creation_or_evolve_token_breakdown": evolve_usage,
+                "eval_harness_run_tokens": eval_summary.get("eval_harness_run_tokens"),
+                "eval_harness_run_token_breakdown": eval_summary.get("eval_harness_run_token_breakdown"),
+                "eval_judge_tokens": eval_summary.get("eval_judge_tokens"),
+                "eval_total_tokens": eval_summary.get("eval_total_tokens"),
+                "eval_harness_run_interactions": eval_summary.get("eval_harness_run_interactions"),
+                "cost_adjusted_gain": cost_adjusted_gain(eval_summary.get("avg_score"), baseline_score, total_round_tokens),
                 "status_counts": json.dumps(eval_summary.get("status_counts", {}), ensure_ascii=False),
                 "summary_csv": eval_summary.get("summary_csv"),
             }
@@ -699,6 +934,12 @@ def main() -> int:
         "rounds": round_rows,
         "final_artifact": round_rows[-1]["artifact_path"] if round_rows else str(baseline_artifact),
         "human_reference_eval": human_eval,
+        "token_totals": {
+            "creation_or_evolve_tokens": sum_numeric([row.get("creation_or_evolve_tokens") for row in round_rows]),
+            "eval_harness_run_tokens": sum_numeric([row.get("eval_harness_run_tokens") for row in round_rows]),
+            "eval_judge_tokens": sum_numeric([row.get("eval_judge_tokens") for row in round_rows]),
+            "eval_total_tokens": sum_numeric([row.get("eval_total_tokens") for row in round_rows]),
+        },
     }
     write_json(run_root / "summary.json", summary)
     if not args.keep_workspace:
