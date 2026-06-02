@@ -884,6 +884,8 @@ export TAC_SERVICE_HEALTH_URL="http://localhost:2999/api/healthcheck/rocketchat"
 
 ## Self-Evolve + Eval
 
+> 当前状态：这一块是预留的第二阶段实验入口，代码骨架已经放好，但还没有作为主实验稳定版本使用。正式实验前需要继续重写 task schema、round selection、human-reference 对齐和 summary 统计。当前 creation+eval 主实验不依赖 self-evolve。
+
 `run_self_evolve.py` 用于 Harness-Evolve 的第二阶段：从一个已经生成出来的 harness 出发，让 meta harness 继续修改它，并在每轮修改后直接接入现有 downstream BMK eval。
 
 它支持两个 RQ：
@@ -901,6 +903,16 @@ base generated harness
 -> snapshot as standard generation artifact
 -> run_creation_eval.py
 -> summary.csv / summary.jsonl
+```
+
+后续修改位置：
+
+```text
+self_evolve/
+├── README.md                 # 当前 self-evolve 设计和待办
+├── tasks/                    # 预留：human commit / goal evolution task 数据
+├── runners/                  # 预留：不同 evolution mode 的 runner 实现
+└── analysis/                 # 预留：learning curve / human gap / regression 分析
 ```
 
 ### 目标驱动自我迭代
@@ -975,7 +987,8 @@ harness-eval/
 ├── REPORT.md                 # 详细评测报告
 ├── run.py                    # harness generation 入口，支持 claude-code / codex
 ├── run_creation_eval.py      # generated harness -> downstream BMK eval 入口
-├── run_self_evolve.py        # generated harness -> self-evolve rounds -> downstream BMK eval
+├── run_self_evolve.py        # self-evolve 实验性入口，后续会迁入 self_evolve/
+├── self_evolve/              # 预留：self-evolve task/schema/runner/analysis
 ├── eval_matrix.yaml          # downstream BMK registry
 ├── generated_harness_adapter.py
 ├── harbor_generated_harness_agent.py
@@ -1000,9 +1013,5 @@ harness-eval/
 │   ├── 03_writing_agent.md
 │   ├── 04_research_agent.md
 │   └── 05_browser_agent.md
-└── outputs/                  # 生成产物
-    ├── opus4_showcase/       # Opus 4 showcase（5 个完整 harness）
-    ├── opus45/               # Opus 4.5 Docker 模式输出
-    ├── opus45_v2/            # Opus 4.5 v2 prompt 输出
-    └── doubao_v2/            # Doubao Docker 模式输出
+└── outputs/                  # 本地生成产物，默认不提交
 ```

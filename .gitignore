@@ -13,3 +13,8 @@ node_modules/
 eval_results/
 outputs/
 external_benchmarks/
+exports/
+metrics.json
+self_evolve_outputs/
+analysis_outputs/
+cache/
