@@ -31,10 +31,15 @@ FIELDS = [
     "cli_probe_pass_rate",
     "gate_pass_before_repair_rate",
     "gate_pass_after_repair_rate",
+    "gate_yield",
     "downstream_success_rate",
     "adapter_failure_rate",
     "avg_score",
     "avg_end_to_end_score",
+    "transfer_score",
+    "avg_generation_tokens",
+    "avg_harness_run_tokens",
+    "avg_total_tokens",
     "avg_repair_rounds",
     "top_failure_modes",
 ]
@@ -152,6 +157,18 @@ def summarize_rows(label: str, path: Path, source_type: str, rows: list[dict[str
     eval_success = sum(1 for row in rows if str(row.get("eval_status") or "").lower() == "success")
     repair_rounds = [to_float(row.get("repair_rounds")) for row in rows]
     repair_rounds = [x for x in repair_rounds if x is not None]
+    transfer_scores = [
+        to_float(row.get("end_to_end_score") or row.get("score"))
+        for row in rows
+        if str(row.get("generation_model") or "")
+        and str(row.get("eval_model") or "")
+        and str(row.get("generation_model") or "") != str(row.get("eval_model") or "")
+    ]
+    transfer_scores = [x for x in transfer_scores if x is not None]
+    generation_tokens = [to_float(row.get("generation_tokens")) for row in rows]
+    generation_tokens = [x for x in generation_tokens if x is not None]
+    harness_tokens = [to_float(row.get("harness_run_tokens")) for row in rows]
+    harness_tokens = [x for x in harness_tokens if x is not None]
     failure_modes = collect_failure_modes(rows)
     return {
         "run_label": label,
@@ -165,10 +182,17 @@ def summarize_rows(label: str, path: Path, source_type: str, rows: list[dict[str
         "cli_probe_pass_rate": bool_rate(rows, "cli_probe_ok"),
         "gate_pass_before_repair_rate": bool_rate(rows, "gate_pass_before_repair"),
         "gate_pass_after_repair_rate": bool_rate(rows, "gate_pass_after_repair") or bool_rate(rows, "gate_pass"),
+        "gate_yield": bool_rate(rows, "gate_pass"),
         "downstream_success_rate": rate(eval_success, total),
         "adapter_failure_rate": rate(adapter_failures, total),
         "avg_score": avg_float(row.get("score") for row in rows),
         "avg_end_to_end_score": avg_float(row.get("end_to_end_score") for row in rows),
+        "transfer_score": round(statistics.mean(transfer_scores), 4) if transfer_scores else "",
+        "avg_generation_tokens": round(statistics.mean(generation_tokens), 2) if generation_tokens else "",
+        "avg_harness_run_tokens": round(statistics.mean(harness_tokens), 2) if harness_tokens else "",
+        "avg_total_tokens": round(statistics.mean(generation_tokens + harness_tokens), 2)
+        if generation_tokens or harness_tokens
+        else "",
         "avg_repair_rounds": round(statistics.mean(repair_rounds), 4) if repair_rounds else "",
         "top_failure_modes": "; ".join(f"{key}={value}" for key, value in failure_modes.most_common(8)),
     }
@@ -260,14 +284,15 @@ def render_report(rows: list[dict[str, Any]]) -> str:
         "",
         "说明：`score` 是 downstream BMK 条件分数；`end_to_end_score` 会把 gate 失败样本计入端到端收益，避免只看通过 gate 的少数样本。",
         "",
-        "| Run | Source | Rows | Harnesses | Gen Success | Gate Before | Gate After | Eval Success | Avg Score | Avg E2E | Failures |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Run | Source | Rows | Harnesses | Gen Success | Gate Before | Gate After | Eval Success | Avg Score | Avg E2E | Transfer | Gen tokens | Harness tokens | Failures |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
             "| {run_label} | {source_type} | {rows} | {harnesses} | {generation_success_rate} | "
             "{gate_pass_before_repair_rate} | {gate_pass_after_repair_rate} | {downstream_success_rate} | "
-            "{avg_score} | {avg_end_to_end_score} | {top_failure_modes} |".format(**row)
+            "{avg_score} | {avg_end_to_end_score} | {transfer_score} | {avg_generation_tokens} | "
+            "{avg_harness_run_tokens} | {top_failure_modes} |".format(**row)
         )
     lines.extend(
         [

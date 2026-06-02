@@ -87,6 +87,8 @@ def main() -> int:
     run_id = args.run_id or "creation-eval-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = (args.eval_output_root / run_id).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    eval_model_input = args.eval_model_name or os.environ.get("MODEL_NAME") or ""
+    eval_model_resolved = resolve_model_alias(eval_model_input)
     runtime = LLMRuntime()
     if not args.dry_run:
         runtime = configure_eval_llm(
@@ -116,6 +118,9 @@ def main() -> int:
             validation = validate_artifact(artifact, python_bin=python_bin)
             validation.pre_bmk_gate_mode = args.pre_bmk_gate
             validation.creation_profile = str(validation.meta.get("creation_profile") or "")
+            validation.meta["eval_model"] = eval_model_resolved or ""
+            validation.meta["eval_model_input"] = eval_model_input
+            validation.meta["eval_reasoning_effort"] = args.eval_reasoning_effort or os.environ.get("REASONING_EFFORT") or ""
             if args.pre_bmk_gate != "off":
                 cached_report = None if args.refresh_pre_bmk_gate else find_cached_pre_bmk_report(artifact)
                 if cached_report is not None:
@@ -205,7 +210,9 @@ def main() -> int:
                 "pre_bmk_gate": args.pre_bmk_gate,
                 "pre_bmk_timeout_seconds": args.pre_bmk_timeout_seconds,
                 "proxy_smoke_for_unsupported": args.proxy_smoke_for_unsupported,
-                "eval_model_name": resolve_model_alias(args.eval_model_name or os.environ.get("MODEL_NAME")),
+                "eval_model_name": eval_model_resolved,
+                "eval_model_input": eval_model_input,
+                "eval_reasoning_effort": args.eval_reasoning_effort or os.environ.get("REASONING_EFFORT") or "",
                 "eval_provider_proxy": (not args.no_eval_provider_proxy and not args.dry_run),
                 "eval_provider_proxy_log": str(runtime.log_path) if runtime.log_path else None,
                 "python_bin": python_bin,

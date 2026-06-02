@@ -7,6 +7,9 @@ from typing import Any
 
 SUMMARY_FIELDS = [
     "generation_model",
+    "eval_model",
+    "eval_model_input",
+    "eval_reasoning_effort",
     "creation_profile",
     "domain",
     "harness_task_id",

@@ -263,6 +263,12 @@ def generation_command(args: argparse.Namespace, spec: ModelSpec, output_dir: Pa
         args.creation_profile,
         "--pre-bmk-gate",
         args.pre_bmk_gate,
+        "--creation-repair-rounds",
+        str(args.creation_repair_rounds),
+        "--repair-gate",
+        args.repair_gate,
+        "--repair-mode",
+        args.repair_mode,
         "--task-id",
         ",".join(args.task_ids),
         "--max-concurrent",
@@ -323,6 +329,9 @@ def main() -> int:
     parser.add_argument("--eval-matrix", default="eval_matrix.yaml")
     parser.add_argument("--creation-profile", default="interface_tool")
     parser.add_argument("--pre-bmk-gate", default="soft", choices=["off", "soft", "hard"])
+    parser.add_argument("--creation-repair-rounds", type=int, default=0)
+    parser.add_argument("--repair-gate", default="public-contract", choices=["public-contract"])
+    parser.add_argument("--repair-mode", default="same-workspace", choices=["same-workspace"])
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--harness-evolve-root", default="/Users/bytedance/Downloads/harness evolve project")
     parser.add_argument("--generation-concurrency", type=int, default=1)
@@ -364,6 +373,9 @@ def main() -> int:
         "eval_bench": args.eval_bench,
         "creation_profile": args.creation_profile,
         "pre_bmk_gate": args.pre_bmk_gate,
+        "creation_repair_rounds": args.creation_repair_rounds,
+        "repair_gate": args.repair_gate,
+        "repair_mode": args.repair_mode,
         "output_root": str(args.output_root),
         "eval_output_root": str(args.eval_output_root),
     }

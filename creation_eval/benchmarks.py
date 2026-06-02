@@ -2088,6 +2088,9 @@ def base_row(
         end_to_end_score = 0.0
     return {
         "generation_model": artifact.generation_model,
+        "eval_model": validation.meta.get("eval_model") or "",
+        "eval_model_input": validation.meta.get("eval_model_input") or "",
+        "eval_reasoning_effort": validation.meta.get("eval_reasoning_effort") or "",
         "creation_profile": validation.creation_profile,
         "domain": artifact.domain,
         "harness_task_id": artifact.task_id,
