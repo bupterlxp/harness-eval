@@ -11,7 +11,11 @@ from pathlib import Path
 from creation_eval.benchmarks import base_row, filter_matrix, load_matrix, run_benchmark
 from creation_eval.llm_runtime import LLMRuntime, configure_eval_llm
 from creation_eval.model_aliases import resolve_model_alias
-from creation_eval.pre_bmk_validation import run_pre_bmk_validation
+from creation_eval.pre_bmk_validation import (
+    apply_pre_bmk_report,
+    find_cached_pre_bmk_report,
+    run_pre_bmk_validation,
+)
 from creation_eval.schema import HarnessRunResult
 from creation_eval.utils import best_python_bin, load_env_file, write_json, write_jsonl, write_summary_csv
 from creation_eval.validator import discover_harness_artifacts, validate_artifact
@@ -62,6 +66,11 @@ def main() -> int:
     )
     parser.add_argument("--pre-bmk-timeout-seconds", type=int, default=300)
     parser.add_argument(
+        "--refresh-pre-bmk-gate",
+        action="store_true",
+        help="Re-run public pre-BMK validation even when the creation-time selected gate report is available.",
+    )
+    parser.add_argument(
         "--proxy-smoke-for-unsupported",
         action="store_true",
         help="For unsupported BMK adapters, run a generated-harness smoke proxy and mark it as non-downstream-BMK.",
@@ -108,14 +117,18 @@ def main() -> int:
             validation.pre_bmk_gate_mode = args.pre_bmk_gate
             validation.creation_profile = str(validation.meta.get("creation_profile") or "")
             if args.pre_bmk_gate != "off":
-                validation = run_pre_bmk_validation(
-                    artifact,
-                    validation,
-                    output_dir / artifact.task_id / "_pre_bmk_validation",
-                    python_bin=python_bin,
-                    timeout=args.pre_bmk_timeout_seconds,
-                    run_toy=not args.dry_run,
-                )
+                cached_report = None if args.refresh_pre_bmk_gate else find_cached_pre_bmk_report(artifact)
+                if cached_report is not None:
+                    validation = apply_pre_bmk_report(validation, cached_report)
+                else:
+                    validation = run_pre_bmk_validation(
+                        artifact,
+                        validation,
+                        output_dir / artifact.task_id / "_pre_bmk_validation",
+                        python_bin=python_bin,
+                        timeout=args.pre_bmk_timeout_seconds,
+                        run_toy=not args.dry_run,
+                    )
                 validation.pre_bmk_gate_mode = args.pre_bmk_gate
             validations[str(artifact.path)] = {
                 "task_id": artifact.task_id,
@@ -123,6 +136,13 @@ def main() -> int:
                 "generation_model": artifact.generation_model,
                 "creation_profile": validation.creation_profile,
                 "generation_status": validation.generation_status,
+                "creation_attempts": validation.creation_attempts,
+                "repair_rounds": validation.repair_rounds,
+                "gate_pass_before_repair": validation.gate_pass_before_repair,
+                "gate_pass_after_repair": validation.gate_pass_after_repair,
+                "repair_failure_reasons": validation.repair_failure_reasons,
+                "repair_tokens": validation.repair_tokens,
+                "selected_attempt_path": validation.selected_attempt_path,
                 "syntax_ok": validation.syntax_ok,
                 "import_ok": validation.import_ok,
                 "cli_probe_ok": validation.cli_probe_ok,

@@ -8,8 +8,13 @@ from typing import Any
 
 from ..adapter import run_generated_harness
 from ..schema import HarnessArtifact, ValidationResult
-from ..scaffold_runtime import find_scaffold_program
+from ..scaffold_runtime import (
+    find_scaffold_program,
+    is_scaffold_native_profile,
+    should_prefer_scaffold_runtime,
+)
 from ..utils import write_json
+from .artifact_contracts import summarize_contract_failures, validate_domain_artifacts
 from .toy_tasks import setup_toy_task
 
 
@@ -39,7 +44,24 @@ def _collect_python_text(harness_dir: Path) -> tuple[list[Path], str, int]:
 def static_checks(artifact: HarnessArtifact) -> dict[str, Any]:
     harness_dir = artifact.path / "harness"
     scaffold_program = find_scaffold_program(artifact.path)
-    if scaffold_program is not None and not harness_dir.exists():
+    meta = _json_file(artifact.path / "meta.json")
+    creation_profile = str(meta.get("creation_profile") or "")
+    if is_scaffold_native_profile(creation_profile) and scaffold_program is None:
+        return {
+            "checks": {
+                "has_scaffold_program": False,
+                "has_scaffold_manifest": False,
+            },
+            "passed": False,
+            "scaffold_style": True,
+            "scaffold_native_required": True,
+            "found_domain_tools": [],
+            "total_python_files": 0,
+            "total_python_lines": 0,
+        }
+    if scaffold_program is not None and (
+        not harness_dir.exists() or should_prefer_scaffold_runtime(artifact.path, creation_profile)
+    ):
         return _scaffold_static_checks(artifact, scaffold_program)
     py_files, text, line_count = _collect_python_text(harness_dir)
     lowered = text.lower()
@@ -78,6 +100,9 @@ def _scaffold_static_checks(artifact: HarnessArtifact, program_path: Path) -> di
     checks = {
         "has_python_files": program_path.is_file(),
         "has_entry_point": True,
+        "has_scaffold_manifest": (artifact.path / "scaffold_manifest.json").is_file()
+        or (artifact.path / "harness_scaffold_manifest.json").is_file(),
+        "has_program_contract": "PROGRAM" in text or "def get_program(" in text,
         "has_result_output": True,
         "has_trajectory": True,
         "has_llm_config": True,
@@ -135,7 +160,17 @@ def _check_code(work_dir: Path, output_dir: Path) -> dict[str, Any]:
 def _check_data(work_dir: Path, output_dir: Path) -> dict[str, Any]:
     report_exists = _has_nonempty_file(output_dir, {"REPORT.md", "report.md"}) or _has_nonempty_file(work_dir, {"REPORT.md", "report.md"})
     chart_exists = any(path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".svg"} for root in (output_dir, work_dir) for path in root.rglob("*"))
-    return {"passed": report_exists and chart_exists, "report_exists": report_exists, "chart_exists": chart_exists}
+    submission_exists = _has_nonempty_file(output_dir, {"submission.csv"}) or _has_nonempty_file(work_dir, {"submission.csv"})
+    return {
+        # The public data gate should check evaluability, not presentation
+        # style. Charts are useful evidence, but MLE-style tasks only require a
+        # valid submission and concrete analysis artifact.
+        "passed": report_exists and submission_exists,
+        "report_exists": report_exists,
+        "chart_exists": chart_exists,
+        "submission_exists": submission_exists,
+        "chart_required": False,
+    }
 
 
 def _check_writing(work_dir: Path, output_dir: Path) -> dict[str, Any]:
@@ -172,6 +207,103 @@ DOMAIN_CHECKS = {
     "research": _check_research,
     "browser": _check_browser,
 }
+
+
+def _resolve_report_path(artifact_root: Path, value: str | None) -> Path | None:
+    if not value:
+        return None
+    candidate = Path(value)
+    candidates = [candidate]
+    if not candidate.is_absolute():
+        candidates.append(Path.cwd() / candidate)
+        candidates.append(artifact_root / candidate)
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _last_repair_report_path(artifact_root: Path) -> Path | None:
+    reports_path = artifact_root / "repair_reports.jsonl"
+    if not reports_path.is_file():
+        return None
+    last: dict[str, Any] | None = None
+    try:
+        for line in reports_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                last = json.loads(line)
+    except Exception:
+        return None
+    if not last:
+        return None
+    return _resolve_report_path(artifact_root, str(last.get("pre_bmk_report_path") or ""))
+
+
+def find_cached_pre_bmk_report(artifact: HarnessArtifact) -> Path | None:
+    """Find the creation-time public gate report for the selected attempt.
+
+    Eval should prefer this cached report over re-running toy validation. The
+    toy validators may execute generated harness logic and can be stochastic if
+    the harness calls an LLM. Reusing the selected creation report keeps
+    `gate_pass_after_repair` and eval summary fields consistent.
+    """
+
+    root = artifact.path
+    direct = root / "_pre_bmk_validation" / "pre_bmk_validation.json"
+    if direct.is_file():
+        return direct.resolve()
+
+    meta = _json_file(root / "meta.json")
+    meta_report = _resolve_report_path(root, str(meta.get("pre_bmk_report_path") or ""))
+    if meta_report is not None:
+        return meta_report
+
+    attempt_index: int | None = None
+    selected = str(meta.get("selected_attempt_path") or "")
+    selected_name = Path(selected).name if selected else ""
+    if selected_name.startswith("attempt_"):
+        try:
+            attempt_index = int(selected_name.split("_", 1)[1])
+        except ValueError:
+            attempt_index = None
+    if attempt_index is None and meta.get("creation_attempts") is not None:
+        try:
+            attempt_index = max(0, int(meta["creation_attempts"]) - 1)
+        except (TypeError, ValueError):
+            attempt_index = None
+    if attempt_index is not None:
+        derived = root / f"attempt_{attempt_index}_public_contract" / "pre_bmk_validation.json"
+        if derived.is_file():
+            return derived.resolve()
+
+    return _last_repair_report_path(root)
+
+
+def apply_pre_bmk_report(validation: ValidationResult, report_path: Path) -> ValidationResult:
+    report = _json_file(report_path)
+    static = report.get("static") if isinstance(report.get("static"), dict) else {}
+    toy = report.get("toy") if isinstance(report.get("toy"), dict) else {}
+    gate = report.get("gate") if isinstance(report.get("gate"), dict) else {}
+
+    gate_pass = gate.get("passed")
+    toy_score = toy.get("score")
+    validation.pre_bmk_static_pass = bool(static.get("passed"))
+    validation.pre_bmk_toy_task_score = float(toy_score) if isinstance(toy_score, (int, float)) else None
+    if toy.get("status") == "skipped":
+        validation.pre_bmk_artifact_pass = None
+    elif gate_pass is None:
+        validation.pre_bmk_artifact_pass = None
+    else:
+        validation.pre_bmk_artifact_pass = bool(gate_pass)
+    validation.pre_bmk_gate_pass = bool(gate_pass) if gate_pass is not None else None
+    validation.pre_bmk_gate_status = "passed" if validation.pre_bmk_gate_pass else "failed"
+    validation.pre_bmk_failure_reason = str(gate.get("failure_reason") or "")
+    validation.pre_bmk_report_path = str(report_path)
+    return validation
 
 
 def run_pre_bmk_validation(
@@ -220,12 +352,14 @@ def run_pre_bmk_validation(
                 )
                 checker = DOMAIN_CHECKS.get(artifact.domain)
                 domain_check = checker(work_dir, toy_output) if checker else {"passed": result.status == "success"}
-                toy_pass = result.status == "success" and bool(domain_check.get("passed"))
+                artifact_contract = validate_domain_artifacts(artifact.domain, work_dir, toy_output)
+                toy_pass = result.status == "success" and bool(domain_check.get("passed")) and artifact_contract.passed
                 toy_score = 1.0 if toy_pass else 0.0
                 report["toy"] = {
                     "status": result.status,
                     "score": toy_score,
                     "domain_check": domain_check,
+                    "artifact_contract": artifact_contract.to_dict(),
                     "stdout_path": result.stdout_path,
                     "stderr_path": result.stderr_path,
                     "raw_result_path": result.raw_result_path,
@@ -233,6 +367,8 @@ def run_pre_bmk_validation(
                 }
                 if not toy_pass:
                     failure_reasons.append("toy_task_failed")
+                    if not artifact_contract.passed:
+                        failure_reasons.append(summarize_contract_failures(artifact_contract))
     elif run_toy and not validation.runnable:
         report["toy"] = {"status": "skipped", "reason": "base validation is not runnable"}
         failure_reasons.append("base_validation_not_runnable")

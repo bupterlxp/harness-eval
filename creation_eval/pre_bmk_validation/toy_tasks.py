@@ -64,9 +64,19 @@ def setup_data_task(work_dir: Path) -> str:
     ]
     with (work_dir / "employees.csv").open("w", newline="", encoding="utf-8") as handle:
         csv.writer(handle).writerows(rows)
+    sample_rows = [
+        ["PassengerId", "Transported"],
+        ["0001_01", "False"],
+        ["0002_01", "True"],
+        ["0003_01", "False"],
+    ]
+    with (work_dir / "sample_submission.csv").open("w", newline="", encoding="utf-8") as handle:
+        csv.writer(handle).writerows(sample_rows)
     return (
         "Analyze employees.csv. Calculate average salary and performance by department, "
-        "identify highest and lowest paid departments, create salary_chart.png, and write REPORT.md with concrete numbers."
+        "identify highest and lowest paid departments, create salary_chart.png, and write REPORT.md with concrete numbers. "
+        "Also treat sample_submission.csv as a public MLE-style submission contract: write submission.csv with exactly the same "
+        "columns and PassengerId rows, and use literal True/False values in the Transported column."
     )
 
 

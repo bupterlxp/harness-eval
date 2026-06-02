@@ -33,7 +33,15 @@ from creation_eval.model_aliases import (
     resolve_codex_model_alias,
     resolve_model_alias,
 )
-from creation_eval.scaffold_runtime import scaffold_source_available, vendor_scaffold_dir
+from creation_eval.pre_bmk_validation import run_pre_bmk_validation
+from creation_eval.schema import HarnessArtifact
+from creation_eval.scaffold_runtime import (
+    is_scaffold_native_profile,
+    is_scaffold_resource_profile,
+    scaffold_source_available,
+    vendor_scaffold_dir,
+)
+from creation_eval.validator import infer_domain, validate_artifact
 
 
 SCAFFOLD_USAGE_SOURCE = Path(__file__).resolve().parent / "vendor" / "CLAUDE_CODE_SCAFFOLD_USAGE.md"
@@ -67,6 +75,9 @@ def default_config() -> dict:
         "creation_profile": os.environ.get("CREATION_PROFILE", "interface_tool"),
         "creation_profile_dir": "./prompts/creation/profiles",
         "pre_bmk_gate": os.environ.get("PRE_BMK_GATE", "soft"),
+        "creation_repair_rounds": int(os.environ.get("CREATION_REPAIR_ROUNDS", "0") or "0"),
+        "repair_gate": os.environ.get("REPAIR_GATE", "public-contract"),
+        "repair_mode": os.environ.get("REPAIR_MODE", "same-workspace"),
     }
 
 
@@ -120,6 +131,9 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "system_prompt_file": args.system_prompt,
         "creation_profile": args.creation_profile,
         "pre_bmk_gate": args.pre_bmk_gate,
+        "creation_repair_rounds": args.creation_repair_rounds,
+        "repair_gate": args.repair_gate,
+        "repair_mode": args.repair_mode,
         "max_concurrent": args.max_concurrent,
         "timeout_minutes": args.timeout_minutes,
     }
@@ -143,6 +157,11 @@ def normalize_creation_profile(value: str | None) -> str:
     aliases = {
         "claude_code_scaffold": "claude_code_scaffold",
         "claudecodescaffold": "claude_code_scaffold",
+        "claude_code_scaffold_native": "claude_code_scaffold_native",
+        "claude_code_native": "claude_code_scaffold_native",
+        "claudecodenative": "claude_code_scaffold_native",
+        "cc_native": "claude_code_scaffold_native",
+        "ccnative": "claude_code_scaffold_native",
         "interface_tool": "interface_tool",
         "interfacetool": "interface_tool",
         "interface": "interface",
@@ -153,7 +172,8 @@ def normalize_creation_profile(value: str | None) -> str:
     if profile not in aliases:
         raise ValueError(
             f"Unsupported creation_profile={value!r}. "
-            "Supported values: freeform, interface, interface_tool, full_loop, claude_code_scaffold."
+            "Supported values: freeform, interface, interface_tool, full_loop, "
+            "claude_code_scaffold, claude_code_scaffold_native."
         )
     return aliases[profile]
 
@@ -331,11 +351,12 @@ def prepare_workspace(task: dict, workspace: str):
 
 
 def install_scaffold_resources(workspace: Path, config: dict) -> None:
-    if normalize_creation_profile(str(config.get("creation_profile") or "interface_tool")) != "claude_code_scaffold":
+    profile = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    if not is_scaffold_resource_profile(profile):
         return
     if not scaffold_source_available():
         raise FileNotFoundError(
-            f"claude_code_scaffold profile requires vendored scaffold at {vendor_scaffold_dir()}"
+            f"{profile} profile requires vendored scaffold at {vendor_scaffold_dir()}"
         )
 
     dest = workspace / "harness_scaffold"
@@ -348,6 +369,166 @@ def install_scaffold_resources(workspace: Path, config: dict) -> None:
     )
     if SCAFFOLD_USAGE_SOURCE.is_file():
         shutil.copy2(SCAFFOLD_USAGE_SOURCE, workspace / "CLAUDE_CODE_SCAFFOLD.md")
+    if is_scaffold_native_profile(profile):
+        install_native_scaffold_contract(workspace)
+
+
+def install_native_scaffold_contract(workspace: Path) -> None:
+    """Seed a scaffold-native program surface without implementing policy."""
+
+    manifest = workspace / "scaffold_manifest.json"
+    if not manifest.exists():
+        manifest.write_text(
+            json.dumps(
+                {
+                    "style": "claude_code_scaffold_native",
+                    "program": "generated_program.py",
+                    "compat_entrypoint": "harness/__main__.py",
+                    "contract": (
+                        "Generated harness must run through harness_scaffold. "
+                        "Additional tools may be added, but the scaffold runtime "
+                        "remains the execution substrate."
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    program = workspace / "generated_program.py"
+    if not program.exists():
+        program.write_text(
+            '''"""Scaffold-native generated harness program.
+
+Edit this file to implement the domain-specific harness policy on top of
+``harness_scaffold``. You may add modules or custom tools, but keep this file
+as the program selected by ``scaffold_manifest.json``.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from harness_scaffold.core.context import RuntimeContext
+from harness_scaffold.core.schemas import HarnessResult
+from harness_scaffold.examples._common import make_result
+from harness_scaffold.tools.registry import ToolRegistry
+
+
+class GeneratedHarnessProgram:
+    name = "generated"
+
+    async def run(
+        self,
+        ctx: RuntimeContext,
+        tools: ToolRegistry,
+        llm: Optional[object],
+    ) -> HarnessResult:
+        ctx.trajectory.log_step(0, phase="start", note=self.name)
+        raise NotImplementedError(
+            "Implement the harness policy using harness_scaffold tools, "
+            "then return a HarnessResult with real artifacts."
+        )
+
+
+PROGRAM = GeneratedHarnessProgram()
+
+
+def get_program() -> GeneratedHarnessProgram:
+    return PROGRAM
+''',
+            encoding="utf-8",
+        )
+
+    harness_dir = workspace / "harness"
+    harness_dir.mkdir(exist_ok=True)
+    init_file = harness_dir / "__init__.py"
+    if not init_file.exists():
+        init_file.write_text('"""Compatibility package for scaffold-native harnesses."""\n', encoding="utf-8")
+
+    main_file = harness_dir / "__main__.py"
+    if not main_file.exists():
+        main_file.write_text(
+            '''from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from harness_scaffold.adapters.cli import run_cli
+
+
+def _load_manifest(root: Path) -> dict:
+    for name in ("scaffold_manifest.json", "harness_scaffold_manifest.json"):
+        path = root / name
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {"program": "generated_program.py"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Scaffold-native generated harness wrapper")
+    parser.add_argument("positional_prompt", nargs="*", help="Optional prompt words")
+    parser.add_argument("-p", "--prompt", default=None)
+    parser.add_argument("--workdir", "--work-dir", "--workspace", dest="workdir", default=".")
+    parser.add_argument("--output-dir", "--output", dest="output_dir", required=True)
+    parser.add_argument("--max-steps", "--max-turns", dest="max_steps", default=None)
+    parser.add_argument("--model-name", default=None)
+    args = parser.parse_args(argv)
+
+    root = Path(__file__).resolve().parents[1]
+    out_dir = Path(args.output_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = _load_manifest(root)
+    program = (root / str(manifest.get("program") or "generated_program.py")).resolve()
+    prompt = args.prompt or " ".join(args.positional_prompt).strip()
+
+    task_json = out_dir / "task.json"
+    config_json = out_dir / "config.json"
+    task_json.write_text(
+        json.dumps(
+            {
+                "task_id": "generated-harness-task",
+                "prompt": prompt,
+                "workdir": str(Path(args.workdir).resolve()),
+                "metadata": {"adapter": "scaffold_native_wrapper"},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    policy = {}
+    if args.max_steps:
+        try:
+            policy["max_steps"] = int(args.max_steps)
+        except ValueError:
+            policy["max_steps"] = args.max_steps
+    config_json.write_text(
+        json.dumps({"policy": policy, "include_optional_tools": True}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return run_cli(
+        [
+            "--task-json",
+            str(task_json),
+            "--program",
+            str(program),
+            "--out-dir",
+            str(out_dir),
+            "--config",
+            str(config_json),
+        ]
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''',
+            encoding="utf-8",
+        )
 
 
 def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
@@ -489,6 +670,219 @@ def run_generation(task_id: str, workspace: str, config: dict, timeout: int) -> 
     return "error", "", f"Unsupported meta_harness={meta_harness!r}"
 
 
+SKIP_COPY_DIRS = {".git", "venv", ".venv", "node_modules", "__pycache__"}
+
+
+def _copy_workspace_contents(src: Path, dst: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in src.iterdir():
+        if item.name in SKIP_COPY_DIRS:
+            continue
+        dest = dst / item.name
+        if item.is_dir():
+            try:
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            except shutil.Error:
+                shutil.copytree(
+                    item,
+                    dest,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("python*", "python3*"),
+                )
+        else:
+            shutil.copy2(item, dest)
+
+
+def _attempt_meta(
+    task: dict,
+    config: dict,
+    *,
+    status: str,
+    stdout: str,
+    stderr: str,
+    attempt_index: int,
+    repair_rounds_run: int,
+) -> dict:
+    return {
+        "task_id": task["id"],
+        "status": status,
+        "run_id": config.get("run_id"),
+        "meta_harness": config.get("meta_harness", "claude-code"),
+        "creation_profile": config.get("creation_profile", "interface_tool"),
+        "scaffold_source": "vendor/harness_scaffold"
+        if is_scaffold_resource_profile(str(config.get("creation_profile") or ""))
+        else None,
+        "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
+        "repair_gate": config.get("repair_gate", "public-contract"),
+        "repair_mode": config.get("repair_mode", "same-workspace"),
+        "attempt_index": attempt_index,
+        "repair_rounds_run": repair_rounds_run,
+        "generation_model_input": config.get("model_name_input"),
+        "generation_model": config.get("model_name"),
+        "eval_model_input": config.get("eval_model_name_input"),
+        "eval_model": config.get("eval_model_name"),
+        "claude_model_name": config.get("claude_model_name", "claude-sonnet-4-6"),
+        "codex_bin": config.get("codex_bin") if config.get("meta_harness") == "codex" else None,
+        "codex_sandbox": config.get("codex_sandbox") if config.get("meta_harness") == "codex" else None,
+        "codex_enable_search": bool(config.get("codex_enable_search")) if config.get("meta_harness") == "codex" else None,
+        "reasoning_effort": config.get("reasoning_effort"),
+        "system_prompt_file": config.get("system_prompt_file") if config.get("include_system_prompt", True) else None,
+        "task_prompt_file": task.get("prompt_file"),
+        "stdout": stdout[-5000:] if stdout else "",
+        "stderr": stderr[-5000:] if stderr else "",
+    }
+
+
+def _validate_workspace_attempt(
+    *,
+    task: dict,
+    config: dict,
+    workspace: Path,
+    task_output_dir: Path,
+    attempt_index: int,
+    status: str,
+    stdout: str,
+    stderr: str,
+) -> dict:
+    meta = _attempt_meta(
+        task,
+        config,
+        status=status,
+        stdout=stdout,
+        stderr=stderr,
+        attempt_index=attempt_index,
+        repair_rounds_run=max(0, attempt_index),
+    )
+    (workspace / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    artifact = HarnessArtifact(
+        path=workspace,
+        task_id=str(task["id"]),
+        domain=infer_domain(str(task["id"]), workspace),
+        generation_model=str(config.get("model_name") or config.get("model_name_input") or "unknown"),
+    )
+    python_bin = sys.executable
+    validation = validate_artifact(artifact, python_bin=python_bin)
+    validation.creation_profile = str(config.get("creation_profile") or "")
+    validation.pre_bmk_gate_mode = str(config.get("pre_bmk_gate") or "soft")
+    validation = run_pre_bmk_validation(
+        artifact,
+        validation,
+        task_output_dir / f"attempt_{attempt_index}_public_contract",
+        python_bin=python_bin,
+        timeout=300,
+        run_toy=True,
+    )
+    report = {
+        "attempt_index": attempt_index,
+        "status": status,
+        "stdout_tail": stdout[-2000:] if stdout else "",
+        "stderr_tail": stderr[-2000:] if stderr else "",
+        "generation_status": validation.generation_status,
+        "syntax_ok": validation.syntax_ok,
+        "import_ok": validation.import_ok,
+        "cli_probe_ok": validation.cli_probe_ok,
+        "adapter_status": validation.adapter_status,
+        "runnable": validation.runnable,
+        "gate_pass": validation.pre_bmk_gate_pass,
+        "gate_failure_reason": validation.pre_bmk_failure_reason,
+        "toy_task_score": validation.pre_bmk_toy_task_score,
+        "static_check_pass": validation.pre_bmk_static_pass,
+        "artifact_check_pass": validation.pre_bmk_artifact_pass,
+        "pre_bmk_report_path": validation.pre_bmk_report_path,
+        "missing_dependencies": validation.missing_dependencies,
+        "errors": validation.errors,
+    }
+    return report
+
+
+def _repair_prompt(report: dict, round_index: int) -> str:
+    failure_report = json.dumps(report, ensure_ascii=False, indent=2)
+    return f"""# Public-Contract Repair Round {round_index}
+
+The harness you generated did not pass the public creation validation gate. Repair the existing harness files in this same workspace.
+
+Rules:
+- Use only the public validation report below. Do not assume hidden benchmark labels, hidden scores, or hidden answers.
+- Keep the same public CLI contract and generated harness layout.
+- Fix the concrete runnable artifact. Do not answer with a plan only.
+- Preserve useful working code and only change what is needed to pass static/import/CLI, toy execution, and public artifact-contract checks.
+- The repaired harness must still work for unseen downstream BMK tasks in the same domain.
+
+Validation report:
+
+```json
+{failure_report}
+```
+"""
+
+
+def _write_repair_instruction(workspace: Path, task_output_dir: Path, report: dict, round_index: int) -> None:
+    prompt = _repair_prompt(report, round_index)
+    repair_dir = task_output_dir / "repair_prompts"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    (repair_dir / f"repair_round_{round_index}.md").write_text(prompt, encoding="utf-8")
+    repair_file = workspace / f"REPAIR_INSTRUCTIONS_ROUND_{round_index}.md"
+    repair_file.write_text(prompt, encoding="utf-8")
+    claude_md = workspace / "CLAUDE.md"
+    with claude_md.open("a", encoding="utf-8") as handle:
+        handle.write("\n\n---\n\n")
+        handle.write(f"# Repair Round {round_index}\n\n")
+        handle.write(f"Read `REPAIR_INSTRUCTIONS_ROUND_{round_index}.md` and repair the generated harness accordingly.\n")
+
+
+def _append_repair_report(task_output_dir: Path, report: dict) -> None:
+    path = task_output_dir / "repair_reports.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(report, ensure_ascii=False) + "\n")
+
+
+def _persist_selected_pre_bmk_report(task_output_dir: Path, repair_attempts: list[dict]) -> str:
+    if not repair_attempts:
+        return ""
+    report_value = str(repair_attempts[-1].get("pre_bmk_report_path") or "")
+    if not report_value:
+        return ""
+    report_path = Path(report_value)
+    if not report_path.is_absolute():
+        report_path = Path.cwd() / report_path
+    if not report_path.is_file():
+        return ""
+    canonical_dir = task_output_dir / "_pre_bmk_validation"
+    canonical_dir.mkdir(parents=True, exist_ok=True)
+    canonical_path = canonical_dir / "pre_bmk_validation.json"
+    shutil.copy2(report_path, canonical_path)
+    return str(canonical_path.resolve())
+
+
+def _run_generation_with_repairs(task: dict, config: dict, workspace: Path, task_output_dir: Path, timeout: int) -> tuple[str, str, str, list[dict]]:
+    max_rounds = max(0, int(config.get("creation_repair_rounds") or 0))
+    attempts: list[dict] = []
+    status = stdout = stderr = ""
+    for attempt_index in range(max_rounds + 1):
+        status, stdout, stderr = run_generation(task["id"], str(workspace), config, timeout)
+        report = _validate_workspace_attempt(
+            task=task,
+            config=config,
+            workspace=workspace,
+            task_output_dir=task_output_dir,
+            attempt_index=attempt_index,
+            status=status,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        attempts.append(report)
+        _append_repair_report(task_output_dir, report)
+        snapshot_dir = task_output_dir / f"attempt_{attempt_index}"
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        _copy_workspace_contents(workspace, snapshot_dir)
+        if report.get("gate_pass") is True:
+            break
+        if attempt_index < max_rounds:
+            _write_repair_instruction(workspace, task_output_dir, report, attempt_index + 1)
+    return status, stdout, stderr, attempts
+
+
 def run_task(task: dict, config: dict, output_dir: Path) -> dict:
     task_id = task["id"]
     task_output_dir = output_dir / task_id
@@ -508,21 +902,23 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         return meta
 
     timeout = config.get("timeout_minutes", 30) * 60
-    status, stdout, stderr = run_generation(task_id, workspace, config, timeout)
+    status, stdout, stderr, repair_attempts = _run_generation_with_repairs(
+        task,
+        config,
+        Path(workspace),
+        task_output_dir,
+        timeout,
+    )
 
-    SKIP_DIRS = {".git", "venv", ".venv", "node_modules", "__pycache__"}
-    for item in Path(workspace).iterdir():
-        dest = task_output_dir / item.name
-        if item.is_dir():
-            if item.name in SKIP_DIRS:
-                continue
-            try:
-                shutil.copytree(item, dest, dirs_exist_ok=True)
-            except shutil.Error:
-                shutil.copytree(item, dest, dirs_exist_ok=True,
-                                ignore=shutil.ignore_patterns("python*", "python3*"))
-        else:
-            shutil.copy2(item, dest)
+    _copy_workspace_contents(Path(workspace), task_output_dir)
+    gate_before = repair_attempts[0].get("gate_pass") if repair_attempts else None
+    gate_after = repair_attempts[-1].get("gate_pass") if repair_attempts else None
+    pre_bmk_report_path = _persist_selected_pre_bmk_report(task_output_dir, repair_attempts)
+    repair_failure_reasons = [
+        str(attempt.get("gate_failure_reason") or "")
+        for attempt in repair_attempts
+        if attempt.get("gate_pass") is not True and attempt.get("gate_failure_reason")
+    ]
 
     meta = {
         "task_id": task_id,
@@ -531,7 +927,7 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         "meta_harness": config.get("meta_harness", "claude-code"),
         "creation_profile": config.get("creation_profile", "interface_tool"),
         "scaffold_source": "vendor/harness_scaffold"
-        if config.get("creation_profile") == "claude_code_scaffold"
+        if is_scaffold_resource_profile(str(config.get("creation_profile") or ""))
         else None,
         "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
         "generation_model_input": config.get("model_name_input"),
@@ -547,6 +943,14 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         "task_prompt_file": task.get("prompt_file"),
         "stdout": stdout[-5000:] if stdout else "",
         "stderr": stderr[-5000:] if stderr else "",
+        "creation_attempts": len(repair_attempts) if repair_attempts else 1,
+        "repair_rounds": max(0, (len(repair_attempts) - 1) if repair_attempts else 0),
+        "gate_pass_before_repair": gate_before,
+        "gate_pass_after_repair": gate_after,
+        "repair_failure_reasons": repair_failure_reasons,
+        "selected_attempt_path": str((task_output_dir / f"attempt_{len(repair_attempts) - 1}").resolve()) if repair_attempts else "",
+        "pre_bmk_report_path": pre_bmk_report_path,
+        "repair_reports_path": str((task_output_dir / "repair_reports.jsonl").resolve()) if (task_output_dir / "repair_reports.jsonl").exists() else "",
     }
 
     metrics_file = task_output_dir / "metrics.json"
@@ -634,6 +1038,11 @@ def parse_args() -> argparse.Namespace:
             "full-loop",
             "claude_code_scaffold",
             "claude-code-scaffold",
+            "claude_code_scaffold_native",
+            "claude-code-scaffold-native",
+            "claude_code_native",
+            "claude-code-native",
+            "cc_native",
         ],
         help="Harness creation profile. Main experiment default: interface_tool.",
     )
@@ -642,6 +1051,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["off", "soft", "hard"],
         help="Pre-BMK validation gate used by --eval-after. soft records failures but still runs BMK; hard skips failed harnesses.",
+    )
+    parser.add_argument(
+        "--creation-repair-rounds",
+        type=int,
+        default=None,
+        help="Number of public-contract repair rounds to run after initial creation. Default: 0.",
+    )
+    parser.add_argument(
+        "--repair-gate",
+        default=None,
+        choices=["public-contract"],
+        help="Repair feedback source. public-contract uses only static, CLI, toy, and public artifact checks.",
+    )
+    parser.add_argument(
+        "--repair-mode",
+        default=None,
+        choices=["same-workspace"],
+        help="Repair mode. same-workspace reruns the same meta harness in the existing generation workspace.",
     )
     parser.add_argument("--no-system-prompt", action="store_true", help="Do not prepend system prompt.")
     parser.add_argument("--max-concurrent", type=int, default=None)
@@ -744,6 +1171,9 @@ def main():
     config = resolve_config_models(apply_cli_overrides(load_config(args.config), args))
     config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
     config["pre_bmk_gate"] = str(config.get("pre_bmk_gate") or "soft")
+    config["creation_repair_rounds"] = max(0, int(config.get("creation_repair_rounds") or 0))
+    config["repair_gate"] = str(config.get("repair_gate") or "public-contract")
+    config["repair_mode"] = str(config.get("repair_mode") or "same-workspace")
 
     if args.list_model_aliases:
         print_model_aliases(config)

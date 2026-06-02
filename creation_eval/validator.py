@@ -5,7 +5,12 @@ import re
 from pathlib import Path
 
 from .schema import HarnessArtifact, ValidationResult
-from .scaffold_runtime import apply_scaffold_pythonpath, find_scaffold_program
+from .scaffold_runtime import (
+    apply_scaffold_pythonpath,
+    find_scaffold_program,
+    is_scaffold_native_profile,
+    should_prefer_scaffold_runtime,
+)
 from .utils import read_json, run_command
 
 
@@ -188,6 +193,13 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
     result = ValidationResult(
         generation_status=generation_status,
         generation_tokens=generation_tokens,
+        creation_attempts=meta.get("creation_attempts"),
+        repair_rounds=meta.get("repair_rounds"),
+        gate_pass_before_repair=meta.get("gate_pass_before_repair"),
+        gate_pass_after_repair=meta.get("gate_pass_after_repair"),
+        repair_failure_reasons=meta.get("repair_failure_reasons") if isinstance(meta.get("repair_failure_reasons"), list) else [],
+        repair_tokens=meta.get("repair_tokens"),
+        selected_attempt_path=str(meta.get("selected_attempt_path") or ""),
         harness_run_interactions=interactions,
         meta=meta,
         metrics=metrics,
@@ -196,7 +208,23 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
 
     harness_dir = artifact.path / "harness"
     scaffold_program = find_scaffold_program(artifact.path)
-    if not harness_dir.is_dir() and scaffold_program is not None:
+    creation_profile = str(meta.get("creation_profile") or "")
+    if is_scaffold_native_profile(creation_profile) and scaffold_program is None:
+        result.errors.append(
+            "scaffold_native_required: expected scaffold_manifest.json plus generated_program.py "
+            "or another PROGRAM/get_program scaffold program"
+        )
+        result.syntax_ok = False
+        result.import_ok = False
+        result.cli_probe_ok = False
+        result.adapter_status = "invalid"
+        result.meta["scaffold_native_required"] = True
+        return result
+
+    if scaffold_program is not None and (
+        not harness_dir.is_dir() or should_prefer_scaffold_runtime(artifact.path, creation_profile)
+    ):
+        result.meta["scaffold_native_required"] = is_scaffold_native_profile(creation_profile)
         return _validate_scaffold_artifact(artifact, result, python_bin, timeout, scaffold_program)
 
     if not harness_dir.is_dir():

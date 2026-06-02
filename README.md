@@ -85,6 +85,16 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 | `interface` | 固定 CLI/schema，但不提供工具 contract。 |
 | `interface_tool` | 主实验默认；固定 interface + tool contract。 |
 | `full_loop` | 强 scaffold / upper bound；给完整 loop 结构但仍要求真实策略。 |
+| `claude_code_scaffold` | 可选注入 CC_4 atomic scaffold；模型可以复用文件、shell、patch、trajectory、artifact、task graph、checkpoint、context compaction、public validator、repair feedback、cost tracker 等原子能力，也可以自行实现。 |
+| `claude_code_scaffold_native` | 最高 scaffold 档；直接把 Claude Code 原子能力作为固定 runtime/substrate，模型可以扩展工具，但不能完全绕开 scaffold 重新写独立 harness。 |
+
+建议把 scaffold 强度作为实验 setting，而不是隐藏实现细节：
+
+| Setting | 对应 profile | 含义 |
+|---|---|---|
+| 从 0 写 | `freeform` | 只给目标和输出契约，测试模型原始 creation 能力。 |
+| 基础 interface/tool | `interface_tool` | 给统一 CLI、schema 和工具 contract，测试模型能否自己实现可运行 harness。 |
+| Claude Code 原子能力 substrate | `claude_code_scaffold_native` | 给抽取好的 Claude Code 原子能力和 scaffold runtime，测试模型能否做高层编排、验证和恢复设计。 |
 
 `--pre-bmk-gate` 有三档：
 
@@ -96,12 +106,69 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 
 summary 会同时输出 `score` 和 `end_to_end_score`。`score` 是 downstream BMK 的真实分数；`end_to_end_score` 会把 gate 失败样本计为 0，用于衡量端到端 yield。
 
+### Public-contract validator + repair loop
+
+当前新增了一层 creation 阶段的公开契约验证和可选修复循环：
+
+```bash
+python run.py config.yaml \
+  --task-id code-agent-harness \
+  --creation-profile claude_code_scaffold_native \
+  --creation-repair-rounds 1 \
+  --repair-gate public-contract \
+  --repair-mode same-workspace
+```
+
+流程是：
+
+1. meta harness 先正常生成 harness；
+2. runner 执行 static/import/CLI 检查和 public toy/artifact contract；
+3. 若失败，结构化写入 `repair_reports.jsonl`，并把公开失败原因写入 `repair_prompts/repair_round_N.md`；
+4. 同一个 meta harness / generation LLM 在同一 workspace 修复；
+5. 达到 gate pass 或超过 `--creation-repair-rounds` 后，选择最后一次 attempt 进入后续 validation / BMK eval。
+
+repair 只使用公开 contract：schema、toy input、sample submission、产物格式、轨迹和日志检查。它不会读取 hidden BMK 分数、hidden labels 或答案。summary 里会记录：
+
+| 字段 | 含义 |
+|---|---|
+| `creation_attempts` | 初始生成 + repair 尝试次数 |
+| `repair_rounds` | 实际 repair 轮数 |
+| `gate_pass_before_repair` | 初始生成是否通过 public gate |
+| `gate_pass_after_repair` | 最终选择版本是否通过 public gate |
+| `repair_failure_reasons` | 每次失败的公开原因 |
+| `selected_attempt_path` | 最终进入 eval 的 attempt 路径 |
+
+public artifact contract 覆盖五类任务：
+
+| Domain | 最低公开可评测契约 |
+|---|---|
+| Code | 必须有真实 diff / changed_files，并记录 verifier/test command evidence。 |
+| MLE / Data | 若存在 `sample_submission.csv`，必须输出列名、行数、ID 顺序和标签域匹配的 `submission.csv`；DAComp 类任务还需结构化数值决策和非模板报告。 |
+| Writing | 必须输出最终用户可读文本，不接受只有日志、JSON metadata 或很短状态说明。 |
+| Research | 必须输出 answer/report 和 citation/evidence trace。 |
+| Browser | 必须输出 action trace 和 final state/result artifact。 |
+
+质量分析脚本：
+
+```bash
+python tools/analyze_creation_quality.py \
+  --run prompt_only=outputs/old_prompt_run \
+  --run scaffold=outputs/claude_scaffold_run \
+  --run scaffold_repair=eval_results/new_scaffold_repair_eval \
+  --output-dir analysis_outputs/creation_quality
+```
+
+输出：
+
+- `creation_quality_comparison.csv`
+- `creation_quality_report.md`
+
 ### 两层结构
 
 ```
 prompts/
 ├── system_prompt.md          # 通用架构约束（ETCSLV），所有 harness 共享
-├── creation/profiles/        # freeform/interface/interface_tool/full_loop profile
+├── creation/profiles/        # freeform/interface/interface_tool/full_loop/claude_code_* profile
 ├── code_agent_harness.md     # 代码智能体：bug 修复、功能开发、重构
 ├── data_analysis_harness.md  # 数据分析：统计分析、可视化、数据工程 pipeline
 ├── writing_harness.md        # 创意写作：长篇小说、情感角色扮演、批评-修改循环

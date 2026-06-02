@@ -14,6 +14,13 @@ SUMMARY_FIELDS = [
     "benchmark",
     "benchmark_id",
     "generation_status",
+    "creation_attempts",
+    "repair_rounds",
+    "gate_pass_before_repair",
+    "gate_pass_after_repair",
+    "repair_failure_reasons",
+    "repair_tokens",
+    "selected_attempt_path",
     "syntax_ok",
     "import_ok",
     "cli_probe_ok",
@@ -57,6 +64,13 @@ class ValidationResult:
     cli_probe_ok: bool = False
     adapter_status: str = "not_checked"
     generation_tokens: int | None = None
+    creation_attempts: int | None = None
+    repair_rounds: int | None = None
+    gate_pass_before_repair: bool | None = None
+    gate_pass_after_repair: bool | None = None
+    repair_failure_reasons: list[str] = field(default_factory=list)
+    repair_tokens: int | None = None
+    selected_attempt_path: str = ""
     harness_run_tokens: int | None = None
     harness_run_interactions: int | None = None
     missing_dependencies: list[str] = field(default_factory=list)

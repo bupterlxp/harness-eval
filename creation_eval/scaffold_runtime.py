@@ -16,6 +16,15 @@ MANIFEST_CANDIDATE_NAMES = (
     "harness_scaffold_manifest.json",
 )
 
+SCAFFOLD_RESOURCE_PROFILES = {
+    "claude_code_scaffold",
+    "claude_code_scaffold_native",
+}
+
+SCAFFOLD_NATIVE_PROFILES = {
+    "claude_code_scaffold_native",
+}
+
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -31,6 +40,34 @@ def vendor_scaffold_dir() -> Path:
 
 def scaffold_source_available() -> bool:
     return (vendor_scaffold_dir() / "adapters" / "cli.py").is_file()
+
+
+def is_scaffold_resource_profile(profile: str | None) -> bool:
+    normalized = (profile or "").strip().lower().replace("-", "_")
+    return normalized in SCAFFOLD_RESOURCE_PROFILES
+
+
+def is_scaffold_native_profile(profile: str | None) -> bool:
+    normalized = (profile or "").strip().lower().replace("-", "_")
+    return normalized in SCAFFOLD_NATIVE_PROFILES
+
+
+def has_scaffold_manifest(root: Path) -> bool:
+    root = Path(root)
+    return any((root / name).is_file() for name in MANIFEST_CANDIDATE_NAMES)
+
+
+def should_prefer_scaffold_runtime(root: Path, profile: str | None = None) -> bool:
+    if is_scaffold_native_profile(profile):
+        return True
+    root = Path(root)
+    if has_scaffold_manifest(root):
+        return True
+    try:
+        meta = json.loads((root / "meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = {}
+    return is_scaffold_native_profile(str(meta.get("creation_profile") or ""))
 
 
 def scaffold_pythonpath(root: Path, program_path: Path | None = None) -> list[str]:

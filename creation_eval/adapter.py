@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .schema import HarnessRunResult
-from .scaffold_runtime import apply_scaffold_pythonpath, find_scaffold_program
+from .scaffold_runtime import (
+    apply_scaffold_pythonpath,
+    find_scaffold_program,
+    should_prefer_scaffold_runtime,
+)
 from .utils import best_python_bin, copytree_filtered, run_command, write_json
 
 
@@ -930,7 +934,9 @@ def run_generated_harness(
                     error="Generated harness requirements installation failed",
                 )
         scaffold_program = find_scaffold_program(workspace)
-        if scaffold_program is not None and not (workspace / "harness").is_dir():
+        if scaffold_program is not None and (
+            should_prefer_scaffold_runtime(workspace) or not (workspace / "harness").is_dir()
+        ):
             return _run_scaffold_program(
                 workspace,
                 scaffold_program,

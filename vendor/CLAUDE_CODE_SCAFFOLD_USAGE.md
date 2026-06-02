@@ -23,9 +23,22 @@ python -m harness_scaffold.adapters.cli \
 The scaffold provides atomic runtime capabilities such as file tools, shell,
 search, patching, git diff/status, artifact writing, trajectory logging,
 timeouts, budgets, permission checks, optional LLM clients, and a strict stdout
-contract. These capabilities are resources, not mandatory APIs.
+contract. It also exposes optional higher-level atoms for task graphs,
+checkpoint/rollback, context compaction, MCP/static tool discovery, public
+domain-artifact validation, repair-feedback formatting, and cost tracking.
+These capabilities are resources, not mandatory APIs.
+
+In `claude_code_scaffold_native` experiments, this scaffold is the required
+runtime substrate. The generated harness may extend it with custom tools or
+policy modules, but it should keep a `scaffold_manifest.json` pointing to a
+program that exposes `PROGRAM` or `get_program()`, and the `python -m harness`
+compatibility entrypoint should delegate to `harness_scaffold.adapters.cli`.
 
 Before downstream BMK, generated harnesses are checked for real execution
 evidence: runnable syntax/import/CLI, `result.json`, `trajectory.jsonl`,
 stdout/stderr logs, non-empty domain artifacts, no TODO/stub-only output, and
 budget-respecting tool/action traces.
+
+If public validation fails, the runner may start a repair round using only the
+public contract report. Hidden BMK labels, hidden answers, and hidden scores are
+not exposed to the repair prompt.
