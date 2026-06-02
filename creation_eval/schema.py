@@ -42,6 +42,7 @@ SUMMARY_FIELDS = [
     "win_rate",
     "reward",
     "harness_run_tokens",
+    "harness_run_token_breakdown",
     "harness_run_interactions",
     "generation_tokens",
     "missing_dependencies",
@@ -123,6 +124,7 @@ class HarnessRunResult:
     reward: float | None = None
     tokens: int | None = None
     harness_run_tokens: int | None = None
+    token_breakdown: dict[str, Any] = field(default_factory=dict)
     interactions: int | None = None
     stdout_path: str = ""
     stderr_path: str = ""

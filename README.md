@@ -476,6 +476,14 @@ python3 run.py config.yaml \
 `run_creation_eval.py` 会把已经生成的 harness 目录接到下游 benchmark registry 上，输出统一的
 `eval_results/<run_id>/summary.jsonl` 和 `summary.csv`。
 
+summary 中的 token 字段口径如下：
+
+- `generation_tokens`：meta harness 在 creation / repair 阶段生成或修改 harness 的 token 消耗。
+- `repair_tokens`：public-contract repair loop 额外消耗的 token。
+- `harness_run_tokens`：生成或 evolve 出来的 harness 配上 eval LLM，在 downstream BMK 解题时的 token 消耗。它从 adapter 输出的 `metadata.json`、`trajectory.jsonl`、`result.json` 或 stdout usage marker 中提取；如果 harness 没有记录 LLM usage，这一列会留空而不是伪造。
+- `harness_run_token_breakdown`：`harness_run_tokens` 的明细，包括 input/output/reasoning token、来源文件和多 task BMK 的 per-task token。
+- 评分 judge 的 token 不计入 `harness_run_tokens`，会写进 `score_breakdown.judge_tokens`，避免把“被测 harness 成本”和“评分成本”混在一起。
+
 ```bash
 python3.12 run_creation_eval.py \
   --generation-output outputs/opus45 \

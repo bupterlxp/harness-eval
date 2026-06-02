@@ -18,10 +18,20 @@ from .scaffold_runtime import (
     find_scaffold_program,
     should_prefer_scaffold_runtime,
 )
+from .token_usage import extract_harness_token_usage
 from .utils import best_python_bin, copytree_filtered, run_command, write_json
 
 
 TEXT_SUFFIXES = {".md", ".txt", ".json"}
+
+
+def _attach_token_usage(result: HarnessRunResult, *paths: Path | str | None) -> HarnessRunResult:
+    usage = extract_harness_token_usage(*paths, result.raw_result_path, result.stdout_path, result.stderr_path)
+    total = usage.get("total_tokens") if usage else None
+    if isinstance(total, (int, float)):
+        result.harness_run_tokens = int(total)
+        result.token_breakdown = usage
+    return result
 
 
 REAL_SEARCH_SITECUSTOMIZE = r'''
@@ -835,7 +845,7 @@ def _run_scaffold_program(
                 "attempts": attempts,
             },
         )
-        return HarnessRunResult(
+        return _attach_token_usage(HarnessRunResult(
             status="success",
             score=1.0,
             pass_rate=1.0,
@@ -843,7 +853,7 @@ def _run_scaffold_program(
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             raw_result_path=str(raw_result_path),
-        )
+        ), run_output_dir, artifacts_dir)
 
     if result.returncode == 124:
         status = "failed/timeout"
@@ -862,7 +872,7 @@ def _run_scaffold_program(
             "attempts": attempts,
         },
     )
-    return HarnessRunResult(
+    return _attach_token_usage(HarnessRunResult(
         status="adapter_failed",
         score=0.0,
         pass_rate=0.0,
@@ -871,7 +881,7 @@ def _run_scaffold_program(
         stderr_path=str(stderr_path),
         raw_result_path=str(raw_result_path),
         error=error,
-    )
+    ), run_output_dir, artifacts_dir)
 
 
 def run_generated_harness(
@@ -923,7 +933,7 @@ def run_generated_harness(
             attempts.append({"phase": "install_requirements", **install_attempt})
             if install_attempt["returncode"] != 0:
                 write_json(raw_result_path, {"status": "failed", "domain": domain, "attempts": attempts})
-                return HarnessRunResult(
+                return _attach_token_usage(HarnessRunResult(
                     status="adapter_failed",
                     score=0.0,
                     pass_rate=0.0,
@@ -932,7 +942,7 @@ def run_generated_harness(
                     stderr_path=str(stderr_path),
                     raw_result_path=str(raw_result_path),
                     error="Generated harness requirements installation failed",
-                )
+                ), workspace, run_output_dir)
         scaffold_program = find_scaffold_program(workspace)
         if scaffold_program is not None and (
             should_prefer_scaffold_runtime(workspace) or not (workspace / "harness").is_dir()
@@ -971,7 +981,7 @@ def run_generated_harness(
                         "attempts": attempts,
                     },
                 )
-                return HarnessRunResult(
+                return _attach_token_usage(HarnessRunResult(
                     status="adapter_failed",
                     score=0.0,
                     pass_rate=0.0,
@@ -980,7 +990,7 @@ def run_generated_harness(
                     stderr_path=str(stderr_path),
                     raw_result_path=str(raw_result_path),
                     error=f"Generated harness command timed out after {timeout}s",
-                )
+                ), workspace, run_output_dir)
             if result.returncode == 0:
                 latest = _latest_text_file(run_output_dir, started_at) or _latest_text_file(workspace, started_at)
                 response_text = ""
@@ -1013,7 +1023,7 @@ def run_generated_harness(
                         "attempts": attempts,
                     },
                 )
-                return HarnessRunResult(
+                return _attach_token_usage(HarnessRunResult(
                     status="success",
                     score=1.0,
                     pass_rate=1.0,
@@ -1021,7 +1031,7 @@ def run_generated_harness(
                     stdout_path=str(stdout_path),
                     stderr_path=str(stderr_path),
                     raw_result_path=str(raw_result_path),
-                )
+                ), workspace, run_output_dir, artifacts_dir)
 
         if scaffold_program is not None:
             return _run_scaffold_program(
@@ -1038,7 +1048,7 @@ def run_generated_harness(
             )
 
         write_json(raw_result_path, {"status": "failed", "domain": domain, "attempts": attempts})
-        return HarnessRunResult(
+        return _attach_token_usage(HarnessRunResult(
             status="adapter_failed",
             score=0.0,
             pass_rate=0.0,
@@ -1047,7 +1057,7 @@ def run_generated_harness(
             stderr_path=str(stderr_path),
             raw_result_path=str(raw_result_path),
             error="All generated harness invocation patterns failed",
-        )
+        ), workspace, run_output_dir)
 
 
 def main() -> None:

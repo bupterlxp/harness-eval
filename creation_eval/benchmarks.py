@@ -18,6 +18,11 @@ from typing import Any
 
 from .adapter import run_generated_harness
 from .schema import HarnessArtifact, HarnessRunResult, ValidationResult
+from .token_usage import (
+    extract_harness_token_usage,
+    extract_harness_token_usage_from_result,
+    merge_token_usages,
+)
 from .utils import read_json, run_command, which_missing, write_json, write_jsonl
 
 
@@ -161,6 +166,62 @@ def _avg_float(values: list[str]) -> float | None:
     return statistics.mean(floats)
 
 
+def _token_total(usage: dict[str, Any] | None) -> int | None:
+    if not usage:
+        return None
+    value = usage.get("total_tokens")
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _result_token_usage(result: HarnessRunResult) -> dict[str, Any]:
+    if result.token_breakdown:
+        return result.token_breakdown
+    usage = extract_harness_token_usage_from_result(result)
+    if usage:
+        result.token_breakdown = usage
+        total = _token_total(usage)
+        if total is not None:
+            result.harness_run_tokens = total
+    return usage
+
+
+def _aggregate_harness_tokens(results: list[HarnessRunResult]) -> tuple[int | None, dict[str, Any]]:
+    usages = []
+    per_task = []
+    for index, result in enumerate(results):
+        usage = _result_token_usage(result)
+        total = _token_total(usage)
+        if total is None:
+            total = result.tokens if result.tokens is not None else result.harness_run_tokens
+        if total is not None:
+            usage = {**(usage or {}), "total_tokens": int(total)}
+            usages.append(usage)
+        per_task.append(
+            {
+                "index": index,
+                "status": result.status,
+                "tokens": int(total) if total is not None else None,
+                "raw_result_path": result.raw_result_path,
+            }
+        )
+    merged = merge_token_usages(usages)
+    if per_task:
+        merged["per_task"] = per_task
+    total = _token_total(merged)
+    return total, merged
+
+
+def _apply_result_token_fallback(result: HarnessRunResult, *paths: str | Path | None) -> HarnessRunResult:
+    usage = result.token_breakdown or extract_harness_token_usage_from_result(result) or extract_harness_token_usage(*paths)
+    total = _token_total(usage)
+    if total is not None:
+        result.harness_run_tokens = total
+        result.token_breakdown = usage
+    return result
+
+
 def _parse_eqbench_csv(csv_path: Path) -> HarnessRunResult:
     if not csv_path.exists():
         return HarnessRunResult(status="failed", error=f"Missing EQ-Bench summary CSV: {csv_path}")
@@ -168,13 +229,27 @@ def _parse_eqbench_csv(csv_path: Path) -> HarnessRunResult:
     scored = [row for row in rows if row.get("score_100")]
     avg_score = _avg_float([row.get("score_100", "") for row in scored])
     total_tokens = _avg_float([row.get("agent_total_tokens", "") for row in rows])
+    input_tokens = _avg_float([row.get("input_tokens", "") or row.get("agent_input_tokens", "") for row in rows])
+    output_tokens = _avg_float([row.get("output_tokens", "") or row.get("agent_output_tokens", "") for row in rows])
+    reasoning_tokens = _avg_float([row.get("reasoning_tokens", "") or row.get("agent_reasoning_tokens", "") for row in rows])
     interactions = _avg_float([row.get("agent_invocations", "") for row in rows])
+    token_breakdown = {}
+    if total_tokens is not None:
+        token_breakdown = {
+            "total_tokens": int(total_tokens),
+            "input_tokens": int(input_tokens) if input_tokens is not None else None,
+            "output_tokens": int(output_tokens) if output_tokens is not None else None,
+            "reasoning_tokens": int(reasoning_tokens) if reasoning_tokens is not None else None,
+            "source_files": [str(csv_path)],
+            "source": "eqbench_summary_csv.agent_tokens",
+        }
     pass_rate = len(scored) / len(rows) if rows else None
     return HarnessRunResult(
         status="success" if scored else "failed",
         score=avg_score,
         pass_rate=pass_rate,
         harness_run_tokens=int(total_tokens) if total_tokens is not None else None,
+        token_breakdown={key: value for key, value in token_breakdown.items() if value is not None},
         interactions=int(interactions) if interactions is not None else None,
         raw_result_path=str(csv_path),
         score_breakdown={
@@ -229,13 +304,22 @@ def _parse_benchmark_report(report_path: Path) -> HarnessRunResult:
     total_tokens = None
     prompt_tokens = aggregate.get("total_prompt_tokens")
     completion_tokens = aggregate.get("total_completion_tokens")
+    token_breakdown: dict[str, Any] = {}
     if isinstance(prompt_tokens, int) or isinstance(completion_tokens, int):
         total_tokens = int(prompt_tokens or 0) + int(completion_tokens or 0)
+        token_breakdown = {
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": total_tokens,
+            "source_files": [str(report_path)],
+            "source": "benchmark_report.aggregate_metrics",
+        }
     return HarnessRunResult(
         status="success" if submitted else "failed",
         score=pass_rate,
         pass_rate=pass_rate,
         harness_run_tokens=total_tokens,
+        token_breakdown=token_breakdown,
         raw_result_path=str(report_path),
         score_breakdown={
             "metric": "resolved_instances / submitted_instances",
@@ -1050,6 +1134,7 @@ def run_dacomp_generated(
     rows = list(csv.DictReader(overall.open("r", encoding="utf-8"))) if overall.exists() else []
     total = None
     breakdown: dict[str, Any] = {"tasks": [task["instance_id"] for task in tasks], "metric": "DAComp weighted total"}
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
     if rows:
         row = rows[0]
         breakdown.update(row)
@@ -1064,6 +1149,8 @@ def run_dacomp_generated(
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
         score_breakdown=breakdown,
+        harness_run_tokens=harness_tokens,
+        token_breakdown=token_breakdown,
         interactions=len(adapter_results),
     )
 
@@ -1149,6 +1236,7 @@ Response:
                 except (TypeError, ValueError):
                     continue
     score = statistics.mean(numeric_scores) * 10 if numeric_scores else None
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
     return HarnessRunResult(
         status="success" if score is not None else "failed",
         score=score,
@@ -1156,8 +1244,14 @@ Response:
         raw_result_path=str(scores_path),
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
-        harness_run_tokens=total_judge_tokens or None,
-        score_breakdown={"metric": "WritingBench average criterion score x10", "queries": len(selected), "criterion_scores": len(numeric_scores)},
+        harness_run_tokens=harness_tokens,
+        token_breakdown=token_breakdown,
+        score_breakdown={
+            "metric": "WritingBench average criterion score x10",
+            "queries": len(selected),
+            "criterion_scores": len(numeric_scores),
+            "judge_tokens": total_judge_tokens or None,
+        },
         interactions=len(adapter_results),
     )
 
@@ -1233,6 +1327,7 @@ def run_deepresearch_generated(
     stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
     stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
     status = "success" if accuracy is not None else ("adapter_failed" if adapter_failures else "failed")
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
     return HarnessRunResult(
         status=status,
         score=accuracy,
@@ -1240,8 +1335,14 @@ def run_deepresearch_generated(
         raw_result_path=str(report_path),
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
-        harness_run_tokens=total_judge_tokens or None,
-        score_breakdown={"metric": "HLE-style short-answer judge accuracy", "items": len(rows), "adapter_failures": adapter_failures},
+        harness_run_tokens=harness_tokens,
+        token_breakdown=token_breakdown,
+        score_breakdown={
+            "metric": "HLE-style short-answer judge accuracy",
+            "items": len(rows),
+            "adapter_failures": adapter_failures,
+            "judge_tokens": total_judge_tokens or None,
+        },
         interactions=len(adapter_results),
     )
 
@@ -1373,6 +1474,7 @@ def run_browsecomp_generated(
     stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
     stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
     status = "success" if accuracy is not None else ("adapter_failed" if adapter_failures else "failed")
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
     return HarnessRunResult(
         status=status,
         score=accuracy,
@@ -1380,8 +1482,14 @@ def run_browsecomp_generated(
         raw_result_path=str(report_path),
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
-        harness_run_tokens=total_judge_tokens or None,
-        score_breakdown={"metric": "BrowseComp accuracy with encrypted official answer set", "items": len(predictions), "adapter_failures": adapter_failures},
+        harness_run_tokens=harness_tokens,
+        token_breakdown=token_breakdown,
+        score_breakdown={
+            "metric": "BrowseComp accuracy with encrypted official answer set",
+            "items": len(predictions),
+            "adapter_failures": adapter_failures,
+            "judge_tokens": total_judge_tokens or None,
+        },
         interactions=len(adapter_results),
     )
 
@@ -1431,6 +1539,7 @@ print(json.dumps(reg.list_competition_ids()))
         scores: list[float] = []
         missing_dependencies: list[str] = []
         total_interactions = 0
+        child_token_usages: list[dict[str, Any]] = []
         for competition_id in competition_ids:
             child_entry = {**entry, "competition_id": competition_id}
             child_output = output_dir / "competitions" / str(competition_id)
@@ -1444,6 +1553,11 @@ print(json.dumps(reg.list_competition_ids()))
                 dry_run=False,
             )
             total_interactions += child_result.interactions or 0
+            child_usage = _result_token_usage(child_result)
+            if child_usage or child_result.harness_run_tokens is not None:
+                if child_result.harness_run_tokens is not None:
+                    child_usage = {**(child_usage or {}), "total_tokens": child_result.harness_run_tokens}
+                child_token_usages.append(child_usage)
             if child_result.stdout_path and Path(child_result.stdout_path).exists():
                 stdout_parts.append(f"=== {competition_id} ===\n" + Path(child_result.stdout_path).read_text(encoding="utf-8", errors="replace"))
             if child_result.stderr_path and Path(child_result.stderr_path).exists():
@@ -1457,6 +1571,7 @@ print(json.dumps(reg.list_competition_ids()))
                     "status": child_result.status,
                     "score": child_result.score,
                     "raw_result_path": child_result.raw_result_path,
+                    "harness_run_tokens": child_result.harness_run_tokens,
                     "missing_dependencies": child_result.missing_dependencies,
                     "error": child_result.error,
                 }
@@ -1473,6 +1588,7 @@ print(json.dumps(reg.list_competition_ids()))
         stdout_path.write_text("\n\n".join(stdout_parts), encoding="utf-8")
         stderr_path.write_text("\n\n".join(stderr_parts), encoding="utf-8")
         status = "success" if scores else ("skipped/missing_dependency" if missing_dependencies else "failed")
+        token_breakdown = merge_token_usages(child_token_usages)
         return HarnessRunResult(
             status=status,
             score=report["score"],
@@ -1481,6 +1597,8 @@ print(json.dumps(reg.list_competition_ids()))
             stderr_path=str(stderr_path),
             missing_dependencies=missing_dependencies[:50],
             score_breakdown={"metric": "MLE-bench mean grade_csv score over competitions", **report},
+            harness_run_tokens=_token_total(token_breakdown),
+            token_breakdown=token_breakdown,
             interactions=total_interactions,
         )
 
@@ -1564,6 +1682,8 @@ print(json.dumps({{
             stderr_path=str(stderr_path),
             error="Generated harness did not produce a submission CSV",
             score_breakdown={"metric": "MLE-bench no-submission zero score", **report},
+            harness_run_tokens=result.harness_run_tokens,
+            token_breakdown=_result_token_usage(result),
             interactions=1,
         )
     submission = csv_candidates[0]
@@ -1621,6 +1741,8 @@ print(json.dumps(payload, default=str))
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
         score_breakdown={"metric": "MLE-bench grade_csv score", "competition_id": competition_id, **report},
+        harness_run_tokens=result.harness_run_tokens,
+        token_breakdown=_result_token_usage(result),
         interactions=1,
     )
 
@@ -1675,6 +1797,7 @@ def run_the_agent_company_generated(
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         missing_dependencies: list[str] = []
+        child_token_usages: list[dict[str, Any]] = []
         for image in task_images:
             task_name = image.split("/")[-1].split(":")[0].replace("-image", "")
             child_entry = {**entry, "task_image_name": image}
@@ -1694,12 +1817,18 @@ def run_the_agent_company_generated(
                 stderr_parts.append(f"=== {image} ===\n" + Path(child_result.stderr_path).read_text(encoding="utf-8", errors="replace"))
             if child_result.score is not None:
                 scores.append(float(child_result.score))
+            child_usage = _result_token_usage(child_result)
+            if child_usage or child_result.harness_run_tokens is not None:
+                if child_result.harness_run_tokens is not None:
+                    child_usage = {**(child_usage or {}), "total_tokens": child_result.harness_run_tokens}
+                child_token_usages.append(child_usage)
             missing_dependencies.extend(child_result.missing_dependencies or [])
             child_results.append(
                 {
                     "task_image": image,
                     "status": child_result.status,
                     "score": child_result.score,
+                    "harness_run_tokens": child_result.harness_run_tokens,
                     "raw_result_path": child_result.raw_result_path,
                     "missing_dependencies": child_result.missing_dependencies,
                     "error": child_result.error,
@@ -1717,6 +1846,7 @@ def run_the_agent_company_generated(
         stdout_path.write_text("\n\n".join(stdout_parts), encoding="utf-8")
         stderr_path.write_text("\n\n".join(stderr_parts), encoding="utf-8")
         status = "success" if scores else ("skipped/missing_dependency" if missing_dependencies else "failed")
+        token_breakdown = merge_token_usages(child_token_usages)
         return HarnessRunResult(
             status=status,
             score=report["score"],
@@ -1726,6 +1856,8 @@ def run_the_agent_company_generated(
             stderr_path=str(stderr_path),
             missing_dependencies=missing_dependencies[:50],
             score_breakdown={"metric": "TheAgentCompany mean final_score.result / total over task images", **report},
+            harness_run_tokens=_token_total(token_breakdown),
+            token_breakdown=token_breakdown,
             interactions=len(task_images),
         )
 
@@ -1886,6 +2018,8 @@ def run_the_agent_company_generated(
             stderr_path=str(stderr_path),
             error=evaluate.stderr[-2000:] or evaluate.stdout[-2000:],
             score_breakdown={"stage": "evaluator", "task_image": task_image, "adapter_status": adapter_result.status},
+            harness_run_tokens=adapter_result.harness_run_tokens,
+            token_breakdown=_result_token_usage(adapter_result),
             interactions=1,
         )
     result = read_json(eval_result_path) if eval_result_path.exists() else {}
@@ -1914,6 +2048,8 @@ def run_the_agent_company_generated(
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
         score_breakdown={"metric": "TheAgentCompany final_score.result / total", "task_image": task_image, **final},
+        harness_run_tokens=adapter_result.harness_run_tokens,
+        token_breakdown=_result_token_usage(adapter_result),
         interactions=1,
     )
 
@@ -2086,6 +2222,8 @@ def base_row(
         end_to_end_score = result.score
     else:
         end_to_end_score = 0.0
+    result = _apply_result_token_fallback(result)
+    harness_tokens = result.tokens if result.tokens is not None else result.harness_run_tokens
     return {
         "generation_model": artifact.generation_model,
         "eval_model": validation.meta.get("eval_model") or "",
@@ -2122,7 +2260,8 @@ def base_row(
         "pass_rate": result.pass_rate,
         "win_rate": result.win_rate,
         "reward": result.reward,
-        "harness_run_tokens": result.tokens if result.tokens is not None else result.harness_run_tokens,
+        "harness_run_tokens": harness_tokens,
+        "harness_run_token_breakdown": result.token_breakdown,
         "harness_run_interactions": result.interactions,
         "generation_tokens": validation.generation_tokens,
         "missing_dependencies": result.missing_dependencies or validation.missing_dependencies,
