@@ -163,6 +163,78 @@ python tools/analyze_creation_quality.py \
 - `creation_quality_comparison.csv`
 - `creation_quality_report.md`
 
+### RQ2：Harness Self-Evolve
+
+`run_self_evolve.py` 是第二阶段 Harness-Evolve runner。它不重新 creation，而是从已经生成好的 base artifact 出发，让 meta harness 修改现有 harness，然后继续调用 `run_creation_eval.py` 做 downstream BMK eval。
+
+当前以 `codebyt/self-evolve` 为主干，`codex/rq1-readiness@9be977b` 只作为 RQ1 token usage 参考 commit；不要普通 merge 该分支，避免把无关历史或 `outputs/` 差异带入。当前主线已经具备等价的 downstream token usage 能力，并在 self-evolve summary 中区分：
+
+| 字段 | 含义 |
+|---|---|
+| `creation_or_evolve_tokens` | creation 或每轮 evolve 的 meta harness token 消耗 |
+| `eval_harness_run_tokens` | generated/evolved harness 配合 eval LLM 跑 downstream BMK 的 token 消耗 |
+| `eval_judge_tokens` | downstream judge / grader 的 token 消耗 |
+| `eval_total_tokens` | harness run token 与 judge token 的合计 |
+
+RQ2-A commit-guided evolution：
+
+```bash
+.venv/bin/python run_self_evolve.py config.yaml \
+  --mode commit \
+  --base-generation-output outputs/<rq1_run_id> \
+  --task-id code-agent-harness \
+  --creation-profile claude_code_scaffold_native \
+  --evolution-tasks-file self_evolve/tasks/<tasks>.jsonl \
+  --max-tasks-per-harness 10 \
+  --eval-bench terminal_2_bench \
+  --run-id rq2a-code-terminal
+```
+
+`--max-tasks-per-harness` 只作用于 JSONL/结构化任务输入，字段来源依次为 `harness`、`repo`、`source_harness`，缺失时归入 `unknown` 并在 summary 里记录 warning。当前人类可读任务清单可用下面命令校验每个 harness 是否在 10 个 fused updates 以内：
+
+```bash
+tools/validate_fused_update_counts.py \
+  "/Users/bytedance/Downloads/harness evolve project/outputs/pr_fused_harness_updates/five_domain_pr_fused_updates.md" \
+  --max-per-harness 10
+```
+
+RQ2-B target-driven self-evolve：
+
+```bash
+.venv/bin/python run_self_evolve.py config.yaml \
+  --mode goal \
+  --base-generation-output outputs/<rq1_run_id> \
+  --task-id data-analysis-harness \
+  --creation-profile claude_code_scaffold_native \
+  --goal-preset mle_bench \
+  --rounds 30 \
+  --eval-bench mle_bench \
+  --run-id rq2b-data-mle
+```
+
+内置 `--goal-preset` 包括 `terminal_2_bench`、`mle_bench`、`browsecomp`。如果显式传入 `--goal`，会完全覆盖 preset。goal prompt 只写高层目标和合法边界，不写 hidden score、hidden answer 或总轮数；`--rounds` 只在实验层截断。
+
+每轮输出位于 `self_evolve_outputs/<run_id>/`：
+
+| 文件 | 含义 |
+|---|---|
+| `rounds.csv` / `rounds.jsonl` / `rounds.json` | 每轮 score、token、gate、best、regression、plateau 字段 |
+| `summary.json` | self-evolve run 摘要 |
+| `experiment_summary.json` | 与 `summary.json` 等价，供后续实验脚本稳定读取 |
+| `artifacts/round_*` | 每轮 harness snapshot |
+| `eval_results/` | 每轮 downstream BMK eval 原始 summary |
+
+curve 字段口径：
+
+| 字段 | 含义 |
+|---|---|
+| `score_delta_from_base` | 当前轮 score 减 base 轮 score |
+| `score_delta_from_previous` | 当前轮 score 减上一轮有分数的 score |
+| `best_score_so_far` / `best_round` | 截至当前轮的 best checkpoint |
+| `regression_from_previous` | 当前分数低于上一轮超过 `--plateau-min-delta` |
+| `round_to_plateau` | 默认连续 `--plateau-patience 3` 个完成 eval 的 evolution round 没有提升 best score 时的停滞起点 |
+| `cost_adjusted_gain` | 相对 base 的 score gain 除以本轮 evolve+eval total tokens |
+
 ### 两层结构
 
 ```

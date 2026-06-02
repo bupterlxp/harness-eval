@@ -15,7 +15,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from creation_eval.utils import load_env_file, read_json, write_json
+from creation_eval.scaffold_runtime import (
+    find_scaffold_program,
+    has_scaffold_manifest,
+    should_prefer_scaffold_runtime,
+)
+from creation_eval.utils import load_env_file, read_json, write_json, write_jsonl
 from creation_eval.validator import discover_harness_artifacts
 from creation_eval.token_usage import merge_token_usages, normalize_usage
 from run import (
@@ -93,6 +98,31 @@ DIRECT_TOKEN_KEYS = {
     "agent_reasoning_tokens",
     "harness_run_tokens",
     "tokens",
+}
+
+CREATION_PROFILE_CHOICES = [
+    "freeform",
+    "interface",
+    "interface_tool",
+    "interface-tool",
+    "full_loop",
+    "full-loop",
+    "claude_code_scaffold",
+    "claude-code-scaffold",
+    "claude_code_scaffold_native",
+    "claude-code-scaffold-native",
+]
+
+GOAL_PRESETS = {
+    "terminal_2_bench": """Improve this code-agent harness on Terminal 2.0 style development evaluation.
+
+Your objective is to make the harness more reliable on real terminal/repo-editing tasks: inspect the workspace, plan edits, use shell and file tools safely, run verifiers, recover from failures, and write valid result/trajectory artifacts. Optimize legitimate downstream performance and robustness, not superficial public-gate compliance.""",
+    "mle_bench": """Improve this data-analysis / MLE harness on MLE-bench style development evaluation.
+
+Your objective is to make the harness more reliable on real machine-learning tasks: inspect datasets, infer the submission contract, build a sensible validation strategy, train or baseline models when feasible, produce benchmark-readable submissions, check artifacts, and report useful diagnostics. Optimize legitimate downstream performance and robustness, not hidden-label leakage or hardcoded outputs.""",
+    "browsecomp": """Improve this research-agent harness on BrowseComp style development evaluation.
+
+Your objective is to make the harness more reliable on browse-and-research tasks: decompose queries, search broadly, track evidence, handle contradictions, synthesize concise answers, verify claims, retry when evidence is weak, and write answer/evidence traces. Optimize legitimate downstream performance and robustness, not memorized question IDs or cached answers.""",
 }
 
 
@@ -285,6 +315,163 @@ def cost_adjusted_gain(score: Any, baseline_score: Any, tokens: Any) -> float | 
     return float(score_value - baseline_value) / float(token_value)
 
 
+def score_value(row: dict[str, Any]) -> float | None:
+    for key in ("avg_end_to_end_score", "avg_score"):
+        value = as_number(row.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def eval_gate_failed(rows: list[dict[str, Any]], status_counts: dict[str, int]) -> bool:
+    for row in rows:
+        if row.get("gate_pass") is False:
+            return True
+        status = str(row.get("eval_status") or "").lower()
+        if "gate" in status and ("fail" in status or "skip" in status):
+            return True
+    return any("gate" in str(status).lower() and ("fail" in str(status).lower() or "skip" in str(status).lower()) for status in status_counts)
+
+
+def detect_artifact_contract(artifact_dir: Path, creation_profile: str | None = None) -> dict[str, Any]:
+    artifact_dir = artifact_dir.resolve()
+    program = find_scaffold_program(artifact_dir)
+    manifest = has_scaffold_manifest(artifact_dir)
+    prefer_scaffold = bool(program and should_prefer_scaffold_runtime(artifact_dir, creation_profile))
+    has_legacy = (artifact_dir / "harness").is_dir()
+    if prefer_scaffold or (program and not has_legacy):
+        kind = "scaffold_native"
+    elif has_legacy:
+        kind = "legacy_harness"
+    elif program:
+        kind = "scaffold_program"
+    else:
+        kind = "unknown"
+    return {
+        "kind": kind,
+        "has_legacy_harness": has_legacy,
+        "has_scaffold_manifest": manifest,
+        "scaffold_program": str(program.relative_to(artifact_dir)) if program and program.is_relative_to(artifact_dir) else (str(program) if program else ""),
+    }
+
+
+def artifact_contract_prompt(contract: dict[str, Any]) -> str:
+    if contract.get("kind") in {"scaffold_native", "scaffold_program"}:
+        return """- Preserve the scaffold-native artifact contract. Keep `generated_program.py` or the manifest-declared program, `scaffold_manifest.json`, and the available `harness_scaffold/` runtime usable.
+- You may improve the generated program and add supporting modules, but do not delete or bypass the scaffold runtime contract unless you also leave a compatible adapter path.
+- The downstream adapter may run the scaffold CLI/program contract instead of `python -m harness`; keep result/trajectory/log artifacts valid."""
+    if contract.get("kind") == "legacy_harness":
+        return """- Preserve the legacy generated harness contract under `harness/`.
+- Keep `python -m harness` or `python -m harness.cli` runnable with prompt/task input, workdir/workspace, output-dir, and max-steps/max-turns style arguments."""
+    return """- Preserve the current generated harness artifact structure and keep it discoverable by downstream eval adapters.
+- If you use scaffold-native files, keep `generated_program.py`, `scaffold_manifest.json`, and `harness_scaffold/` usable; if you use a legacy harness, keep `harness/` and `python -m harness` usable."""
+
+
+def resolve_goal(args: argparse.Namespace, domain: str) -> str:
+    if args.goal:
+        return str(args.goal)
+    if args.goal_preset:
+        return GOAL_PRESETS[args.goal_preset]
+    return (
+        f"Improve legitimate downstream benchmark performance for domain={domain}, "
+        f"bench={args.eval_bench}. Focus on robust hidden-task behavior while preserving the public execution contract."
+    )
+
+
+def task_harness_key(task_unit: dict[str, Any]) -> tuple[str, str | None]:
+    for key in ("harness", "repo", "source_harness"):
+        value = task_unit.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), None
+    return "unknown", "missing harness/repo/source_harness field; grouped under unknown"
+
+
+def limit_tasks_per_harness(tasks: list[dict[str, Any]], max_per_harness: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    counts: dict[str, int] = {}
+    selected: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    skipped = 0
+    for task in tasks:
+        harness, warning = task_harness_key(task)
+        if warning and warning not in warnings:
+            warnings.append(warning)
+        current = counts.get(harness, 0)
+        if current >= max_per_harness:
+            skipped += 1
+            continue
+        counts[harness] = current + 1
+        selected.append(task)
+    return selected, {"counts": counts, "max_per_harness": max_per_harness, "skipped": skipped, "warnings": warnings}
+
+
+def annotate_round_metrics(rows: list[dict[str, Any]], *, plateau_patience: int, plateau_min_delta: float) -> dict[str, Any]:
+    baseline = score_value(rows[0]) if rows else None
+    best_score = baseline
+    best_round = int(rows[0].get("round", 0)) if rows and baseline is not None else None
+    previous_score: float | None = None
+    stagnant_start: int | None = None
+    stagnant_count = 0
+    plateau_round: int | None = None
+    score_curve: list[dict[str, Any]] = []
+
+    for row in rows:
+        round_index = int(row.get("round", 0) or 0)
+        current_score = score_value(row)
+        row["score_delta_from_base"] = (
+            current_score - baseline if current_score is not None and baseline is not None else None
+        )
+        row["score_delta_from_previous"] = (
+            current_score - previous_score if current_score is not None and previous_score is not None else None
+        )
+        row["regression_from_previous"] = (
+            bool(current_score < previous_score - plateau_min_delta)
+            if current_score is not None and previous_score is not None
+            else False
+        )
+        if current_score is not None:
+            if best_score is None or current_score > best_score + plateau_min_delta:
+                best_score = current_score
+                best_round = round_index
+                stagnant_count = 0
+                stagnant_start = None
+            elif round_index > 0:
+                if stagnant_count == 0:
+                    stagnant_start = round_index
+                stagnant_count += 1
+                if plateau_round is None and stagnant_count >= plateau_patience:
+                    plateau_round = stagnant_start
+            previous_score = current_score
+        row["best_score_so_far"] = best_score
+        row["best_round"] = best_round
+        row["round_to_plateau"] = plateau_round
+        score_curve.append(
+            {
+                "round": round_index,
+                "score": row.get("avg_score"),
+                "end_to_end_score": row.get("avg_end_to_end_score"),
+                "best_score_so_far": best_score,
+                "best_round": best_round,
+            }
+        )
+
+    for row in rows:
+        row["round_to_plateau"] = plateau_round
+
+    regressions = sum(1 for row in rows if row.get("regression_from_previous"))
+    gate_failures = sum(1 for row in rows if row.get("gate_fail"))
+    return {
+        "base_score": baseline,
+        "best_score": best_score,
+        "best_round": best_round,
+        "round_to_plateau": plateau_round,
+        "plateau_patience": plateau_patience,
+        "plateau_min_delta": plateau_min_delta,
+        "regression_count": regressions,
+        "gate_fail_count": gate_failures,
+        "score_curve": score_curve,
+    }
+
+
 def copy_tree_contents(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
@@ -359,7 +546,17 @@ def task_instruction(task_unit: dict[str, Any]) -> str:
     return json.dumps(sanitize_task_unit(task_unit), ensure_ascii=False, indent=2)
 
 
-def prompt_header(artifact_task_id: str, domain: str, args: argparse.Namespace, config: dict[str, Any]) -> str:
+def prompt_header(
+    artifact_task_id: str,
+    domain: str,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    artifact_dir: Path | None = None,
+) -> str:
+    contract = detect_artifact_contract(
+        artifact_dir or Path.cwd(),
+        str(config.get("creation_profile") or ""),
+    )
     return f"""# Harness Self-Evolve Round
 
 You are editing an existing generated harness, not solving a single downstream benchmark instance.
@@ -369,12 +566,11 @@ Domain: {domain}
 Meta harness: {config.get("meta_harness")}
 Generation model: {config.get("model_name")}
 Creation profile: {config.get("creation_profile")}
+Artifact contract kind: {contract.get("kind")}
 
 ## Non-negotiable contract
 
-- Keep the generated harness runnable as a standard artifact under `harness/`.
-- Preserve the CLI contract expected by downstream eval adapters:
-  `python -m harness` or `python -m harness.cli`, with support for prompt/task input, workdir/workspace, output-dir, and max-steps/max-turns style arguments.
+{artifact_contract_prompt(contract)}
 - Preserve or improve `result.json`, `trajectory.jsonl`, stdout/stderr logging, and domain artifacts.
 - Do not hard-code benchmark answers, task ids, hidden test instances, or expected grader outputs.
 - Make reusable harness improvements: context management, tool policy, verifier, retry/recovery, state tracking, artifact writing, or cost control.
@@ -392,11 +588,12 @@ def build_commit_prompt(
     previous_eval_summary: dict[str, Any] | None,
     args: argparse.Namespace,
     config: dict[str, Any],
+    artifact_dir: Path | None = None,
 ) -> str:
     sanitized = sanitize_task_unit(task_unit)
     instruction = task_instruction(task_unit)
     return (
-        prompt_header(artifact_task_id, domain, args, config)
+        prompt_header(artifact_task_id, domain, args, config, artifact_dir)
         + f"""
 ## Mode: human-commit comparable evolution
 
@@ -432,10 +629,11 @@ def build_goal_prompt(
     previous_eval_summary: dict[str, Any] | None,
     args: argparse.Namespace,
     config: dict[str, Any],
+    artifact_dir: Path | None = None,
 ) -> str:
-    goal = args.goal or f"Improve downstream benchmark score for domain={domain}, bench={args.eval_bench}."
+    goal = resolve_goal(args, domain)
     return (
-        prompt_header(artifact_task_id, domain, args, config)
+        prompt_header(artifact_task_id, domain, args, config, artifact_dir)
         + f"""
 ## Mode: target-driven self-evolve
 
@@ -443,7 +641,7 @@ Goal:
 
 {goal}
 
-Round: {round_index} of {args.rounds}
+Current evolution round index: {round_index}
 Downstream eval domain: {args.eval_domain or domain}
 Downstream eval bench: {args.eval_bench}
 Eval model used by the generated harness: {config.get("eval_model_name") or config.get("model_name")}
@@ -489,6 +687,7 @@ def snapshot_artifact(
     if artifact_dir.exists():
         shutil.rmtree(artifact_dir)
     copy_tree_contents(workspace, artifact_dir)
+    artifact_contract = detect_artifact_contract(artifact_dir, str(config.get("creation_profile") or ""))
     meta = read_json(artifact_dir / "meta.json")
     meta.update(
         {
@@ -508,6 +707,7 @@ def snapshot_artifact(
             "eval_reasoning_effort": config.get("eval_reasoning_effort"),
             "creation_profile": config.get("creation_profile"),
             "pre_bmk_gate": config.get("pre_bmk_gate"),
+            "self_evolve_artifact_contract": artifact_contract,
             "stdout": stdout[-5000:] if stdout else "",
             "stderr": stderr[-5000:] if stderr else "",
         }
@@ -544,6 +744,7 @@ def summarize_eval(eval_dir: Path, returncode: int) -> dict[str, Any]:
         status = str(row.get("eval_status") or "unknown")
         statuses[status] = statuses.get(status, 0) + 1
     token_summary = aggregate_eval_tokens(rows)
+    gate_fail = eval_gate_failed(rows, statuses)
     return {
         "returncode": returncode,
         "eval_dir": str(eval_dir),
@@ -553,6 +754,7 @@ def summarize_eval(eval_dir: Path, returncode: int) -> dict[str, Any]:
         "status_counts": statuses,
         "avg_score": sum(scores) / len(scores) if scores else None,
         "avg_end_to_end_score": sum(e2e_scores) / len(e2e_scores) if e2e_scores else None,
+        "gate_fail": gate_fail,
         **token_summary,
         "rows_preview": rows[:5],
     }
@@ -656,6 +858,13 @@ def write_round_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "eval_status",
         "avg_score",
         "avg_end_to_end_score",
+        "score_delta_from_base",
+        "score_delta_from_previous",
+        "best_score_so_far",
+        "best_round",
+        "regression_from_previous",
+        "gate_fail",
+        "round_to_plateau",
         "creation_or_evolve_tokens",
         "eval_harness_run_tokens",
         "eval_judge_tokens",
@@ -685,8 +894,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=Path("self_evolve_outputs"))
     parser.add_argument("--rounds", type=int, default=None)
     parser.add_argument("--goal", default=None)
+    parser.add_argument("--goal-preset", choices=sorted(GOAL_PRESETS), default=None)
     parser.add_argument("--evolution-tasks-file", type=Path, default=None)
     parser.add_argument("--max-tasks", type=int, default=0)
+    parser.add_argument("--max-tasks-per-harness", type=int, default=0)
     parser.add_argument("--human-generation-output", type=Path, default=None, help="Optional human reference artifact to evaluate with the same BMK config.")
 
     parser.add_argument("--meta-harness", choices=["claude-code", "codex"], default=None)
@@ -699,7 +910,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default=None)
     parser.add_argument("--claude-model-name", default=None)
     parser.add_argument("--reasoning-effort", choices=["low", "medium", "high", "xhigh", "max"], default=None)
-    parser.add_argument("--creation-profile", choices=["freeform", "interface", "interface_tool", "interface-tool", "full_loop", "full-loop"], default=None)
+    parser.add_argument("--creation-profile", choices=CREATION_PROFILE_CHOICES, default=None)
 
     parser.add_argument("--eval-bench", default="all")
     parser.add_argument("--eval-domain", default=None)
@@ -716,6 +927,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pre-bmk-gate", choices=["off", "soft", "hard"], default=None)
     parser.add_argument("--harness-evolve-root", type=Path, default=Path("/Users/bytedance/Downloads/harness evolve project"))
     parser.add_argument("--timeout-minutes", type=int, default=None)
+    parser.add_argument("--plateau-patience", type=int, default=3)
+    parser.add_argument("--plateau-min-delta", type=float, default=1e-6)
     parser.add_argument("--keep-workspace", action="store_true")
     return parser.parse_args()
 
@@ -733,8 +946,13 @@ def main() -> int:
     args.mode = "commit" if args.mode == "human-commit" else args.mode
     args.rounds = int(args.rounds if args.rounds is not None else self_cfg.get("rounds", 3))
     args.goal = args.goal if args.goal is not None else self_cfg.get("goal")
+    args.goal_preset = args.goal_preset if args.goal_preset is not None else self_cfg.get("goal_preset")
+    if args.goal_preset and args.goal_preset not in GOAL_PRESETS:
+        raise SystemExit(f"Unsupported --goal-preset={args.goal_preset!r}. Choose one of: {', '.join(sorted(GOAL_PRESETS))}")
     if args.evolution_tasks_file is None and self_cfg.get("evolution_tasks_file"):
         args.evolution_tasks_file = Path(str(self_cfg["evolution_tasks_file"]))
+    if not args.max_tasks_per_harness and self_cfg.get("max_tasks_per_harness"):
+        args.max_tasks_per_harness = int(self_cfg["max_tasks_per_harness"])
 
     config = apply_cli_overrides(config, args)
     config = resolve_config_models(config)
@@ -762,12 +980,20 @@ def main() -> int:
         build_docker_image()
 
     rounds: list[dict[str, Any]]
+    task_selection_summary: dict[str, Any] = {}
     if args.mode == "commit":
         if not args.evolution_tasks_file:
             raise SystemExit("--evolution-tasks-file is required for --mode commit")
         rounds = read_jsonl(args.evolution_tasks_file)
+        input_count = len(rounds)
+        task_selection_summary = {"input_count": input_count, "warnings": []}
+        if args.max_tasks_per_harness:
+            rounds, task_selection_summary = limit_tasks_per_harness(rounds, args.max_tasks_per_harness)
+            task_selection_summary["input_count"] = input_count
         if args.max_tasks:
             rounds = rounds[: args.max_tasks]
+            task_selection_summary["global_max_tasks"] = args.max_tasks
+        task_selection_summary["selected_count"] = len(rounds)
     else:
         rounds = [{} for _ in range(args.rounds)]
 
@@ -789,8 +1015,13 @@ def main() -> int:
         "pre_bmk_gate": config.get("pre_bmk_gate"),
         "eval_bench": args.eval_bench,
         "eval_domain": args.eval_domain or base_artifact.domain,
-        "goal": args.goal,
+        "goal": resolve_goal(args, base_artifact.domain),
+        "goal_preset": args.goal_preset,
         "round_count": len(rounds),
+        "max_tasks_per_harness": args.max_tasks_per_harness,
+        "task_selection": task_selection_summary,
+        "plateau_patience": args.plateau_patience,
+        "plateau_min_delta": args.plateau_min_delta,
     }
     write_json(run_root / "run_config.json", run_config)
 
@@ -824,6 +1055,7 @@ def main() -> int:
             "eval_status": baseline_eval.get("status"),
             "avg_score": baseline_eval.get("avg_score"),
             "avg_end_to_end_score": baseline_eval.get("avg_end_to_end_score"),
+            "gate_fail": baseline_eval.get("gate_fail"),
             "creation_or_evolve_tokens": baseline_generation_tokens,
             "creation_or_evolve_token_breakdown": baseline_generation_usage,
             "eval_harness_run_tokens": baseline_eval.get("eval_harness_run_tokens"),
@@ -848,6 +1080,7 @@ def main() -> int:
                 previous_eval_summary,
                 args,
                 config,
+                workspace,
             )
         else:
             round_name = f"target_goal_{index}"
@@ -858,6 +1091,7 @@ def main() -> int:
                 previous_eval_summary,
                 args,
                 config,
+                workspace,
             )
         prompt_path = prompts_root / f"round_{index:03d}_{safe_name(round_name)}.md"
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -906,6 +1140,7 @@ def main() -> int:
                 "eval_status": eval_summary.get("status"),
                 "avg_score": eval_summary.get("avg_score"),
                 "avg_end_to_end_score": eval_summary.get("avg_end_to_end_score"),
+                "gate_fail": eval_summary.get("gate_fail"),
                 "creation_or_evolve_tokens": evolve_tokens,
                 "creation_or_evolve_token_breakdown": evolve_usage,
                 "eval_harness_run_tokens": eval_summary.get("eval_harness_run_tokens"),
@@ -924,7 +1159,13 @@ def main() -> int:
         human_artifact = select_artifact(args.human_generation_output, args.task_id)
         human_eval = run_downstream_eval(human_artifact.path, "human_reference", args, config, run_root)
 
+    curve_summary = annotate_round_metrics(
+        round_rows,
+        plateau_patience=args.plateau_patience,
+        plateau_min_delta=args.plateau_min_delta,
+    )
     write_json(run_root / "rounds.json", round_rows)
+    write_jsonl(run_root / "rounds.jsonl", round_rows)
     write_round_csv(run_root / "rounds.csv", round_rows)
     summary = {
         "run_id": args.run_id,
@@ -934,6 +1175,8 @@ def main() -> int:
         "rounds": round_rows,
         "final_artifact": round_rows[-1]["artifact_path"] if round_rows else str(baseline_artifact),
         "human_reference_eval": human_eval,
+        "curve_summary": curve_summary,
+        "task_selection": task_selection_summary,
         "token_totals": {
             "creation_or_evolve_tokens": sum_numeric([row.get("creation_or_evolve_tokens") for row in round_rows]),
             "eval_harness_run_tokens": sum_numeric([row.get("eval_harness_run_tokens") for row in round_rows]),
@@ -942,10 +1185,12 @@ def main() -> int:
         },
     }
     write_json(run_root / "summary.json", summary)
+    write_json(run_root / "experiment_summary.json", summary)
     if not args.keep_workspace:
         shutil.rmtree(workspace, ignore_errors=True)
         summary["workspace"] = ""
         write_json(run_root / "summary.json", summary)
+        write_json(run_root / "experiment_summary.json", summary)
 
     print(json.dumps({"run_id": args.run_id, "run_root": str(run_root), "rounds": len(round_rows), "final_artifact": summary["final_artifact"]}, ensure_ascii=False, indent=2))
     return 0
