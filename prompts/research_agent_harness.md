@@ -2,6 +2,19 @@
 
 构建一个通用的深度研究 harness，能接受研究问题，自主完成信息检索、来源评估、证据组织和结构化报告生成。
 
+## Scaffold-native 最低实现要求
+
+如果当前 creation profile 是 `claude_code_scaffold_native`，工作区已经有 `generated_program.py`、`scaffold_manifest.json` 和 `harness_scaffold/`。你必须直接修改并实现 `generated_program.py` 中的 `GeneratedHarnessProgram.run(...)`，不能停留在 scaffold seed。
+
+必须满足：
+
+- 删除或替换 `raise NotImplementedError`、`TODO`、stub fallback；
+- `generated_program.py` 必须真实调用 `harness_scaffold` runtime，并驱动 query planning、search/fetch、evidence tracking、answer synthesis 和 verifier；
+- 可以新增模块，但新增模块必须被 `generated_program.py` 实际调用；
+- 不能只写 README、说明文档、helper 模块或未接入的工具；
+- 运行后必须写出 `result.json`、`trajectory.jsonl`、stdout/stderr 日志，以及 `answer.md` / `answer.json`、`sources.json`、`evidence.json` 或等价 citation trace；
+- 如果 search API 不可用，必须结构化记录缺失依赖并输出 `partial`，不能伪造 citation、URL 或证据。
+
 ---
 
 ## 一、入口与输出
@@ -21,6 +34,17 @@ python -m harness -p "任务描述" --output-dir ./output/
     "trajectory": str,   # JSONL trajectory 文件路径
 }
 ```
+
+### Research BMK 必须满足的执行契约
+
+这个 harness 会直接接入 DeepResearch bench / BrowseComp 类研究任务。分数取决于答案是否正确且证据可追溯，而不是报告篇幅。因此必须做到：
+
+- 根据问题类型选择直接答案、结构化答案或报告，不能所有任务都输出冗长综述；
+- 每个事实性结论必须关联 evidence id、source URL 或可复查的来源摘要；
+- `sources.json` / `evidence.json` 必须记录 search query、source title、URL、抓取时间、支撑片段和质量判断；
+- `trajectory.jsonl` 必须记录 query decomposition、search/fetch、evidence_add、synthesis、verification 等关键步骤；
+- `success` 的最低条件是答案非空、证据 trace 非空、引用和最终答案一致；
+- 无证据、无 search trace、只靠模型常识生成的答案必须标记为 `partial` 或 `failed`。
 
 ---
 

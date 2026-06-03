@@ -2,6 +2,19 @@
 
 构建一个通用的代码智能体 harness，能接受软件工程任务描述（bug 修复、功能开发、重构等），自主完成代码修改并验证结果。
 
+## Scaffold-native 最低实现要求
+
+如果当前 creation profile 是 `claude_code_scaffold_native`，工作区已经有 `generated_program.py`、`scaffold_manifest.json` 和 `harness_scaffold/`。你必须直接修改并实现 `generated_program.py` 中的 `GeneratedHarnessProgram.run(...)`，不能停留在 scaffold seed。
+
+必须满足：
+
+- 删除或替换 `raise NotImplementedError`、`TODO`、stub fallback；
+- `generated_program.py` 必须真实调用 `harness_scaffold` runtime，并驱动代码任务的 inspect / edit / verify 流程；
+- 可以新增模块，但新增模块必须被 `generated_program.py` 实际调用；
+- 不能只写 README、说明文档、helper 模块或未接入的工具；
+- 运行后必须写出 `result.json`、`trajectory.jsonl`、stdout/stderr 日志，以及 patch、changed files、commands_run、test/verifier 结果；
+- 如果无法完全完成，也必须返回 `partial` 或 `failed` 并保留可诊断轨迹，不能空退出。
+
 ---
 
 ## 一、入口与输出

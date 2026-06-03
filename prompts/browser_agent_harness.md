@@ -2,6 +2,19 @@
 
 构建一个通用的浏览器自动化 harness，能接受 Web 任务描述（导航、表单填写、数据提取、文件下载等），自主在浏览器中完成多步骤操作。
 
+## Scaffold-native 最低实现要求
+
+如果当前 creation profile 是 `claude_code_scaffold_native`，工作区已经有 `generated_program.py`、`scaffold_manifest.json` 和 `harness_scaffold/`。你必须直接修改并实现 `generated_program.py` 中的 `GeneratedHarnessProgram.run(...)`，不能停留在 scaffold seed。
+
+必须满足：
+
+- 删除或替换 `raise NotImplementedError`、`TODO`、stub fallback；
+- `generated_program.py` 必须真实调用 `harness_scaffold` runtime，并驱动 browser action planning、state tracking、action execution、observation parsing 和 final result writing；
+- 可以新增模块，但新增模块必须被 `generated_program.py` 实际调用；
+- 不能只写 README、说明文档、helper 模块或未接入的工具；
+- 运行后必须写出 `result.json`、`trajectory.jsonl`、stdout/stderr 日志，以及 final state/result artifact、action trace、截图或提取数据；
+- 如果浏览器服务、页面或凭证不可用，必须结构化记录失败原因并输出 `partial` 或 `failed`，不能伪造完成状态。
+
 ---
 
 ## 一、入口与输出
@@ -21,6 +34,16 @@ python -m harness -p "任务描述" --output-dir ./output/
     "trajectory": str,   # JSONL trajectory 文件路径
 }
 ```
+
+### Browser BMK 必须满足的执行契约
+
+这个 harness 会直接接入 TheAgentCompany / browser-task 类长链任务。评测会检查最终环境状态和操作轨迹。因此必须做到：
+
+- 每一步 action 必须是可执行的浏览器动作或等价工具动作，例如 navigate、click、type、select、upload、extract、wait、screenshot、done；
+- `trajectory.jsonl` 每行必须记录 action、observation、state summary、error、retry 或 final decision；
+- 必须维护当前 URL、页面标题、活跃元素、已完成子目标、待完成子目标和已收集数据；
+- 最终 `result.json` 必须包含 status、final_state、collected_data 或 reference id，并指向关键 artifact；
+- 页面不可访问、服务未启动、凭证缺失时，必须把缺失依赖写入 result 和 trajectory，不能把模拟数据当成真实完成结果。
 
 ---
 

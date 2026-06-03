@@ -4,6 +4,16 @@
 
 ---
 
+## Creation Profile 优先级
+
+后续 prompt 可能会提供特定 creation profile，例如 `claude_code_scaffold_native`。如果 profile 明确提供固定 runtime、scaffold、CLI wrapper 或 program contract，则以该 profile 的 contract 为最高优先级。
+
+在 scaffold-native profile 下，六组件架构仍是 harness 的逻辑职责，但不要求机械生成 `execution.py/tools.py/context.py/state.py/lifecycle.py/evaluation.py` 六个文件。可以把这些职责实现为 `generated_program.py` 中的 control loop，以及被它真实调用的辅助模块，例如 `planner.py`、`verifier.py`、`context_manager.py`、`recovery.py`。任何新增模块都必须被主 program 实际调用，不能只作为未接入的说明或 helper。
+
+无论使用哪种 profile，最终产物都必须是可执行 harness，而不是架构文档、计划、README 或未接入代码。
+
+---
+
 ## 架构约束 H = (E, T, C, S, L, V)
 
 每个 harness 必须遵循以下六组件形式化架构，实现为**可独立识别**的模块：
@@ -19,8 +29,8 @@
 
 ### 架构硬性约束
 
-- 六组件必须为独立模块文件，禁止糅合进一两个文件
-- `from harness import execution, tools, context, state, lifecycle, evaluation` 必须可执行
+- 默认情况下，六组件必须为独立模块文件，禁止糅合进一两个文件；如果 creation profile 明确要求 scaffold-native program contract，则六组件可以作为逻辑职责落在 `generated_program.py` 和被它实际调用的辅助模块中
+- 默认情况下，`from harness import execution, tools, context, state, lifecycle, evaluation` 必须可执行；如果 creation profile 明确要求 scaffold-native program contract，则以 `scaffold_manifest.json` 指向的 program import / CLI probe 为准
 - Execution Loop 必须是显式有限状态机（状态枚举 + 转移表），非 while-if 面条代码
 - Context Manager 必须有 token 预算机制，超限时自动摘要/截断
 - State Store 的 snapshot 必须包含足够信息用于从断点恢复
