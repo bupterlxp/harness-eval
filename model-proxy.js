@@ -12,7 +12,9 @@ const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY;
 const OPENROUTER_VERBOSITY = process.env.OPENROUTER_VERBOSITY || '';
 const OPENROUTER_REASONING_ENABLED = process.env.OPENROUTER_REASONING_ENABLED === 'true';
 const PROVIDER_EXTRA_BODY_JSON = process.env.PROVIDER_EXTRA_BODY_JSON || '';
+const PROVIDER_EXTRA_HEADERS_JSON = process.env.PROVIDER_EXTRA_HEADERS_JSON || '';
 const PROVIDER_STRIP_MAX_TOKENS = process.env.PROVIDER_STRIP_MAX_TOKENS === '1' || process.env.PROVIDER_STRIP_MAX_TOKENS === 'true';
+const PROVIDER_STRIP_CACHE_CONTROL = process.env.PROVIDER_STRIP_CACHE_CONTROL === '1' || process.env.PROVIDER_STRIP_CACHE_CONTROL === 'true';
 const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 
@@ -158,6 +160,22 @@ function buildUpstreamOptions(targetUrl, method, headers, bodyLength) {
   nextHeaders['content-length'] = bodyLength;
   delete nextHeaders.connection;
   delete nextHeaders['accept-encoding'];
+  if (PROVIDER_EXTRA_HEADERS_JSON) {
+    try {
+      const extraHeaders = JSON.parse(PROVIDER_EXTRA_HEADERS_JSON);
+      if (extraHeaders && typeof extraHeaders === 'object' && !Array.isArray(extraHeaders)) {
+        for (const [key, value] of Object.entries(extraHeaders)) {
+          const normalized = String(key).toLowerCase();
+          if (normalized === 'content-length' || normalized === 'host' || normalized === 'connection') {
+            continue;
+          }
+          nextHeaders[key] = String(value);
+        }
+      }
+    } catch (e) {
+      console.error(`Invalid PROVIDER_EXTRA_HEADERS_JSON: ${e.message}`);
+    }
+  }
   return {
     protocol: upstream.protocol,
     hostname: upstream.hostname,
@@ -191,6 +209,56 @@ function textFromContent(content) {
     }).join('');
   }
   return content == null ? '' : String(content);
+}
+
+function stripProviderOnlyFields(value) {
+  if (Array.isArray(value)) {
+    return value.map(stripProviderOnlyFields);
+  }
+  if (value && typeof value === 'object') {
+    const next = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (key === 'cache_control') continue;
+      next[key] = stripProviderOnlyFields(item);
+    }
+    return next;
+  }
+  return value;
+}
+
+function normalizeProviderTools(payload) {
+  if (!Array.isArray(payload.tools)) return;
+  const tools = [];
+  for (const tool of payload.tools) {
+    if (!tool || typeof tool !== 'object') continue;
+    const source = tool.function || tool.custom || tool;
+    const name = source.name || tool.name;
+    if (!name) continue;
+    const parameters = source.parameters || source.input_schema || source.inputSchema || {
+      type: 'object',
+      properties: {},
+    };
+    tools.push({
+      type: 'function',
+      function: {
+        name,
+        description: source.description || tool.description || '',
+        parameters: stripProviderOnlyFields(parameters),
+      },
+    });
+  }
+  payload.tools = tools;
+
+  const choice = payload.tool_choice;
+  if (choice && typeof choice === 'object') {
+    if (choice.type === 'auto') payload.tool_choice = 'auto';
+    else if (choice.type === 'any') payload.tool_choice = 'required';
+    else if (choice.name) {
+      payload.tool_choice = { type: 'function', function: { name: choice.name } };
+    } else if (choice.function?.name) {
+      payload.tool_choice = { type: 'function', function: { name: choice.function.name } };
+    }
+  }
 }
 
 function openAiToAnthropicPayload(bodyText) {
@@ -347,6 +415,11 @@ function shapeProviderRequest(bodyText) {
     delete payload.max_tokens;
     delete payload.max_completion_tokens;
   }
+  if (PROVIDER_STRIP_CACHE_CONTROL) {
+    stripCacheControl(payload);
+  }
+
+  normalizeProviderTools(payload);
 
   // Claude Opus 4.7 uses adaptive thinking. OpenRouter recommends opting in
   // with reasoning.enabled and controlling the overall effort with verbosity.
@@ -371,6 +444,18 @@ function shapeProviderRequest(bodyText) {
   }
 
   return Buffer.from(JSON.stringify(payload));
+}
+
+function stripCacheControl(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) stripCacheControl(item);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  delete value.cache_control;
+  for (const item of Object.values(value)) {
+    stripCacheControl(item);
+  }
 }
 
 const providerProxy = http.createServer((req, res) => {

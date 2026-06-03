@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -532,7 +533,7 @@ if __name__ == "__main__":
 
 
 def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
-    container_name = f"harness-eval-{task_id}-{int(time.time())}"
+    container_name = f"harness-eval-{task_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     try:
         result = subprocess.run(
             [
@@ -555,8 +556,11 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
                 "-e", f"OPENROUTER_VERBOSITY={config.get('reasoning_effort') or ''}",
                 "-e", f"OPENROUTER_REASONING_ENABLED={'true' if config.get('reasoning_effort') else ''}",
                 "-e", f"PROVIDER_EXTRA_BODY_JSON={os.environ.get('PROVIDER_EXTRA_BODY_JSON', '')}",
+                "-e", f"PROVIDER_EXTRA_HEADERS_JSON={os.environ.get('PROVIDER_EXTRA_HEADERS_JSON', '')}",
                 "-e", f"PROVIDER_STRIP_MAX_TOKENS={os.environ.get('PROVIDER_STRIP_MAX_TOKENS', '')}",
+                "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
                 "-e", f"PROVIDER_DEFAULT_MAX_TOKENS={os.environ.get('PROVIDER_DEFAULT_MAX_TOKENS', '')}",
+                "-v", f"{Path(__file__).resolve().parent / 'model-proxy.js'}:/model-proxy.js:ro",
                 "-v", f"{workspace}:/workspace",
                 "harness-eval",
             ],
