@@ -11,6 +11,9 @@ const UPSTREAM_BASE_URL = process.env.UPSTREAM_BASE_URL;
 const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY;
 const OPENROUTER_VERBOSITY = process.env.OPENROUTER_VERBOSITY || '';
 const OPENROUTER_REASONING_ENABLED = process.env.OPENROUTER_REASONING_ENABLED === 'true';
+const PROVIDER_EXTRA_BODY_JSON = process.env.PROVIDER_EXTRA_BODY_JSON || '';
+const PROVIDER_STRIP_MAX_TOKENS = process.env.PROVIDER_STRIP_MAX_TOKENS === '1' || process.env.PROVIDER_STRIP_MAX_TOKENS === 'true';
+const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 
 // Rough estimate: 1 token ≈ 4 chars for English, ≈ 2 chars for Chinese
@@ -204,9 +207,14 @@ function openAiToAnthropicPayload(bodyText) {
   }
   const next = {
     model: MODEL_NAME,
-    max_tokens: payload.max_tokens || payload.max_completion_tokens || 4096,
     messages,
   };
+  if (!PROVIDER_STRIP_MAX_TOKENS) {
+    const requestedMaxTokens = payload.max_tokens || payload.max_completion_tokens || PROVIDER_DEFAULT_MAX_TOKENS;
+    if (requestedMaxTokens) {
+      next.max_tokens = Number.isNaN(Number(requestedMaxTokens)) ? requestedMaxTokens : Number(requestedMaxTokens);
+    }
+  }
   if (systemParts.length) next.system = systemParts.join('\n\n');
   if (payload.temperature !== undefined) next.temperature = payload.temperature;
   if (payload.top_p !== undefined) next.top_p = payload.top_p;
@@ -323,6 +331,22 @@ function shapeProviderRequest(bodyText) {
   }
 
   payload.model = MODEL_NAME;
+
+  if (PROVIDER_EXTRA_BODY_JSON) {
+    try {
+      const extraBody = JSON.parse(PROVIDER_EXTRA_BODY_JSON);
+      if (extraBody && typeof extraBody === 'object' && !Array.isArray(extraBody)) {
+        Object.assign(payload, extraBody);
+      }
+    } catch (e) {
+      console.error(`Invalid PROVIDER_EXTRA_BODY_JSON: ${e.message}`);
+    }
+  }
+
+  if (PROVIDER_STRIP_MAX_TOKENS) {
+    delete payload.max_tokens;
+    delete payload.max_completion_tokens;
+  }
 
   // Claude Opus 4.7 uses adaptive thinking. OpenRouter recommends opting in
   // with reasoning.enabled and controlling the overall effort with verbosity.

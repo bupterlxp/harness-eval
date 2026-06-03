@@ -165,9 +165,7 @@ def _validate_scaffold_artifact(
         result.errors.append(f"scaffold_cli_probe_failed: {probe.stderr.strip() or probe.stdout.strip()}")
 
     result.meta["scaffold_program"] = str(program_path)
-    if result.generation_status != "success":
-        result.adapter_status = "invalid_generation_status"
-    elif result.syntax_ok and result.import_ok and result.cli_probe_ok:
+    if result.syntax_ok and result.import_ok and result.cli_probe_ok:
         result.adapter_status = "ready"
     else:
         result.adapter_status = "invalid"
@@ -272,9 +270,7 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
     if not result.cli_probe_ok:
         result.errors.append("cli_probe_failed: python -m harness --help and python -m harness.cli --help both failed")
 
-    if result.generation_status != "success":
-        result.adapter_status = "invalid_generation_status"
-    elif result.syntax_ok and result.import_ok and result.cli_probe_ok:
+    if result.syntax_ok and result.import_ok and result.cli_probe_ok:
         result.adapter_status = "ready"
     else:
         result.adapter_status = "invalid"

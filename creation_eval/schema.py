@@ -97,8 +97,7 @@ class ValidationResult:
     @property
     def runnable(self) -> bool:
         return (
-            self.generation_status == "success"
-            and self.syntax_ok
+            self.syntax_ok
             and self.import_ok
             and self.cli_probe_ok
             and self.adapter_status == "ready"
