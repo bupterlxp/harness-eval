@@ -74,7 +74,7 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 - **main runtime/eval**：保留 `run.py -> run_creation_eval.py -> eval_matrix.yaml -> creation_eval/benchmarks.py` 的完整生成和下游 BMK 评测主链路；
 - **Claude Code scaffold/native substrate**：在 generation workspace 中提供不同强度的 `creation_profile`，其中 `claude_code_scaffold_native` 是 RQ1 主 setting；
 - **BMK dev feedback**：creation agent 可运行 `run_dev_bmk.py` 在公开/dev subset 上自测，读取真实 score、stdout/stderr、trajectory、artifact，再自行修改 harness；
-- **main BMK scoring contract**：正式分数仍由 SWE-bench、TerminalBench、MLE-bench、DAComp、WritingBench、EQbench3、DeepResearch/BrowseComp、TheAgentCompany 等 adapter 产生，不使用 public gate 或 toy task 伪造分数。
+- **main BMK scoring contract**：正式分数仍由 SWE-bench、TerminalBench、MLE-bench、EQbench3、BrowseComp、TheAgentCompany 等 active adapter 产生，不使用 public gate 或 toy task 伪造分数。DAComp、WritingBench、DeepResearch bench 当前已从 active downstream eval registry 移除。
 
 推荐主 profile 是 `claude_code_scaffold_native`。它固定 Claude Code atomic scaffold/runtime，让模型主要生成 harness 的 decision layer：control loop、context packing、state tracking、tool policy、verifier、retry/recovery 和 final artifact construction。`interface_tool` 和 `freeform` 仍作为 scaffold ablation。
 
@@ -510,20 +510,29 @@ python3 run.py config.yaml \
   --eval-domain code \
   --eval-bench swebench_pro,terminal_2_bench
 
-# 只生成/评测写作 harness，并跑 Writing-bench + EQbench3
+# 只生成/评测写作 harness，并跑 EQbench3
 python3 run.py config.yaml \
   --task-id writing-harness \
   --creation-profile claude_code_scaffold_native \
   --dev-bmk-task-limit 3 \
   --eval-after \
   --eval-domain writing \
-  --eval-bench writing_bench,eqbench3
+  --eval-bench eqbench3
 ```
 
 ### 生成后接下游 BMK 评测
 
 `run_creation_eval.py` 会把已经生成的 harness 目录接到下游 benchmark registry 上，输出统一的
 `eval_results/<run_id>/summary.jsonl` 和 `summary.csv`。
+
+正式实验默认使用 `--adapter-mode strict`。这个模式只允许固定协议桥：
+
+- scaffold-native artifact：通过 `scaffold_manifest.json + generated_program.py` 调用 `harness_scaffold.adapters.cli`；
+- legacy artifact：只调用标准 `python -m harness --task-json ... --workdir ... --output-dir ... --model-config ...`；
+- 必须由 generated harness 产出 `result.json`、`trajectory.jsonl` 和对应 domain artifact；
+- 不再猜测多种 CLI 入口、不自动找最新文件当答案、不注入 search patch、不自动安装 generated harness 的 requirements。
+
+`--adapter-mode permissive` 仅用于 bring-up/debug，会保留历史的多入口探测、fallback 和运行时补丁；正式 RQ1/RQ2 分数不要用 permissive。
 
 summary 中的 token 字段口径如下：
 
@@ -548,7 +557,7 @@ uv pip install --python .venv/bin/python -r requirements.txt
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/opus45 \
   --python-bin "$PWD/.venv/bin/python" \
-  --pre-bmk-gate soft
+  --adapter-mode strict
 ```
 
 常用筛选：
@@ -557,16 +566,17 @@ uv pip install --python .venv/bin/python -r requirements.txt
 # 只跑 writing 相关 benchmark
 python3.12 run_creation_eval.py --generation-output outputs/opus45 --domain writing
 
-# 只跑写作类最终保留的两个 downstream BMK
+# 只跑写作类最终保留的 downstream BMK
 python3.12 run_creation_eval.py \
   --generation-output outputs/opus45/writing-harness \
-  --bench writing_bench,eqbench3
+  --bench eqbench3
 
 # 只跑代码类两个 downstream BMK
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/opus45/code-agent-harness \
   --bench swebench_pro,terminal_2_bench \
-  --python-bin "$PWD/.venv/bin/python"
+  --python-bin "$PWD/.venv/bin/python" \
+  --adapter-mode strict
 
 # 对尚未接入真实运行器的 benchmark 跑 generated-harness 代理冒烟验证，
 # 结果会标记为 proxy_smoke_*，不会伪装成真实 BMK 分数。
@@ -588,7 +598,7 @@ python3.12 run_creation_eval.py \
 - 禁止只输出固定模板、文件列表、步骤列表或 `response.md` 后声明成功；
 - Code harness 遇到明确目标路径时，必须尽早创建 best-effort 文件，例如 TerminalBench 里的 `/app/gpt2.c`；
 - Data harness 遇到 MLE-Bench 必须产出同 schema 的 `submission.csv`，不能 no submission；
-- DAComp 报告必须包含真实计算结果：风险指标、风险分层、授信额度、利率规则、结论表和机器可读汇总。
+- Data harness 遇到 tabular / notebook 类任务时必须包含真实计算结果、结构化表格、可复现脚本和机器可读汇总。DAComp 当前不再作为 active downstream BMK。
 
 这部分是为了区分两类失败：
 
@@ -610,7 +620,7 @@ python3.12 run_creation_eval.py \
 |---|---|---:|---|
 | Terminal 2.0 | `regen-code-opus47-max-promptfix-terminal2-20260528` | unresolved，`0/1` | Harbor 和 verifier 已真实启动；generated code harness 30 步耗尽，未完成 `/app/gpt2.c`，属于 creation 质量问题。 |
 | MLE-bench | `regen-data-opus47-high-promptfix-dataeval-20260528` | `score=0.82299` | generated data harness 产出有效 `submission.csv`，可以 pilot。 |
-| DAComp | `regen-data-opus47-high-promptfix-dataeval-20260528` | `score=0.0` | runner 和 judge 已真实运行；generated data harness 只写浅层模板报告，属于 creation 质量问题。 |
+| DAComp | `regen-data-opus47-high-promptfix-dataeval-20260528` | `score=0.0` | 历史验证记录；DAComp 当前已从 active downstream eval registry 移除。 |
 
 上述结果的统一输出在 `eval_results/<run_id>/summary.csv`。`eval_results/` 默认被 `.gitignore` 忽略，不会提交到仓库。
 
@@ -619,16 +629,13 @@ python3.12 run_creation_eval.py \
 | BMK | 运行器 | 当前接入方式 |
 |---|---|---|
 | `mle_bench` | `mlebench_generated` | 接官方 `openai/mle-bench`，generated data harness 生成 submission CSV 后调用官方 `grade_csv`；需要 Kaggle credential 和 prepared competition data。 |
-| `dacomp` | `dacomp_generated` | 将 DAComp SQLite 导出为 CSV，generated data harness 产出报告，再复用 DAComp `llm_judge.py/get_score.py`。 |
-| `writing_bench` | `writingbench_generated` | 接官方 `X-PLUG/WritingBench` query/checklist，generated writing harness 产出回答，再用 OpenAI-compatible judge 打 criterion 分。 |
 | `eqbench3` | `eqbench3` | 复用现有 EQ-Bench3/Kimi-writer wrapper，并将 `KIMI_WRITER_PATH` 指向 generated harness adapter。 |
-| `deepresearch_bench` | `deepresearch_generated` | 用本地 HLE-style text-only 全量任务，generated research harness 产出 answer，再用 short-answer judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback。 |
 | `browsecomp` | `browsecomp_generated` | 下载 OpenAI simple-evals BrowseComp encrypted CSV，全量解密题目，generated research harness 回答，再用 judge 算 accuracy；优先使用 `SERPER_KEY_ID`、`TAVILY_API_KEY` 或 `SEARCH_API_KEY`，缺 key 时用 Bing/DuckDuckGo HTML fallback。 |
 | `the_agent_company` | `the_agent_company_generated` | 将 generated browser harness 接到 TheAgentCompany 官方全量 task image 列表；需要官方服务栈先在本机或远端启动，包括 RocketChat、ownCloud、GitLab、Plane 等服务。 |
 
 Research 类 BMK 不接受 generated harness 自带的 mock/LLM-simulated search 作为正式分数。adapter 会在临时运行目录中给 generated research harness 注入真实联网搜索工具：有 Serper/Tavily/API key 时走 API provider，没有 key 时走 Bing/DuckDuckGo HTML fallback。论文级稳定复现实验建议配置正式 search API key；本地一两条任务验证可以先用 fallback。
 
-当前默认 registry 已切到 full run：所有支持全量数据的 BMK 默认不再限制为 1 条。写作类评测只保留 `writing_bench` 和 `eqbench3`。`mle_bench` 的代码路径已接通，但全量跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data；未 prepare 的 competition 会被标成明确依赖缺失，不伪造分数。
+当前默认 registry 已切到 full run：所有支持全量数据的 active BMK 默认不再限制为 1 条。写作类评测只保留 `eqbench3`；Data 只保留 `mle_bench`；Research 只保留 `browsecomp`。`dacomp`、`writing_bench`、`deepresearch_bench` 当前不会在 downstream eval 中运行。`mle_bench` 的代码路径已接通，但全量跑分前必须先配置 Kaggle credential 并 prepare 对应 competition data；未 prepare 的 competition 会被标成明确依赖缺失，不伪造分数。
 
 ### 非代码四类 harness 的全量验证命令
 
@@ -656,34 +663,34 @@ export EVAL_API_KEY="$OPENROUTER_API_KEY"
 然后执行：
 
 ```bash
-# Writing：Writing-bench + EQbench3，全量任务
+# Writing：EQbench3，全量任务
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-opus47-max-final-20260523 \
   --domain writing \
-  --bench writing_bench,eqbench3 \
+  --bench eqbench3 \
   --run-id noncode-writing-opus47-eval \
   --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
   --eval-model-name "anthropic/claude-opus-4.7" \
   --eval-reasoning-effort max
 
-# Data：MLE-bench + DAComp；MLE 需要 Kaggle credential 和 prepared data，DAComp 默认跑全量 100 题
+# Data：MLE-bench；需要 Kaggle credential 和 prepared data
 HARNESS_EVAL_DATA_MAX_TURNS=8 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-opus47-max-final-20260523 \
   --domain data_analysis \
-  --bench all \
+  --bench mle_bench \
   --run-id noncode-data-opus47-eval \
   --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
   --eval-model-name "anthropic/claude-opus-4.7" \
   --eval-reasoning-effort max
 
-# Research：DeepResearch bench + BrowseComp，全量任务
+# Research：BrowseComp，全量任务
 HARNESS_EVAL_RESEARCH_MAX_STEPS=8 \
 HARNESS_EVAL_RESEARCH_BREADTH=2 \
 HARNESS_EVAL_RESEARCH_DEPTH=1 \
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-opus47-max-final-20260523 \
   --domain research \
-  --bench deepresearch_bench,browsecomp \
+  --bench browsecomp \
   --run-id noncode-research-opus47-eval \
   --eval-base-url "https://openrouter.ai/api/v1/chat/completions" \
   --eval-model-name "anthropic/claude-opus-4.7" \
@@ -706,9 +713,9 @@ HARNESS_EVAL_RESEARCH_DEPTH=1 \
 
 | Run ID | 结果 |
 |---|---|
-| `noncode-writing-opus47-eval-20260523` | `writing_bench` 和 `eqbench3` 均真实运行成功。 |
-| `noncode-data-opus47-eval-20260523` | `dacomp` 真实运行成功；`mle_bench` 因缺 Kaggle credential 和 prepared data 被结构化标记为 `skipped/missing_dependency`。 |
-| `noncode-research-opus47-eval-20260523` | `deepresearch_bench` 和 `browsecomp` 均真实运行成功。 |
+| `noncode-writing-opus47-eval-20260523` | 历史记录；当前 active writing downstream BMK 只保留 `eqbench3`。 |
+| `noncode-data-opus47-eval-20260523` | 历史记录；当前 active data downstream BMK 只保留 `mle_bench`。 |
+| `noncode-research-opus47-eval-20260523` | 历史记录；当前 active research downstream BMK 只保留 `browsecomp`。 |
 | `noncode-browser-opus47-eval-20260523` | 代码链路已接到 TheAgentCompany runner；本机服务栈未启动，因此结构化标记为 `skipped/missing_dependency`。 |
 
 TheAgentCompany 官方服务栈启动命令：
@@ -896,7 +903,7 @@ export HARNESS_EVAL_DATA_MAX_TURNS=8
 .venv/bin/python run_creation_eval.py \
   --generation-output outputs/noncode-data-browser-opus47-max \
   --domain data_analysis \
-  --bench mle_bench,dacomp \
+  --bench mle_bench \
   --run-id data-eval-opus47-max \
   --eval-base-url "$BASE_URL" \
   --eval-model-name "anthropic/claude-opus-4.7" \

@@ -122,6 +122,7 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "eval_api_key": args.eval_api_key,
         "eval_model_name": args.eval_model_name,
         "eval_reasoning_effort": args.eval_reasoning_effort,
+        "eval_adapter_mode": args.eval_adapter_mode,
         "meta_harness": args.meta_harness,
         "codex_bin": args.codex_bin,
         "codex_sandbox": args.codex_sandbox,
@@ -538,9 +539,9 @@ if __name__ == "__main__":
 def _bench_defaults_for_task(task_id: str) -> str:
     mapping = {
         "code-agent-harness": "terminal_2_bench,swebench_pro",
-        "data-analysis-harness": "mle_bench,dacomp",
-        "writing-harness": "writing_bench,eqbench3",
-        "research-agent-harness": "deepresearch_bench,browsecomp",
+        "data-analysis-harness": "mle_bench",
+        "writing-harness": "eqbench3",
+        "research-agent-harness": "browsecomp",
         "browser-agent-harness": "the_agent_company",
     }
     return mapping.get(task_id, "all")
@@ -1176,6 +1177,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-provider-proxy-port", type=int, default=3458)
     parser.add_argument(
+        "--eval-adapter-mode",
+        default=None,
+        choices=["strict", "permissive"],
+        help=(
+            "Adapter mode for --eval-after. strict uses only the fixed generated-harness "
+            "contract; permissive keeps legacy CLI probing/fallbacks."
+        ),
+    )
+    parser.add_argument(
         "--harness-evolve-root",
         default="/Users/bytedance/Downloads/harness evolve project",
     )
@@ -1224,6 +1234,7 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
     if args.no_eval_provider_proxy:
         command.append("--no-eval-provider-proxy")
     command.extend(["--eval-provider-proxy-port", str(args.eval_provider_proxy_port)])
+    command.extend(["--adapter-mode", str(config.get("eval_adapter_mode") or "strict")])
     if args.eval_domain:
         command.extend(["--domain", args.eval_domain])
     command.extend(["--run-id", eval_run_id])

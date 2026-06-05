@@ -345,6 +345,7 @@ def _common_generated_env(
     env["GENERATED_HARNESS_DOMAIN"] = artifact.domain
     env["GENERATED_HARNESS_ADAPTER"] = str(harness_eval_root / "generated_harness_adapter.py")
     env["GENERATED_HARNESS_TIMEOUT"] = str(timeout)
+    env["HARNESS_EVAL_ADAPTER_MODE"] = os.environ.get("HARNESS_EVAL_ADAPTER_MODE", "strict")
     env["PYTHONPATH"] = str(harness_eval_root) + os.pathsep + env.get("PYTHONPATH", "")
     for name in ["OPENAI_BASE_URL", "BASE_URL", "OPENAI_API_KEY", "API_KEY"]:
         container_value = os.environ.get(f"CONTAINER_{name}")
@@ -755,6 +756,8 @@ def run_terminalbench_generated(
         f"task_work_dir={entry.get('task_work_dir', '/workspace')}",
         "--ak",
         f"timeout_sec={max(60, timeout - 60)}",
+        "--ak",
+        f"adapter_mode={os.environ.get('HARNESS_EVAL_ADAPTER_MODE', 'strict')}",
     ]
     n_limit = _limit_value(entry.get("n_limit"), default=1)
     if n_limit is not None:
@@ -769,6 +772,7 @@ def run_terminalbench_generated(
         "SEED2LITE_API_KEY",
         "SEED2LITE_BASE_URL",
         "SEED2LITE_MODEL_ID",
+        "HARNESS_EVAL_ADAPTER_MODE",
     ]:
         value = _container_env_value(env_name)
         if value:
@@ -2248,6 +2252,7 @@ def base_row(
         "import_ok": validation.import_ok,
         "cli_probe_ok": validation.cli_probe_ok,
         "adapter_status": validation.adapter_status,
+        "adapter_mode": os.environ.get("HARNESS_EVAL_ADAPTER_MODE", "strict"),
         "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
         "gate_pass": validation.pre_bmk_gate_pass,
         "gate_failure_reason": validation.pre_bmk_failure_reason,

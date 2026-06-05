@@ -28,6 +28,7 @@ SUMMARY_FIELDS = [
     "import_ok",
     "cli_probe_ok",
     "adapter_status",
+    "adapter_mode",
     "pre_bmk_gate_mode",
     "gate_pass",
     "gate_failure_reason",

@@ -19,10 +19,18 @@ from .scaffold_runtime import (
     should_prefer_scaffold_runtime,
 )
 from .token_usage import extract_harness_token_usage
-from .utils import best_python_bin, copytree_filtered, run_command, write_json
+from .utils import best_python_bin, copytree_filtered, read_json, run_command, write_json
 
 
 TEXT_SUFFIXES = {".md", ".txt", ".json"}
+ADAPTER_MODES = {"strict", "permissive"}
+
+
+def _normalize_adapter_mode(value: str | None = None) -> str:
+    mode = (value or os.environ.get("HARNESS_EVAL_ADAPTER_MODE") or "strict").strip().lower()
+    if mode not in ADAPTER_MODES:
+        raise ValueError(f"Invalid adapter mode {mode!r}; expected one of {sorted(ADAPTER_MODES)}")
+    return mode
 
 
 def _attach_token_usage(result: HarnessRunResult, *paths: Path | str | None) -> HarnessRunResult:
@@ -760,6 +768,30 @@ def _scaffold_config(domain: str, timeout: int) -> dict[str, Any]:
     }
 
 
+def _write_canonical_task_and_config(
+    *,
+    task_json: Path,
+    config_json: Path,
+    domain: str,
+    prompt: str,
+    task_work_dir: Path,
+    timeout: int,
+    adapter: str,
+) -> None:
+    write_json(
+        task_json,
+        {
+            "task_id": f"{domain}-generated-harness",
+            "prompt": prompt,
+            "workdir": str(task_work_dir),
+            "domain": domain,
+            "benchmark_id": "harness-eval-adapter",
+            "metadata": {"adapter": adapter},
+        },
+    )
+    write_json(config_json, _scaffold_config(domain, timeout))
+
+
 def _run_scaffold_program(
     workspace: Path,
     program_path: Path,
@@ -780,18 +812,15 @@ def _run_scaffold_program(
     stderr_path = output_dir / "adapter_stderr.log"
     raw_result_path = output_dir / "adapter_result.json"
 
-    write_json(
-        task_json,
-        {
-            "task_id": f"{domain}-generated-harness",
-            "prompt": prompt,
-            "workdir": str(task_work_dir),
-            "domain": domain,
-            "benchmark_id": "harness-eval-adapter",
-            "metadata": {"adapter": "scaffold"},
-        },
+    _write_canonical_task_and_config(
+        task_json=task_json,
+        config_json=config_json,
+        domain=domain,
+        prompt=prompt,
+        task_work_dir=task_work_dir,
+        timeout=timeout,
+        adapter="scaffold",
     )
-    write_json(config_json, _scaffold_config(domain, timeout))
     apply_scaffold_pythonpath(env, workspace, program_path)
 
     command = [
@@ -849,7 +878,7 @@ def _run_scaffold_program(
             status="success",
             score=1.0,
             pass_rate=1.0,
-            score_breakdown={"adapter_smoke": True, "adapter": "scaffold", "response_chars": len(response_text)},
+            score_breakdown={"adapter_smoke": True, "adapter": "scaffold", "adapter_mode": _normalize_adapter_mode(), "response_chars": len(response_text)},
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             raw_result_path=str(raw_result_path),
@@ -876,7 +905,137 @@ def _run_scaffold_program(
         status="adapter_failed",
         score=0.0,
         pass_rate=0.0,
-        score_breakdown={"adapter_smoke": True, "adapter": "scaffold"},
+        score_breakdown={"adapter_smoke": True, "adapter": "scaffold", "adapter_mode": _normalize_adapter_mode()},
+        stdout_path=str(stdout_path),
+        stderr_path=str(stderr_path),
+        raw_result_path=str(raw_result_path),
+        error=error,
+    ), run_output_dir, artifacts_dir)
+
+
+def _run_legacy_canonical(
+    workspace: Path,
+    domain: str,
+    prompt: str,
+    output_dir: Path,
+    task_work_dir: Path,
+    python_bin: str,
+    timeout: int,
+    env: dict[str, str],
+    attempts: list[dict[str, Any]],
+) -> HarnessRunResult:
+    run_output_dir = workspace / "adapter_canonical_output"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    task_json = run_output_dir / "task.json"
+    config_json = run_output_dir / "config.json"
+    stdout_path = output_dir / "adapter_stdout.log"
+    stderr_path = output_dir / "adapter_stderr.log"
+    raw_result_path = output_dir / "adapter_result.json"
+
+    _write_canonical_task_and_config(
+        task_json=task_json,
+        config_json=config_json,
+        domain=domain,
+        prompt=prompt,
+        task_work_dir=task_work_dir,
+        timeout=timeout,
+        adapter="legacy_canonical",
+    )
+
+    command = [
+        python_bin,
+        "-m",
+        "harness",
+        "--task-json",
+        str(task_json),
+        "--workdir",
+        str(task_work_dir),
+        "--output-dir",
+        str(run_output_dir),
+        "--model-config",
+        str(config_json),
+    ]
+    result = run_command(command, cwd=workspace, env=env, timeout=timeout)
+    stdout_path.write_text(result.stdout, encoding="utf-8")
+    stderr_path.write_text(result.stderr, encoding="utf-8")
+    attempts.append(
+        {
+            "phase": "legacy_canonical_cli",
+            "command": command,
+            "returncode": result.returncode,
+            "elapsed_sec": result.elapsed_sec,
+            "stdout_tail": result.stdout[-4000:],
+            "stderr_tail": result.stderr[-4000:],
+        }
+    )
+
+    artifacts_dir = output_dir / "artifacts"
+    if artifacts_dir.exists():
+        shutil.rmtree(artifacts_dir)
+    shutil.copytree(run_output_dir, artifacts_dir, dirs_exist_ok=True)
+
+    result_json = run_output_dir / "result.json"
+    trajectory_jsonl = run_output_dir / "trajectory.jsonl"
+    if result.returncode == 0 and result_json.is_file() and trajectory_jsonl.is_file():
+        payload = read_json(result_json)
+        response_path = output_dir / "response.md"
+        response_source = run_output_dir / "response.md"
+        report_source = run_output_dir / "REPORT.md"
+        if response_source.is_file():
+            response_text = response_source.read_text(encoding="utf-8", errors="replace")
+        elif report_source.is_file():
+            response_text = report_source.read_text(encoding="utf-8", errors="replace")
+        else:
+            response_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        response_path.write_text(response_text, encoding="utf-8")
+        write_json(
+            raw_result_path,
+            {
+                "status": "success",
+                "domain": domain,
+                "adapter": "legacy_canonical",
+                "selected_file": str(response_path),
+                "artifacts_dir": str(artifacts_dir),
+                "result_json": str(result_json),
+                "trajectory_jsonl": str(trajectory_jsonl),
+                "attempts": attempts,
+            },
+        )
+        return _attach_token_usage(HarnessRunResult(
+            status="success",
+            score=1.0,
+            pass_rate=1.0,
+            score_breakdown={"adapter_smoke": True, "adapter": "legacy_canonical", "adapter_mode": "strict"},
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            raw_result_path=str(raw_result_path),
+        ), run_output_dir, artifacts_dir)
+
+    missing = []
+    if not result_json.is_file():
+        missing.append("result.json")
+    if not trajectory_jsonl.is_file():
+        missing.append("trajectory.jsonl")
+    error = "Legacy canonical harness invocation failed"
+    if result.returncode == 0 and missing:
+        error = "Legacy canonical harness did not produce required artifacts: " + ",".join(missing)
+    elif result.returncode == 124:
+        error = f"Legacy canonical harness timed out after {timeout}s"
+    write_json(
+        raw_result_path,
+        {
+            "status": "adapter_failed",
+            "domain": domain,
+            "adapter": "legacy_canonical",
+            "missing_required_artifacts": missing,
+            "attempts": attempts,
+        },
+    )
+    return _attach_token_usage(HarnessRunResult(
+        status="adapter_failed",
+        score=0.0,
+        pass_rate=0.0,
+        score_breakdown={"adapter_smoke": True, "adapter": "legacy_canonical", "adapter_mode": "strict"},
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
         raw_result_path=str(raw_result_path),
@@ -893,7 +1052,9 @@ def run_generated_harness(
     task_work_dir: Path | None = None,
     python_bin: str | None = None,
     timeout: int = 900,
+    adapter_mode: str | None = None,
 ) -> HarnessRunResult:
+    adapter_mode = _normalize_adapter_mode(adapter_mode)
     python_bin = best_python_bin(python_bin)
     output_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = output_dir / "adapter_stdout.log"
@@ -904,7 +1065,7 @@ def run_generated_harness(
     with tempfile.TemporaryDirectory(prefix="generated_harness_") as tmp:
         workspace = Path(tmp) / "artifact"
         copytree_filtered(harness_path, workspace)
-        if domain == "research":
+        if adapter_mode == "permissive" and domain == "research":
             _install_real_search_patch(workspace)
         task_work_dir = task_work_dir.resolve() if task_work_dir else workspace
         run_output_dir = workspace / "adapter_output"
@@ -928,22 +1089,70 @@ def run_generated_harness(
             env.setdefault("HARNESS_EVAL_SEARCH_TIMEOUT_SECONDS", "10")
 
         attempts: list[dict[str, Any]] = []
-        install_attempt = _install_requirements(workspace, python_bin, timeout)
-        if install_attempt:
-            attempts.append({"phase": "install_requirements", **install_attempt})
-            if install_attempt["returncode"] != 0:
-                write_json(raw_result_path, {"status": "failed", "domain": domain, "attempts": attempts})
-                return _attach_token_usage(HarnessRunResult(
-                    status="adapter_failed",
-                    score=0.0,
-                    pass_rate=0.0,
-                    score_breakdown={"adapter_smoke": True},
-                    stdout_path=str(stdout_path),
-                    stderr_path=str(stderr_path),
-                    raw_result_path=str(raw_result_path),
-                    error="Generated harness requirements installation failed",
-                ), workspace, run_output_dir)
+        if adapter_mode == "permissive":
+            install_attempt = _install_requirements(workspace, python_bin, timeout)
+            if install_attempt:
+                attempts.append({"phase": "install_requirements", **install_attempt})
+                if install_attempt["returncode"] != 0:
+                    write_json(raw_result_path, {"status": "failed", "domain": domain, "attempts": attempts, "adapter_mode": adapter_mode})
+                    return _attach_token_usage(HarnessRunResult(
+                        status="adapter_failed",
+                        score=0.0,
+                        pass_rate=0.0,
+                        score_breakdown={"adapter_smoke": True, "adapter_mode": adapter_mode},
+                        stdout_path=str(stdout_path),
+                        stderr_path=str(stderr_path),
+                        raw_result_path=str(raw_result_path),
+                        error="Generated harness requirements installation failed",
+                    ), workspace, run_output_dir)
         scaffold_program = find_scaffold_program(workspace)
+        if adapter_mode == "strict":
+            if scaffold_program is not None and should_prefer_scaffold_runtime(workspace):
+                return _run_scaffold_program(
+                    workspace,
+                    scaffold_program,
+                    domain,
+                    prompt,
+                    output_dir,
+                    task_work_dir,
+                    python_bin,
+                    timeout,
+                    env,
+                    attempts,
+                )
+            if (workspace / "harness").is_dir():
+                return _run_legacy_canonical(
+                    workspace,
+                    domain,
+                    prompt,
+                    output_dir,
+                    task_work_dir,
+                    python_bin,
+                    timeout,
+                    env,
+                    attempts,
+                )
+            write_json(
+                raw_result_path,
+                {
+                    "status": "adapter_failed",
+                    "domain": domain,
+                    "adapter_mode": adapter_mode,
+                    "attempts": attempts,
+                    "error": "Strict adapter requires scaffold manifest/program or legacy harness package",
+                },
+            )
+            return _attach_token_usage(HarnessRunResult(
+                status="adapter_failed",
+                score=0.0,
+                pass_rate=0.0,
+                score_breakdown={"adapter_smoke": True, "adapter_mode": adapter_mode},
+                stdout_path=str(stdout_path),
+                stderr_path=str(stderr_path),
+                raw_result_path=str(raw_result_path),
+                error="Strict adapter requires scaffold manifest/program or legacy harness package",
+            ), workspace, run_output_dir)
+
         if scaffold_program is not None and (
             should_prefer_scaffold_runtime(workspace) or not (workspace / "harness").is_dir()
         ):
@@ -1068,6 +1277,12 @@ def main() -> None:
     parser.add_argument("--output-dir", default=os.environ.get("GENERATED_HARNESS_ADAPTER_OUTPUT_DIR"))
     parser.add_argument("--work-dir", default=os.environ.get("GENERATED_HARNESS_TASK_WORK_DIR"))
     parser.add_argument("--timeout", type=int, default=int(os.environ.get("GENERATED_HARNESS_TIMEOUT", "900")))
+    parser.add_argument(
+        "--adapter-mode",
+        default=os.environ.get("HARNESS_EVAL_ADAPTER_MODE", "strict"),
+        choices=sorted(ADAPTER_MODES),
+        help="strict uses only the fixed generated-harness contract; permissive enables legacy probing/fallbacks.",
+    )
     args = parser.parse_args()
 
     if not args.harness_path:
@@ -1085,6 +1300,7 @@ def main() -> None:
         task_work_dir=Path(args.work_dir) if args.work_dir else None,
         python_bin=os.environ.get("HARNESS_EVAL_PYTHON") or sys.executable,
         timeout=args.timeout,
+        adapter_mode=args.adapter_mode,
     )
 
     payload = {}

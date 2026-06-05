@@ -27,6 +27,7 @@ class GeneratedHarnessAgent(BaseAgent):
         domain: str = "code",
         task_work_dir: str = "/app",
         timeout_sec: int = 900,
+        adapter_mode: str = "strict",
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -45,6 +46,12 @@ class GeneratedHarnessAgent(BaseAgent):
         self.task_work_dir = task_work_dir
         self.timeout_sec = int(timeout_sec)
         self.extra_env = dict(extra_env or {})
+        self.adapter_mode = (
+            self.extra_env.get("HARNESS_EVAL_ADAPTER_MODE")
+            or os.environ.get("HARNESS_EVAL_ADAPTER_MODE")
+            or adapter_mode
+            or "strict"
+        )
 
     @staticmethod
     def name() -> str:
@@ -91,12 +98,13 @@ class GeneratedHarnessAgent(BaseAgent):
         )
         await environment.exec(command=python_bootstrap, user="root", timeout_sec=600)
 
-        install_cmd = (
-            "if [ -f /installed-agent/generated_harness/requirements.txt ]; then "
-            "PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user -q -r /installed-agent/generated_harness/requirements.txt; "
-            "fi"
-        )
-        await environment.exec(command=install_cmd, timeout_sec=240)
+        if self.adapter_mode == "permissive":
+            install_cmd = (
+                "if [ -f /installed-agent/generated_harness/requirements.txt ]; then "
+                "PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user -q -r /installed-agent/generated_harness/requirements.txt; "
+                "fi"
+            )
+            await environment.exec(command=install_cmd, timeout_sec=240)
 
     def _runtime_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
@@ -137,6 +145,7 @@ class GeneratedHarnessAgent(BaseAgent):
             f"--work-dir {escaped_work_dir} "
             f"--output-dir {escaped_output_dir} "
             f"--timeout {self.timeout_sec} "
+            f"--adapter-mode {shlex.quote(self.adapter_mode)} "
             f"{escaped_instruction} "
             f"2>&1 | tee {shlex.quote(str(env_paths.agent_dir / 'generated_harness_stdout.log'))}"
         )
