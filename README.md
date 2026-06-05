@@ -12,23 +12,23 @@
    - `codex`：调用本机 Codex CLI，在临时 workspace 里生成 harness
 3. Claude Code 路径会经过 model-proxy 透明代理 LLM 请求，记录 token 用量和交互轮次
 4. 按 `--creation-profile` 注入 scaffold 设定，让模型在固定 interface/tool contract 下生成 harness
-5. Agent 在临时 workspace 中工作
-6. 任务完成后，收集输出产物和 metrics
-7. 如果指定 `--eval-after`，先做 pre-BMK validation gate，再进入下游 BMK scoring
+5. Agent 在临时 workspace 中工作；如果开启 dev BMK feedback，会看到 `DEV_BMK_COMMANDS.md` 和 `run_dev_bmk.py`，可自行跑公开/dev BMK subset、看日志/分数/轨迹并修改 harness
+6. 任务完成后，收集最终输出产物、dev BMK 轨迹和 metrics
+7. 如果指定 `--eval-after`，直接通过 adapter 接入下游 BMK scoring；正式 score 只来自 downstream BMK，不使用 public gate 伪造分数
 
 ---
 
 ## 整体流程
 
 ```
-研究 → 提示词 → 生成 → 验证
+研究 → 提示词 → 生成 + dev BMK 自测 → 正式 eval
 ```
 
 1. **调研**（`research/`）：分析各领域生产级 agent 的实现模式，提炼共性架构
 2. **提示词设计**（`prompts/`）：将调研结论转化为结构化 prompt，定义功能要求和调用示例
 3. **生成**（`run.py`）：将 `system prompt + creation profile + task prompt` 喂给 meta harness（Claude Code Docker 或本机 Codex CLI），生成完整 harness
-4. **Pre-BMK validation**（`creation_eval/pre_bmk_validation/`）：先做静态检查和 toy task，不改变真实 BMK 分数
-5. **验证/评测**（`run_creation_eval.py`）：检查产物是否符合架构约束，并把 generated harness 接到 downstream BMK
+4. **Creation dev BMK feedback**：在生成 workspace 内提供 `run_dev_bmk.py`，让 meta harness + LLM 自己跑公开/dev BMK subset、读分数/日志/轨迹并决定是否继续修改
+5. **正式评测**（`run_creation_eval.py`）：做最小 adapter/runnable 检查，并把最终 generated harness 接到 downstream BMK；正式分数不反馈给 creation agent
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -67,15 +67,16 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 
 ## 提示词设计
 
-### 主实验方案：main runtime/eval + scaffold/test infra + BMK scoring contract
+### 主实验方案：main runtime/eval + scaffold substrate + BMK dev feedback
 
 当前主实验采用 hybrid 方案：
 
 - **main runtime/eval**：保留 `run.py -> run_creation_eval.py -> eval_matrix.yaml -> creation_eval/benchmarks.py` 的完整生成和下游 BMK 评测主链路；
-- **lxp scaffold/test infra**：在 generation 侧加入 `creation_profile`，在 eval 前加入 pre-BMK validation gate；
-- **main BMK scoring contract**：真实分数仍由 SWE-bench、TerminalBench、MLE-bench、DAComp、WritingBench、EQbench3、DeepResearch/BrowseComp、TheAgentCompany 等 adapter 产生，validation gate 不伪造分数。
+- **Claude Code scaffold/native substrate**：在 generation workspace 中提供不同强度的 `creation_profile`，其中 `claude_code_scaffold_native` 是 RQ1 主 setting；
+- **BMK dev feedback**：creation agent 可运行 `run_dev_bmk.py` 在公开/dev subset 上自测，读取真实 score、stdout/stderr、trajectory、artifact，再自行修改 harness；
+- **main BMK scoring contract**：正式分数仍由 SWE-bench、TerminalBench、MLE-bench、DAComp、WritingBench、EQbench3、DeepResearch/BrowseComp、TheAgentCompany 等 adapter 产生，不使用 public gate 或 toy task 伪造分数。
 
-推荐主 profile 是 `interface_tool`。它固定 CLI、tool API contract、logging、result schema 和预算边界，模型只生成 harness 的 decision layer：control loop、context packing、state tracking、tool policy、verifier、retry/recovery 和 final artifact construction。
+推荐主 profile 是 `claude_code_scaffold_native`。它固定 Claude Code atomic scaffold/runtime，让模型主要生成 harness 的 decision layer：control loop、context packing、state tracking、tool policy、verifier、retry/recovery 和 final artifact construction。`interface_tool` 和 `freeform` 仍作为 scaffold ablation。
 
 可选 profile：
 
@@ -85,7 +86,7 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 | `interface` | 固定 CLI/schema，但不提供工具 contract。 |
 | `interface_tool` | 主实验默认；固定 interface + tool contract。 |
 | `full_loop` | 强 scaffold / upper bound；给完整 loop 结构但仍要求真实策略。 |
-| `claude_code_scaffold` | 可选注入 CC_4 atomic scaffold；模型可以复用文件、shell、patch、trajectory、artifact、task graph、checkpoint、context compaction、public validator、repair feedback、cost tracker 等原子能力，也可以自行实现。 |
+| `claude_code_scaffold` | 可选注入 CC_4 atomic scaffold；模型可以复用文件、shell、patch、trajectory、artifact、task graph、checkpoint、context compaction、cost tracker 等原子能力，也可以自行实现。 |
 | `claude_code_scaffold_native` | 最高 scaffold 档；直接把 Claude Code 原子能力作为固定 runtime/substrate，模型可以扩展工具，但不能完全绕开 scaffold 重新写独立 harness。 |
 
 建议把 scaffold 强度作为实验 setting，而不是隐藏实现细节：
@@ -96,57 +97,33 @@ codex meta harness 会直接调用本机 `codex exec`，模型名通过 `-m` 传
 | 基础 interface/tool | `interface_tool` | 给统一 CLI、schema 和工具 contract，测试模型能否自己实现可运行 harness。 |
 | Claude Code 原子能力 substrate | `claude_code_scaffold_native` | 给抽取好的 Claude Code 原子能力和 scaffold runtime，测试模型能否做高层编排、验证和恢复设计。 |
 
-`--pre-bmk-gate` 有三档：
+### Creation dev BMK feedback loop
 
-| Gate | 行为 |
-|---|---|
-| `off` | 不做 pre-BMK validation。 |
-| `soft` | 记录 gate 结果，但仍进入 downstream BMK；适合 pilot 和失败分析。 |
-| `hard` | gate 失败就不跑 expensive BMK，`end_to_end_score=0`。 |
-
-summary 会同时输出 `score` 和 `end_to_end_score`。`score` 是 downstream BMK 的真实分数；`end_to_end_score` 会把 gate 失败样本计为 0，用于衡量端到端 yield。
-
-### Public-contract validator + repair loop
-
-当前新增了一层 creation 阶段的公开契约验证和可选修复循环：
+当前 RQ1 creation 阶段不再由外部 public validator/repair controller 指导模型。runner 只把公开/dev BMK feedback 命令放进 workspace，模型自己决定是否测试和如何修改：
 
 ```bash
 python run.py config.yaml \
   --task-id code-agent-harness \
   --creation-profile claude_code_scaffold_native \
-  --creation-repair-rounds 1 \
-  --repair-gate public-contract \
-  --repair-mode same-workspace
+  --dev-bmk-task-limit 3 \
+  --run-id code-rq1-opus
 ```
 
-流程是：
+生成 workspace 中会有：
 
-1. meta harness 先正常生成 harness；
-2. runner 执行 static/import/CLI 检查和 public toy/artifact contract；
-3. 若失败，结构化写入 `repair_reports.jsonl`，并把公开失败原因写入 `repair_prompts/repair_round_N.md`；
-4. 同一个 meta harness / generation LLM 在同一 workspace 修复；
-5. 达到 gate pass 或超过 `--creation-repair-rounds` 后，选择最后一次 attempt 进入后续 validation / BMK eval。
+- `DEV_BMK_COMMANDS.md`：说明该 domain 推荐自测哪些 BMK；
+- `run_dev_bmk.py`：调用 `run_creation_eval.py --max-tasks-per-bmk N`，在公开/dev subset 上运行当前 harness；
+- `dev_bmk_runs/`：保存每次自测的 `summary.csv`、`summary.jsonl`、stdout/stderr、raw result 和 index。
 
-repair 只使用公开 contract：schema、toy input、sample submission、产物格式、轨迹和日志检查。它不会读取 hidden BMK 分数、hidden labels 或答案。summary 里会记录：
+模型可以在 Claude Code 会话里反复执行：
 
-| 字段 | 含义 |
-|---|---|
-| `creation_attempts` | 初始生成 + repair 尝试次数 |
-| `repair_rounds` | 实际 repair 轮数 |
-| `gate_pass_before_repair` | 初始生成是否通过 public gate |
-| `gate_pass_after_repair` | 最终选择版本是否通过 public gate |
-| `repair_failure_reasons` | 每次失败的公开原因 |
-| `selected_attempt_path` | 最终进入 eval 的 attempt 路径 |
+```bash
+python3 run_dev_bmk.py --bench auto --max-tasks 3
+```
 
-public artifact contract 覆盖五类任务：
+然后根据 score、trajectory、artifact 和日志自行修改 harness，直到输出或写下 `FINISH`。正式 eval 只使用最终冻结的 harness，不能再把正式分数反馈给模型。
 
-| Domain | 最低公开可评测契约 |
-|---|---|
-| Code | 必须有真实 diff / changed_files，并记录 verifier/test command evidence。 |
-| MLE / Data | 若存在 `sample_submission.csv`，必须输出列名、行数、ID 顺序和标签域匹配的 `submission.csv`；DAComp 类任务还需结构化数值决策和非模板报告。 |
-| Writing | 必须输出最终用户可读文本，不接受只有日志、JSON metadata 或很短状态说明。 |
-| Research | 必须输出 answer/report 和 citation/evidence trace。 |
-| Browser | 必须输出 action trace 和 final state/result artifact。 |
+这会更直接地测 LLM 写 harness 的能力：模型不是满足我们写的 toy gate，而是用真实 BMK dev feedback 自己调试。
 
 质量分析脚本：
 
@@ -154,7 +131,7 @@ public artifact contract 覆盖五类任务：
 python tools/analyze_creation_quality.py \
   --run prompt_only=outputs/old_prompt_run \
   --run scaffold=outputs/claude_scaffold_run \
-  --run scaffold_repair=eval_results/new_scaffold_repair_eval \
+  --run scaffold_native_dev_feedback=outputs/claude_scaffold_native_run \
   --output-dir analysis_outputs/creation_quality
 ```
 
@@ -527,8 +504,8 @@ python3 run.py --list-model-aliases
 # 只生成/评测代码 harness，并跑 SWE-bench Pro + Terminal 2.0
 python3 run.py config.yaml \
   --task-id code-agent-harness \
-  --creation-profile interface_tool \
-  --pre-bmk-gate soft \
+  --creation-profile claude_code_scaffold_native \
+  --dev-bmk-task-limit 3 \
   --eval-after \
   --eval-domain code \
   --eval-bench swebench_pro,terminal_2_bench
@@ -536,8 +513,8 @@ python3 run.py config.yaml \
 # 只生成/评测写作 harness，并跑 Writing-bench + EQbench3
 python3 run.py config.yaml \
   --task-id writing-harness \
-  --creation-profile interface_tool \
-  --pre-bmk-gate soft \
+  --creation-profile claude_code_scaffold_native \
+  --dev-bmk-task-limit 3 \
   --eval-after \
   --eval-domain writing \
   --eval-bench writing_bench,eqbench3
@@ -550,8 +527,8 @@ python3 run.py config.yaml \
 
 summary 中的 token 字段口径如下：
 
-- `generation_tokens`：meta harness 在 creation / repair 阶段生成或修改 harness 的 token 消耗。
-- `repair_tokens`：public-contract repair loop 额外消耗的 token。
+- `generation_tokens`：meta harness 在 creation 阶段生成和自测修改 harness 的 token 消耗。
+- `repair_tokens`：保留的兼容字段；RQ1 当前不启用外部 public-contract repair loop，通常为空。
 - `harness_run_tokens`：生成或 evolve 出来的 harness 配上 eval LLM，在 downstream BMK 解题时的 token 消耗。它从 adapter 输出的 `metadata.json`、`trajectory.jsonl`、`result.json` 或 stdout usage marker 中提取；如果 harness 没有记录 LLM usage，这一列会留空而不是伪造。
 - `harness_run_token_breakdown`：`harness_run_tokens` 的明细，包括 input/output/reasoning token、来源文件和多 task BMK 的 per-task token。
 - 评分 judge 的 token 不计入 `harness_run_tokens`，会写进 `score_breakdown.judge_tokens`，避免把“被测 harness 成本”和“评分成本”混在一起。
@@ -560,7 +537,6 @@ summary 中的 token 字段口径如下：
 python3.12 run_creation_eval.py \
   --generation-output outputs/opus45 \
   --run-id opus45-dryrun \
-  --pre-bmk-gate soft \
   --dry-run
 ```
 
@@ -1065,7 +1041,7 @@ self_evolve_outputs/<run-id>/
 - `--meta-harness claude-code|codex`：谁来驱动 harness 修改。
 - `--model-name` / `--reasoning-effort`：self-evolve 阶段的 meta LLM，例如 `Claude4.7`、`GPT5.5`、`Seed2.0`。
 - `--eval-model-name` / `--eval-reasoning-effort`：evolved harness 在 downstream BMK 解题时调用的 LLM。
-- `--pre-bmk-gate soft|hard|off`：每轮 eval 前是否跑 pre-BMK validation。
+- `--pre-bmk-gate soft|hard|off`：兼容旧命令的隐藏参数；RQ1 正式链路不再使用 public gate。
 
 ---
 

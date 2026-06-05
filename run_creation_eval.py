@@ -11,11 +11,6 @@ from pathlib import Path
 from creation_eval.benchmarks import base_row, filter_matrix, load_matrix, run_benchmark
 from creation_eval.llm_runtime import LLMRuntime, configure_eval_llm
 from creation_eval.model_aliases import resolve_model_alias
-from creation_eval.pre_bmk_validation import (
-    apply_pre_bmk_report,
-    find_cached_pre_bmk_report,
-    run_pre_bmk_validation,
-)
 from creation_eval.schema import HarnessRunResult
 from creation_eval.utils import best_python_bin, load_env_file, write_json, write_jsonl, write_summary_csv
 from creation_eval.validator import discover_harness_artifacts, validate_artifact
@@ -26,6 +21,26 @@ def parse_csv_set(value: str | None) -> set[str] | None:
         return None
     items = {item.strip() for item in value.split(",") if item.strip()}
     return items or None
+
+
+def apply_max_tasks_per_bmk(matrix: list[dict], limit: int) -> list[dict]:
+    if limit <= 0:
+        return [dict(entry) for entry in matrix]
+    limited = []
+    for entry in matrix:
+        item = dict(entry)
+        item["n_limit"] = limit
+        runner = str(item.get("runner") or "")
+        if runner == "dacomp_generated":
+            item["task_ids"] = "all"
+            item["n_limit"] = limit
+        elif runner == "eqbench3":
+            item["default_subset"] = str(limit)
+        elif runner == "the_agent_company_generated":
+            item["task_image_name"] = "all"
+            item["n_limit"] = limit
+        limited.append(item)
+    return limited
 
 
 def main() -> int:
@@ -58,18 +73,10 @@ def main() -> int:
     )
     parser.add_argument("--eval-provider-proxy-port", type=int, default=3458)
     parser.add_argument("--dry-run", action="store_true", help="Validate and dependency-check only; do not launch BMK commands.")
-    parser.add_argument(
-        "--pre-bmk-gate",
-        default=os.environ.get("PRE_BMK_GATE", "soft"),
-        choices=["off", "soft", "hard"],
-        help="Run pre-BMK validation before downstream BMK. soft records failures but still runs; hard skips failed harnesses.",
-    )
-    parser.add_argument("--pre-bmk-timeout-seconds", type=int, default=300)
-    parser.add_argument(
-        "--refresh-pre-bmk-gate",
-        action="store_true",
-        help="Re-run public pre-BMK validation even when the creation-time selected gate report is available.",
-    )
+    parser.add_argument("--max-tasks-per-bmk", type=int, default=0, help="Limit each BMK to this many public/dev tasks. Omit for full eval.")
+    parser.add_argument("--pre-bmk-gate", default="off", choices=["off", "soft", "hard"], help=argparse.SUPPRESS)
+    parser.add_argument("--pre-bmk-timeout-seconds", type=int, default=300, help=argparse.SUPPRESS)
+    parser.add_argument("--refresh-pre-bmk-gate", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--proxy-smoke-for-unsupported",
         action="store_true",
@@ -108,6 +115,7 @@ def main() -> int:
         domains = parse_csv_set(args.domain)
         benches = parse_csv_set(args.bench)
         selected_matrix = filter_matrix(matrix, domains=domains, benches=benches)
+        selected_matrix = apply_max_tasks_per_bmk(selected_matrix, args.max_tasks_per_bmk)
         artifacts = discover_harness_artifacts(args.generation_output, args.generation_model)
         if args.max_harnesses:
             artifacts = artifacts[: args.max_harnesses]
@@ -116,25 +124,11 @@ def main() -> int:
         rows = []
         for artifact in artifacts:
             validation = validate_artifact(artifact, python_bin=python_bin)
-            validation.pre_bmk_gate_mode = args.pre_bmk_gate
+            validation.pre_bmk_gate_mode = "off"
             validation.creation_profile = str(validation.meta.get("creation_profile") or "")
             validation.meta["eval_model"] = eval_model_resolved or ""
             validation.meta["eval_model_input"] = eval_model_input
             validation.meta["eval_reasoning_effort"] = args.eval_reasoning_effort or os.environ.get("REASONING_EFFORT") or ""
-            if args.pre_bmk_gate != "off":
-                cached_report = None if args.refresh_pre_bmk_gate else find_cached_pre_bmk_report(artifact)
-                if cached_report is not None:
-                    validation = apply_pre_bmk_report(validation, cached_report)
-                else:
-                    validation = run_pre_bmk_validation(
-                        artifact,
-                        validation,
-                        output_dir / artifact.task_id / "_pre_bmk_validation",
-                        python_bin=python_bin,
-                        timeout=args.pre_bmk_timeout_seconds,
-                        run_toy=not args.dry_run,
-                    )
-                validation.pre_bmk_gate_mode = args.pre_bmk_gate
             validations[str(artifact.path)] = {
                 "task_id": artifact.task_id,
                 "domain": artifact.domain,
@@ -168,25 +162,18 @@ def main() -> int:
                 bench_output_dir = output_dir / artifact.task_id / str(entry.get("id"))
                 bench_output_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    if args.pre_bmk_gate == "hard" and validation.pre_bmk_gate_pass is False:
-                        result = HarnessRunResult(
-                            status="skipped/pre_bmk_gate_failed",
-                            missing_dependencies=[validation.pre_bmk_failure_reason or "pre-BMK validation gate failed"],
-                            raw_result_path=validation.pre_bmk_report_path,
-                        )
-                    else:
-                        result = run_benchmark(
-                            artifact,
-                            validation,
-                            entry,
-                            bench_output_dir,
-                            harness_eval_root=harness_eval_root,
-                            harness_evolve_root=args.harness_evolve_root,
-                            python_bin=python_bin,
-                            timeout=args.timeout_seconds,
-                            dry_run=args.dry_run,
-                            proxy_smoke_for_unsupported=args.proxy_smoke_for_unsupported,
-                        )
+                    result = run_benchmark(
+                        artifact,
+                        validation,
+                        entry,
+                        bench_output_dir,
+                        harness_eval_root=harness_eval_root,
+                        harness_evolve_root=args.harness_evolve_root,
+                        python_bin=python_bin,
+                        timeout=args.timeout_seconds,
+                        dry_run=args.dry_run,
+                        proxy_smoke_for_unsupported=args.proxy_smoke_for_unsupported,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     result = HarnessRunResult(
                         status="failed",
@@ -207,8 +194,9 @@ def main() -> int:
                 "bench": args.bench,
                 "domain": args.domain,
                 "dry_run": args.dry_run,
-                "pre_bmk_gate": args.pre_bmk_gate,
-                "pre_bmk_timeout_seconds": args.pre_bmk_timeout_seconds,
+                "pre_bmk_gate": "off",
+                "public_validation_gate": "disabled",
+                "max_tasks_per_bmk": args.max_tasks_per_bmk,
                 "proxy_smoke_for_unsupported": args.proxy_smoke_for_unsupported,
                 "eval_model_name": eval_model_resolved,
                 "eval_model_input": eval_model_input,

@@ -129,18 +129,19 @@ python -m harness \
 - 禁止 hard-code benchmark answer、固定 prompt 或固定输出。
 - 禁止依赖某一个测试任务；必须能处理未见 writing prompt。
 
-## Public validation / repair
+## Creation 阶段自测
 
-生成后会运行 public validation。它会检查：
+工作区会提供 `DEV_BMK_COMMANDS.md` 和 `run_dev_bmk.py`。你应该用公开/dev writing BMK 任务自测：
 
 - `generated_program.py` 是否不再是 stub；
 - CLI / scaffold adapter 是否可运行；
 - 是否生成 `response.md` 或等价正文 artifact；
 - 正文是否达到最低长度；
 - `trajectory.jsonl` 是否记录写作流程；
-- `result.json` 是否指向最终 artifact。
+- `result.json` 是否指向最终 artifact；
+- WritingBench / EQbench3 dev task 的日志、分数和失败原因是否说明 harness 需要调整。
 
-如果 validation 失败，repair round 会提供失败报告。repair 时必须优先修改 `generated_program.py`，确保文件内容真实变化，并重新运行最低 artifact 检查。
+没有外部 public validator / repair controller 会替你修改。你需要自己查看 dev BMK 的 score、stdout/stderr、trajectory 和 artifact，修改 harness，再自测，直到最终输出或写下 `FINISH`。
 
 ## 技术约束
 

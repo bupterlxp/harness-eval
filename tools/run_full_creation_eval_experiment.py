@@ -261,14 +261,8 @@ def generation_command(args: argparse.Namespace, spec: ModelSpec, output_dir: Pa
         spec.effort,
         "--creation-profile",
         args.creation_profile,
-        "--pre-bmk-gate",
-        args.pre_bmk_gate,
-        "--creation-repair-rounds",
-        str(args.creation_repair_rounds),
-        "--repair-gate",
-        args.repair_gate,
-        "--repair-mode",
-        args.repair_mode,
+        "--dev-bmk-task-limit",
+        str(args.dev_bmk_task_limit),
         "--task-id",
         ",".join(args.task_ids),
         "--max-concurrent",
@@ -306,8 +300,6 @@ def eval_command(args: argparse.Namespace, spec: ModelSpec, generation_output: P
         spec.effort,
         "--eval-provider-proxy-port",
         str(port),
-        "--pre-bmk-gate",
-        args.pre_bmk_gate,
         "--run-id",
         run_id,
     ]
@@ -327,15 +319,16 @@ def main() -> int:
     parser.add_argument("--task-ids", default=",".join(DEFAULT_TASK_IDS))
     parser.add_argument("--eval-bench", default="all")
     parser.add_argument("--eval-matrix", default="eval_matrix.yaml")
-    parser.add_argument("--creation-profile", default="interface_tool")
-    parser.add_argument("--pre-bmk-gate", default="soft", choices=["off", "soft", "hard"])
-    parser.add_argument("--creation-repair-rounds", type=int, default=0)
-    parser.add_argument("--repair-gate", default="public-contract", choices=["public-contract"])
-    parser.add_argument("--repair-mode", default="same-workspace", choices=["same-workspace"])
+    parser.add_argument("--creation-profile", default="claude_code_scaffold_native")
+    parser.add_argument("--dev-bmk-task-limit", type=int, default=3)
+    parser.add_argument("--pre-bmk-gate", default="off", choices=["off", "soft", "hard"], help=argparse.SUPPRESS)
+    parser.add_argument("--creation-repair-rounds", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--repair-gate", default="public-contract", choices=["public-contract"], help=argparse.SUPPRESS)
+    parser.add_argument("--repair-mode", default="same-workspace", choices=["same-workspace"], help=argparse.SUPPRESS)
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--harness-evolve-root", default="/Users/bytedance/Downloads/harness evolve project")
     parser.add_argument("--generation-concurrency", type=int, default=1)
-    parser.add_argument("--generation-timeout-minutes", type=int, default=180)
+    parser.add_argument("--generation-timeout-minutes", type=int, default=0)
     parser.add_argument("--eval-timeout-seconds", type=int, default=7200)
     parser.add_argument("--eval-provider-proxy-port-base", type=int, default=3658)
     parser.add_argument("--output-root", type=Path, default=Path("outputs/full_experiment"))
@@ -372,10 +365,9 @@ def main() -> int:
         "task_ids": args.task_ids,
         "eval_bench": args.eval_bench,
         "creation_profile": args.creation_profile,
-        "pre_bmk_gate": args.pre_bmk_gate,
-        "creation_repair_rounds": args.creation_repair_rounds,
-        "repair_gate": args.repair_gate,
-        "repair_mode": args.repair_mode,
+        "dev_bmk_task_limit": args.dev_bmk_task_limit,
+        "public_gate": "disabled",
+        "external_repair_loop": "disabled",
         "output_root": str(args.output_root),
         "eval_output_root": str(args.eval_output_root),
     }

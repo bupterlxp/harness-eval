@@ -3,6 +3,8 @@ set -e
 
 echo "=== Harness Eval: Configuring ccr ==="
 
+api_timeout_ms="${API_TIMEOUT_MS:-7200000}"
+
 mkdir -p "$HOME/.claude-code-router"
 cat > "$HOME/.claude-code-router/config.json" <<EOF
 {
@@ -12,7 +14,7 @@ cat > "$HOME/.claude-code-router/config.json" <<EOF
   "HOST": "127.0.0.1",
   "PORT": 3456,
   "APIKEY": "",
-  "API_TIMEOUT_MS": "600000",
+  "API_TIMEOUT_MS": "${api_timeout_ms}",
   "PROXY_URL": "",
   "NON_INTERACTIVE_MODE": true,
   "transformers": [],
@@ -85,7 +87,7 @@ export CLAUDE_REASONING_EFFORT="${CLAUDE_REASONING_EFFORT:-}"
 export NO_PROXY="127.0.0.1"
 export DISABLE_TELEMETRY="true"
 export DISABLE_COST_WARNINGS="true"
-export API_TIMEOUT_MS="600000"
+export API_TIMEOUT_MS="${api_timeout_ms}"
 
 echo "=== Starting Claude Code ==="
 

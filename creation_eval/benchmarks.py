@@ -1013,6 +1013,7 @@ def run_dacomp_generated(
         else:
             tasks = [task for task in all_tasks if task.get("instance_id") in set(selected_ids)]
             task_ids = selected_ids
+    tasks = _limit_sequence(tasks, entry.get("n_limit"), default=None)
     if not tasks:
         return HarnessRunResult(status="failed", error=f"No DAComp tasks selected from {task_file}: {task_ids}")
 

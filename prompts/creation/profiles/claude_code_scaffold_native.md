@@ -34,7 +34,7 @@ CLAUDE_CODE_SCAFFOLD.md
 - task graph、checkpoint / rollback；
 - context compaction；
 - domain artifact validator；
-- repair feedback；
+- dev feedback / failure report parsing；
 - cost tracking。
 
 你可以新增自己的工具、模块、策略文件和 verifier，但新增能力应当注册或接入这个 scaffold runtime。不要完全不用 `harness_scaffold` 后另写一套独立工具系统。
@@ -118,13 +118,16 @@ python -m harness \
 - **research**：必须记录搜索、阅读、证据或 citation trace；答案需要可追溯来源。
 - **browser**：必须记录 navigate/click/type/extract 等 action trace 和最终状态/结果文件。
 
-## Public validator / repair loop
+## Downstream BMK dev feedback loop
 
-生成后会先跑公开 validation：
+工作区会提供 `DEV_BMK_COMMANDS.md` 和 `run_dev_bmk.py`。它们允许你在 creation 阶段用公开/dev subset 跑少量真实 BMK 任务，查看分数、stdout/stderr、trajectory、artifact 和 raw result。
 
-- scaffold program syntax/import/CLI；
-- toy task execution；
-- public artifact contract；
-- domain-specific 最低产物检查。
+这不是 public validation gate，也没有外部 repair controller。你需要自己决定：
 
-如果失败，系统会把结构化 validation report 反馈给你，并要求在同一 workspace 修复。repair 只使用公开 schema、toy task、公开 sample artifact 和运行日志，不会提供 hidden BMK 分数或答案。
+- 何时运行 `python3 run_dev_bmk.py --bench auto --max-tasks 3` 或指定某个 BMK；
+- 如何根据 dev BMK score、日志、失败 artifact 和 trajectory 判断 harness 问题；
+- 如何修改 `generated_program.py`、policy/verifier/context/recovery/custom tools；
+- 何时再次运行 dev BMK；
+- 何时认为 harness 已可进入正式 eval，并输出或写下 `FINISH`。
+
+不要把 dev subset 当正式分数，也不要 hard-code dev task、instance id、答案或固定输出。正式 eval 会在隔离的 BMK subset 上只运行最终 harness，不再给你修改机会。

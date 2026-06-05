@@ -50,16 +50,19 @@ model_aliases:
 system_prompt_file: "./prompts/system_prompt.md"
 include_system_prompt: true
 
-# 主实验 creation profile。推荐 interface_tool：
-# 固定 CLI/tool/logging/result schema，模型生成 control loop/context/verifier/recovery。
-# 可选：freeform / interface / interface_tool / full_loop
-creation_profile: "interface_tool"
+# 主实验 creation profile。RQ1 主 setting 推荐 claude_code_scaffold_native：
+# 固定 Claude Code atomic scaffold/runtime，让模型主要设计 harness policy、编排、
+# verifier、recovery 和 artifact 组织。
+# 可选：freeform / interface / interface_tool / full_loop /
+#       claude_code_scaffold / claude_code_scaffold_native
+creation_profile: "claude_code_scaffold_native"
 
-# 进入下游 BMK 前的 validation gate：
-# - off: 不做 pre-BMK validation
-# - soft: 记录 gate 结果，但仍继续跑 downstream BMK，适合 pilot
-# - hard: gate 失败则不进入 expensive BMK，end_to_end_score 记 0
-pre_bmk_gate: "soft"
+# Creation 阶段给 meta harness + LLM 暴露公开/dev BMK feedback 命令。
+# 这不是 validation gate，也没有外部 repair controller；模型自己决定是否调用
+# run_dev_bmk.py、如何读分数/轨迹/日志、如何修改 harness、何时 FINISH。
+enable_dev_bmk_feedback: true
+dev_bmk_task_limit: 3
+harness_evolve_root: "/Users/bytedance/Downloads/harness evolve project"
 
 # Self-evolve 默认设置。run_self_evolve.py 仍然可以用命令行覆盖这些项。
 # mode=goal: 给 harness 一个目标，让它根据 BMK 分数/轨迹自我迭代。
@@ -72,7 +75,8 @@ self_evolve:
 
 # Docker settings
 max_concurrent: 4
-timeout_minutes: 30
+# RQ1 正式 creation 默认不设 timeout；如需 pilot/debug 可临时设置分钟数。
+timeout_minutes:
 workspace_dir: "/workspace"
 output_dir: "./outputs"
 tasks_file: "./tasks.jsonl"

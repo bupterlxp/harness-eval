@@ -60,9 +60,11 @@ python -m harness \
 - `stdout.log` / `stderr.log` 或等价日志；
 - domain-specific artifact，例如 patch、代码文件、submission.csv、REPORT.md、risk_scores.csv、图片、研究证据或浏览器结果。
 
-## Pre-BMK gate 标准
+## BMK dev feedback 自测标准
 
-进入真实 BMK 前会检查：
+工作区会提供 `DEV_BMK_COMMANDS.md` 和 `run_dev_bmk.py`。你可以用公开/dev subset 自己运行少量真实 BMK 任务，并从 score、stdout/stderr、raw result、artifact 和 trajectory 中判断 harness 是否可用。
+
+你在自测和修改时至少应该关注：
 
 - 语法、import、CLI probe；
 - `result.json`、`trajectory.jsonl`、stdout/stderr 日志；
@@ -81,18 +83,9 @@ python -m harness \
 
 成功只能来自真实执行和真实产物。固定模板、文件列表、执行步骤列表不能标记为 `success`。
 
-## Public validator / repair loop
+没有外部 public gate 或 repair controller 会替你判断并返修。你需要自己运行 dev BMK、读取反馈、修改 harness、再次测试，直到认为最终 harness 可以进入正式 eval，并输出或写下 `FINISH`。
 
-生成结束后，系统会先运行公开验证，而不是直接相信 harness 的 `success`：
-
-- static/import/CLI probe；
-- toy task execution；
-- public artifact contract；
-- domain-specific 最低产物检查。
-
-如果失败，系统会把结构化 validation report 追加到工作区，并要求你在同一 workspace 修复已有 harness。这个 repair 过程只使用公开 schema、toy task、公开 sample artifact 和运行日志，不会提供 hidden BMK 分数或答案。
-
-因此，harness 需要把真实执行证据写出来，方便 validator 判断：
+因此，harness 需要把真实执行证据写出来，方便从 dev BMK 轨迹中分析：
 
 - `result.json` 中写出 `status`、`artifacts`、`tool_calls`、`errors`、`commands_run` 或等价字段；
 - `trajectory.jsonl` 中保留每轮 action/observation；

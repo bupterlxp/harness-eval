@@ -34,18 +34,17 @@ from creation_eval.model_aliases import (
     resolve_codex_model_alias,
     resolve_model_alias,
 )
-from creation_eval.pre_bmk_validation import run_pre_bmk_validation
-from creation_eval.schema import HarnessArtifact
 from creation_eval.scaffold_runtime import (
     is_scaffold_native_profile,
     is_scaffold_resource_profile,
     scaffold_source_available,
     vendor_scaffold_dir,
 )
-from creation_eval.validator import infer_domain, validate_artifact
 
 
 SCAFFOLD_USAGE_SOURCE = Path(__file__).resolve().parent / "vendor" / "CLAUDE_CODE_SCAFFOLD_USAGE.md"
+HARNESS_EVAL_ROOT = Path(__file__).resolve().parent
+DEFAULT_HARNESS_EVOLVE_ROOT = Path("/Users/bytedance/Downloads/harness evolve project")
 
 
 def default_config() -> dict:
@@ -67,7 +66,7 @@ def default_config() -> dict:
         "codex_enable_search": False,
         "codex_extra_args": "",
         "max_concurrent": 1,
-        "timeout_minutes": 30,
+        "timeout_minutes": None,
         "workspace_dir": "/workspace",
         "output_dir": "./outputs",
         "tasks_file": "./tasks.jsonl",
@@ -75,10 +74,9 @@ def default_config() -> dict:
         "include_system_prompt": True,
         "creation_profile": os.environ.get("CREATION_PROFILE", "interface_tool"),
         "creation_profile_dir": "./prompts/creation/profiles",
-        "pre_bmk_gate": os.environ.get("PRE_BMK_GATE", "soft"),
-        "creation_repair_rounds": int(os.environ.get("CREATION_REPAIR_ROUNDS", "0") or "0"),
-        "repair_gate": os.environ.get("REPAIR_GATE", "public-contract"),
-        "repair_mode": os.environ.get("REPAIR_MODE", "same-workspace"),
+        "enable_dev_bmk_feedback": os.environ.get("ENABLE_DEV_BMK_FEEDBACK", "1").lower() not in {"0", "false", "no"},
+        "dev_bmk_task_limit": int(os.environ.get("DEV_BMK_TASK_LIMIT", "3") or "3"),
+        "harness_evolve_root": os.environ.get("HARNESS_EVOLVE_ROOT", str(DEFAULT_HARNESS_EVOLVE_ROOT)),
     }
 
 
@@ -131,16 +129,18 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "tasks_file": args.tasks_file,
         "system_prompt_file": args.system_prompt,
         "creation_profile": args.creation_profile,
-        "pre_bmk_gate": args.pre_bmk_gate,
-        "creation_repair_rounds": args.creation_repair_rounds,
-        "repair_gate": args.repair_gate,
-        "repair_mode": args.repair_mode,
+        "enable_dev_bmk_feedback": None if args.enable_dev_bmk_feedback else False,
+        "dev_bmk_task_limit": args.dev_bmk_task_limit,
+        "harness_evolve_root": args.harness_evolve_root,
         "max_concurrent": args.max_concurrent,
         "timeout_minutes": args.timeout_minutes,
     }
     for key, value in override_fields.items():
         if value is not None:
-            config[key] = value
+            if key == "timeout_minutes":
+                config[key] = None if value <= 0 else value
+            else:
+                config[key] = value
     if args.no_system_prompt:
         config["include_system_prompt"] = False
     if args.codex_enable_search:
@@ -280,13 +280,15 @@ def compose_prompt(prompt: str, config: dict) -> str:
 def build_docker_image(force: bool = False):
     if not force:
         existing = subprocess.run(
-            ["docker", "image", "inspect", "harness-eval:latest"],
+            ["docker", "image", "inspect", "-f", "{{ index .Config.Labels \"harness-eval.dev-bmk\" }}", "harness-eval:latest"],
             capture_output=True,
             text=True,
         )
-        if existing.returncode == 0:
-            print("Docker image harness-eval:latest already exists; skipping build.")
+        if existing.returncode == 0 and existing.stdout.strip() == "1":
+            print("Docker image harness-eval:latest already has dev-BMK support; skipping build.")
             return
+        if existing.returncode == 0:
+            print("Docker image harness-eval:latest exists but lacks dev-BMK support; rebuilding.")
     print("Building Docker image...")
     subprocess.run(
         ["docker", "build", "-t", "harness-eval", "."],
@@ -349,6 +351,7 @@ def prepare_workspace(task: dict, workspace: str):
                 shutil.copy2(src, dest)
 
     install_scaffold_resources(ws, task["_config"])
+    install_dev_bmk_feedback_tools(ws, task, task["_config"])
 
 
 def install_scaffold_resources(workspace: Path, config: dict) -> None:
@@ -532,38 +535,275 @@ if __name__ == "__main__":
         )
 
 
-def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
+def _bench_defaults_for_task(task_id: str) -> str:
+    mapping = {
+        "code-agent-harness": "terminal_2_bench,swebench_pro",
+        "data-analysis-harness": "mle_bench,dacomp",
+        "writing-harness": "writing_bench,eqbench3",
+        "research-agent-harness": "deepresearch_bench,browsecomp",
+        "browser-agent-harness": "the_agent_company",
+    }
+    return mapping.get(task_id, "all")
+
+
+def install_dev_bmk_feedback_tools(workspace: Path, task: dict, config: dict) -> None:
+    """Expose real public/dev BMK feedback commands to the creation agent.
+
+    This is intentionally a thin experiment shell: the meta harness + LLM decides
+    when to call the command, how to interpret trajectories, how to modify the
+    harness, and when to finish. The runner only provides stable commands and
+    records outputs.
+    """
+
+    if not config.get("enable_dev_bmk_feedback", True):
+        return
+
+    task_id = str(task.get("id") or "")
+    default_benches = _bench_defaults_for_task(task_id)
+    limit = max(1, int(config.get("dev_bmk_task_limit") or 3))
+    config_payload = {
+        "task_id": task_id,
+        "domain": task_id.replace("-harness", "").replace("-agent", ""),
+        "default_benches": default_benches,
+        "default_max_tasks_per_bmk": limit,
+        "harness_eval_root": "/harness-eval",
+        "harness_evolve_root": "/harness-evolve",
+        "output_root": "dev_bmk_runs",
+        "notes": (
+            "Use run_dev_bmk.py during creation to test the current harness on public/dev BMK tasks. "
+            "These runs are for the creation agent's own feedback, not a public validation gate."
+        ),
+    }
+    (workspace / "dev_bmk_config.json").write_text(
+        json.dumps(config_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (workspace / "DEV_BMK_COMMANDS.md").write_text(
+        f"""# Downstream BMK Dev Feedback Commands
+
+This workspace provides real public/dev benchmark feedback for harness creation.
+
+There is no public-validation gate and no external repair controller. You, the
+meta harness + LLM creation agent, should decide when to test, how to read the
+results, how to revise the harness, and when to stop.
+
+## Default command
+
+```bash
+python3 run_dev_bmk.py --bench auto --max-tasks {limit}
+```
+
+`auto` selects the public/dev BMKs for this creation task:
+
+```text
+{default_benches}
+```
+
+You may also choose a specific BMK:
+
+```bash
+python3 run_dev_bmk.py --bench mle_bench --max-tasks {limit}
+python3 run_dev_bmk.py --bench terminal_2_bench --max-tasks {limit}
+python3 run_dev_bmk.py --bench browsecomp --max-tasks {limit}
+```
+
+## What to inspect
+
+Each run writes under `dev_bmk_runs/<timestamp>/`:
+
+- `summary.csv`
+- `summary.jsonl`
+- `validation.json` with minimal adapter/CLI status only
+- per-BMK stdout/stderr/raw result artifacts
+
+Use these files, plus any generated `trajectory.jsonl`, harness artifacts, and
+stdout/stderr, to decide what to change.
+
+## Finish condition
+
+When you believe the harness is ready for formal downstream eval, write or say
+`FINISH` and leave the final harness files in this workspace. The outer runner
+will freeze the workspace after your Claude Code task exits.
+""",
+        encoding="utf-8",
+    )
+
+    (workspace / "run_dev_bmk.py").write_text(
+        '''#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+CONFIG = json.loads((ROOT / "dev_bmk_config.json").read_text(encoding="utf-8"))
+
+
+def ensure_meta() -> None:
+    meta_path = ROOT / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    else:
+        meta = {}
+    meta.setdefault("task_id", CONFIG.get("task_id") or ROOT.name)
+    meta.setdefault("status", "success")
+    meta.setdefault("creation_profile", "claude_code_scaffold_native")
+    meta["dev_bmk_feedback_enabled"] = True
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\\n", encoding="utf-8")
+
+
+def append_index(record: dict) -> None:
+    index_path = ROOT / "dev_bmk_runs" / "index.jsonl"
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    with index_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\\n")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run public/dev BMK feedback for the current generated harness.")
+    parser.add_argument("--bench", default="auto", help="BMK id(s), comma-separated, or auto.")
+    parser.add_argument("--max-tasks", type=int, default=int(CONFIG.get("default_max_tasks_per_bmk") or 3))
+    parser.add_argument("--timeout-seconds", type=int, default=int(os.environ.get("DEV_BMK_TIMEOUT_SECONDS", "3600")))
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--eval-model-name", default=os.environ.get("EVAL_MODEL_NAME") or os.environ.get("MODEL_NAME") or "")
+    parser.add_argument("--eval-base-url", default=os.environ.get("EVAL_BASE_URL") or os.environ.get("BASE_URL") or "")
+    args = parser.parse_args()
+
+    ensure_meta()
+    harness_eval_root = Path(os.environ.get("HARNESS_EVAL_ROOT") or CONFIG.get("harness_eval_root") or "/harness-eval")
+    harness_evolve_root = Path(os.environ.get("HARNESS_EVOLVE_ROOT") or CONFIG.get("harness_evolve_root") or "/harness-evolve")
+    bench = CONFIG.get("default_benches") if args.bench == "auto" else args.bench
+    run_id = "dev-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_root = ROOT / str(CONFIG.get("output_root") or "dev_bmk_runs")
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        sys.executable,
+        str(harness_eval_root / "run_creation_eval.py"),
+        "--generation-output",
+        str(ROOT),
+        "--matrix",
+        str(harness_eval_root / "eval_matrix.yaml"),
+        "--bench",
+        str(bench),
+        "--run-id",
+        run_id,
+        "--eval-output-root",
+        str(output_root),
+        "--harness-evolve-root",
+        str(harness_evolve_root),
+        "--python-bin",
+        sys.executable,
+        "--timeout-seconds",
+        str(args.timeout_seconds),
+        "--max-tasks-per-bmk",
+        str(max(1, args.max_tasks)),
+    ]
+    if args.eval_model_name:
+        command.extend(["--eval-model-name", args.eval_model_name])
+    if args.eval_base_url:
+        command.extend(["--eval-base-url", args.eval_base_url])
+    if args.dry_run:
+        command.append("--dry-run")
+
+    env = os.environ.copy()
+    if not env.get("EVAL_API_KEY"):
+        env["EVAL_API_KEY"] = env.get("API_KEY", "")
+    if not env.get("EVAL_BASE_URL"):
+        env["EVAL_BASE_URL"] = env.get("BASE_URL", "")
+    if not env.get("EVAL_MODEL_NAME"):
+        env["EVAL_MODEL_NAME"] = env.get("MODEL_NAME", "")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+    print("Running public/dev BMK feedback:")
+    print(" ".join(command))
+    result = subprocess.run(command, cwd=ROOT, env=env)
+    output_dir = output_root / run_id
+    record = {
+        "run_id": run_id,
+        "bench": bench,
+        "max_tasks": args.max_tasks,
+        "returncode": result.returncode,
+        "output_dir": str(output_dir),
+        "summary_csv": str(output_dir / "summary.csv"),
+        "summary_jsonl": str(output_dir / "summary.jsonl"),
+    }
+    append_index(record)
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return result.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''',
+        encoding="utf-8",
+    )
+    os.chmod(workspace / "run_dev_bmk.py", 0o755)
+
+
+def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int | None) -> tuple[str, str, str]:
     container_name = f"harness-eval-{task_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    harness_evolve_root = Path(str(config.get("harness_evolve_root") or DEFAULT_HARNESS_EVOLVE_ROOT)).expanduser()
+    docker_command = [
+        "docker", "run",
+        "--name", container_name,
+        "-e", f"BASE_URL={config['base_url']}",
+        "-e", f"API_KEY={config['api_key']}",
+        "-e", f"MODEL_NAME={config['model_name']}",
+        "-e", f"CLAUDE_MODEL_NAME={config.get('claude_model_name', 'claude-sonnet-4-6')}",
+        "-e", f"CLAUDE_NATIVE_ANTHROPIC={os.environ.get('CLAUDE_NATIVE_ANTHROPIC', '1' if 'anthropic' in str(config.get('base_url', '')).lower() else '')}",
+        "-e", f"ANTHROPIC_BASE_URL={os.environ.get('ANTHROPIC_BASE_URL', config.get('base_url', ''))}",
+        "-e", f"ANTHROPIC_AUTH_TOKEN={os.environ.get('ANTHROPIC_AUTH_TOKEN', config.get('api_key', ''))}",
+        "-e", f"ANTHROPIC_API_KEY={os.environ.get('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_AUTH_TOKEN', config.get('api_key', '')))}",
+        "-e", f"ANTHROPIC_MODEL={os.environ.get('ANTHROPIC_MODEL', config.get('model_name', ''))}",
+        "-e", f"CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING={os.environ.get('CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING', '')}",
+        "-e", f"CLAUDE_CODE_THINKING={os.environ.get('CLAUDE_CODE_THINKING', '')}",
+        "-e", f"CLAUDE_CODE_THINKING_EFFORT={os.environ.get('CLAUDE_CODE_THINKING_EFFORT', config.get('reasoning_effort') or '')}",
+        "-e", f"META_HARNESS={config.get('meta_harness', 'claude-code')}",
+        "-e", f"CLAUDE_REASONING_EFFORT={config.get('reasoning_effort') or ''}",
+        "-e", f"OPENROUTER_VERBOSITY={config.get('reasoning_effort') or ''}",
+        "-e", f"OPENROUTER_REASONING_ENABLED={'true' if config.get('reasoning_effort') else ''}",
+        "-e", f"PROVIDER_EXTRA_BODY_JSON={os.environ.get('PROVIDER_EXTRA_BODY_JSON', '')}",
+        "-e", f"PROVIDER_EXTRA_HEADERS_JSON={os.environ.get('PROVIDER_EXTRA_HEADERS_JSON', '')}",
+        "-e", f"PROVIDER_STRIP_MAX_TOKENS={os.environ.get('PROVIDER_STRIP_MAX_TOKENS', '')}",
+        "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
+        "-e", f"PROVIDER_DEFAULT_MAX_TOKENS={os.environ.get('PROVIDER_DEFAULT_MAX_TOKENS', '')}",
+        "-e", f"EVAL_BASE_URL={config.get('eval_base_url') or config.get('base_url') or ''}",
+        "-e", f"EVAL_API_KEY={config.get('eval_api_key') or config.get('api_key') or ''}",
+        "-e", f"EVAL_MODEL_NAME={config.get('eval_model_name') or config.get('model_name') or ''}",
+        "-e", f"EVAL_REASONING_EFFORT={config.get('eval_reasoning_effort') or config.get('reasoning_effort') or ''}",
+        "-e", "HARNESS_EVAL_ROOT=/harness-eval",
+        "-e", "HARNESS_EVOLVE_ROOT=/harness-evolve",
+        "-e", "PYTHONDONTWRITEBYTECODE=1",
+        "-v", f"{HARNESS_EVAL_ROOT / 'entrypoint.sh'}:/entrypoint.sh:ro",
+        "-v", f"{HARNESS_EVAL_ROOT / 'model-proxy.js'}:/model-proxy.js:ro",
+        "-v", f"{HARNESS_EVAL_ROOT}:/harness-eval:ro",
+        "-v", f"{harness_evolve_root}:/harness-evolve:ro",
+        "-v", f"{workspace}:/workspace",
+    ]
+    docker_sock = Path("/var/run/docker.sock")
+    if docker_sock.exists():
+        docker_command.extend([
+            "-v",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "--group-add",
+            str(docker_sock.stat().st_gid),
+            "-e",
+            "DOCKER_HOST=unix:///var/run/docker.sock",
+        ])
+    docker_command.append("harness-eval")
     try:
         result = subprocess.run(
-            [
-                "docker", "run",
-                "--name", container_name,
-                "-e", f"BASE_URL={config['base_url']}",
-                "-e", f"API_KEY={config['api_key']}",
-                "-e", f"MODEL_NAME={config['model_name']}",
-                "-e", f"CLAUDE_MODEL_NAME={config.get('claude_model_name', 'claude-sonnet-4-6')}",
-                "-e", f"CLAUDE_NATIVE_ANTHROPIC={os.environ.get('CLAUDE_NATIVE_ANTHROPIC', '1' if 'anthropic' in str(config.get('base_url', '')).lower() else '')}",
-                "-e", f"ANTHROPIC_BASE_URL={os.environ.get('ANTHROPIC_BASE_URL', config.get('base_url', ''))}",
-                "-e", f"ANTHROPIC_AUTH_TOKEN={os.environ.get('ANTHROPIC_AUTH_TOKEN', config.get('api_key', ''))}",
-                "-e", f"ANTHROPIC_API_KEY={os.environ.get('ANTHROPIC_API_KEY', os.environ.get('ANTHROPIC_AUTH_TOKEN', config.get('api_key', '')))}",
-                "-e", f"ANTHROPIC_MODEL={os.environ.get('ANTHROPIC_MODEL', config.get('model_name', ''))}",
-                "-e", f"CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING={os.environ.get('CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING', '')}",
-                "-e", f"CLAUDE_CODE_THINKING={os.environ.get('CLAUDE_CODE_THINKING', '')}",
-                "-e", f"CLAUDE_CODE_THINKING_EFFORT={os.environ.get('CLAUDE_CODE_THINKING_EFFORT', config.get('reasoning_effort') or '')}",
-                "-e", f"META_HARNESS={config.get('meta_harness', 'claude-code')}",
-                "-e", f"CLAUDE_REASONING_EFFORT={config.get('reasoning_effort') or ''}",
-                "-e", f"OPENROUTER_VERBOSITY={config.get('reasoning_effort') or ''}",
-                "-e", f"OPENROUTER_REASONING_ENABLED={'true' if config.get('reasoning_effort') else ''}",
-                "-e", f"PROVIDER_EXTRA_BODY_JSON={os.environ.get('PROVIDER_EXTRA_BODY_JSON', '')}",
-                "-e", f"PROVIDER_EXTRA_HEADERS_JSON={os.environ.get('PROVIDER_EXTRA_HEADERS_JSON', '')}",
-                "-e", f"PROVIDER_STRIP_MAX_TOKENS={os.environ.get('PROVIDER_STRIP_MAX_TOKENS', '')}",
-                "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
-                "-e", f"PROVIDER_DEFAULT_MAX_TOKENS={os.environ.get('PROVIDER_DEFAULT_MAX_TOKENS', '')}",
-                "-v", f"{Path(__file__).resolve().parent / 'model-proxy.js'}:/model-proxy.js:ro",
-                "-v", f"{workspace}:/workspace",
-                "harness-eval",
-            ],
+            docker_command,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -587,7 +827,7 @@ def codex_reasoning_effort(value: str | None) -> str | None:
     return value
 
 
-def run_codex_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
+def run_codex_generation(task_id: str, workspace: str, config: dict, timeout: int | None) -> tuple[str, str, str]:
     codex_bin = str(config.get("codex_bin") or "codex")
     resolved_codex_bin = shutil.which(codex_bin) or codex_bin
     if not Path(resolved_codex_bin).exists() and shutil.which(resolved_codex_bin) is None:
@@ -668,7 +908,7 @@ def run_codex_generation(task_id: str, workspace: str, config: dict, timeout: in
         return "error", "", str(e)
 
 
-def run_generation(task_id: str, workspace: str, config: dict, timeout: int) -> tuple[str, str, str]:
+def run_generation(task_id: str, workspace: str, config: dict, timeout: int | None) -> tuple[str, str, str]:
     meta_harness = str(config.get("meta_harness") or "claude-code")
     if meta_harness == "claude-code":
         return run_claude_code_generation(task_id, workspace, config, timeout)
@@ -700,16 +940,7 @@ def _copy_workspace_contents(src: Path, dst: Path) -> None:
             shutil.copy2(item, dest)
 
 
-def _attempt_meta(
-    task: dict,
-    config: dict,
-    *,
-    status: str,
-    stdout: str,
-    stderr: str,
-    attempt_index: int,
-    repair_rounds_run: int,
-) -> dict:
+def _generation_meta(task: dict, config: dict, *, status: str, stdout: str, stderr: str) -> dict:
     return {
         "task_id": task["id"],
         "status": status,
@@ -719,11 +950,8 @@ def _attempt_meta(
         "scaffold_source": "vendor/harness_scaffold"
         if is_scaffold_resource_profile(str(config.get("creation_profile") or ""))
         else None,
-        "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
-        "repair_gate": config.get("repair_gate", "public-contract"),
-        "repair_mode": config.get("repair_mode", "same-workspace"),
-        "attempt_index": attempt_index,
-        "repair_rounds_run": repair_rounds_run,
+        "dev_bmk_feedback_enabled": bool(config.get("enable_dev_bmk_feedback", True)),
+        "dev_bmk_task_limit": config.get("dev_bmk_task_limit"),
         "generation_model_input": config.get("model_name_input"),
         "generation_model": config.get("model_name"),
         "eval_model_input": config.get("eval_model_name_input"),
@@ -740,154 +968,26 @@ def _attempt_meta(
     }
 
 
-def _validate_workspace_attempt(
-    *,
-    task: dict,
-    config: dict,
-    workspace: Path,
-    task_output_dir: Path,
-    attempt_index: int,
-    status: str,
-    stdout: str,
-    stderr: str,
-) -> dict:
-    meta = _attempt_meta(
-        task,
-        config,
-        status=status,
-        stdout=stdout,
-        stderr=stderr,
-        attempt_index=attempt_index,
-        repair_rounds_run=max(0, attempt_index),
-    )
-    (workspace / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    artifact = HarnessArtifact(
-        path=workspace,
-        task_id=str(task["id"]),
-        domain=infer_domain(str(task["id"]), workspace),
-        generation_model=str(config.get("model_name") or config.get("model_name_input") or "unknown"),
-    )
-    python_bin = sys.executable
-    validation = validate_artifact(artifact, python_bin=python_bin)
-    validation.creation_profile = str(config.get("creation_profile") or "")
-    validation.pre_bmk_gate_mode = str(config.get("pre_bmk_gate") or "soft")
-    validation = run_pre_bmk_validation(
-        artifact,
-        validation,
-        task_output_dir / f"attempt_{attempt_index}_public_contract",
-        python_bin=python_bin,
-        timeout=300,
-        run_toy=True,
-    )
-    report = {
-        "attempt_index": attempt_index,
-        "status": status,
-        "stdout_tail": stdout[-2000:] if stdout else "",
-        "stderr_tail": stderr[-2000:] if stderr else "",
-        "generation_status": validation.generation_status,
-        "syntax_ok": validation.syntax_ok,
-        "import_ok": validation.import_ok,
-        "cli_probe_ok": validation.cli_probe_ok,
-        "adapter_status": validation.adapter_status,
-        "runnable": validation.runnable,
-        "gate_pass": validation.pre_bmk_gate_pass,
-        "gate_failure_reason": validation.pre_bmk_failure_reason,
-        "toy_task_score": validation.pre_bmk_toy_task_score,
-        "static_check_pass": validation.pre_bmk_static_pass,
-        "artifact_check_pass": validation.pre_bmk_artifact_pass,
-        "pre_bmk_report_path": validation.pre_bmk_report_path,
-        "missing_dependencies": validation.missing_dependencies,
-        "errors": validation.errors,
+def _attach_generation_metrics(meta: dict, task_output_dir: Path) -> None:
+    metrics_file = task_output_dir / "metrics.json"
+    if not metrics_file.exists():
+        return
+    try:
+        metrics = json.loads(metrics_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return
+    meta["metrics"] = {
+        "total_requests": metrics.get("total_requests", 0),
+        "total_input_tokens": metrics.get("total_input_tokens", 0),
+        "total_output_tokens": metrics.get("total_output_tokens", 0),
+        "total_cache_read_tokens": metrics.get("total_cache_read_tokens", 0),
+        "total_cache_creation_tokens": metrics.get("total_cache_creation_tokens", 0),
+        "total_tokens": metrics.get("total_input_tokens", 0) + metrics.get("total_output_tokens", 0),
+        "effective_requests": metrics.get("effective_requests", 0),
+        "effective_input_tokens": metrics.get("effective_input_tokens", 0),
+        "effective_output_tokens": metrics.get("effective_output_tokens", 0),
+        "retry_requests": metrics.get("retry_requests", 0),
     }
-    return report
-
-
-def _repair_prompt(report: dict, round_index: int) -> str:
-    failure_report = json.dumps(report, ensure_ascii=False, indent=2)
-    return f"""# Public-Contract Repair Round {round_index}
-
-The harness you generated did not pass the public creation validation gate. Repair the existing harness files in this same workspace.
-
-Rules:
-- Use only the public validation report below. Do not assume hidden benchmark labels, hidden scores, or hidden answers.
-- Keep the same public CLI contract and generated harness layout.
-- Fix the concrete runnable artifact. Do not answer with a plan only.
-- Preserve useful working code and only change what is needed to pass static/import/CLI, toy execution, and public artifact-contract checks.
-- The repaired harness must still work for unseen downstream BMK tasks in the same domain.
-
-Validation report:
-
-```json
-{failure_report}
-```
-"""
-
-
-def _write_repair_instruction(workspace: Path, task_output_dir: Path, report: dict, round_index: int) -> None:
-    prompt = _repair_prompt(report, round_index)
-    repair_dir = task_output_dir / "repair_prompts"
-    repair_dir.mkdir(parents=True, exist_ok=True)
-    (repair_dir / f"repair_round_{round_index}.md").write_text(prompt, encoding="utf-8")
-    repair_file = workspace / f"REPAIR_INSTRUCTIONS_ROUND_{round_index}.md"
-    repair_file.write_text(prompt, encoding="utf-8")
-    claude_md = workspace / "CLAUDE.md"
-    with claude_md.open("a", encoding="utf-8") as handle:
-        handle.write("\n\n---\n\n")
-        handle.write(f"# Repair Round {round_index}\n\n")
-        handle.write(f"Read `REPAIR_INSTRUCTIONS_ROUND_{round_index}.md` and repair the generated harness accordingly.\n")
-
-
-def _append_repair_report(task_output_dir: Path, report: dict) -> None:
-    path = task_output_dir / "repair_reports.jsonl"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(report, ensure_ascii=False) + "\n")
-
-
-def _persist_selected_pre_bmk_report(task_output_dir: Path, repair_attempts: list[dict]) -> str:
-    if not repair_attempts:
-        return ""
-    report_value = str(repair_attempts[-1].get("pre_bmk_report_path") or "")
-    if not report_value:
-        return ""
-    report_path = Path(report_value)
-    if not report_path.is_absolute():
-        report_path = Path.cwd() / report_path
-    if not report_path.is_file():
-        return ""
-    canonical_dir = task_output_dir / "_pre_bmk_validation"
-    canonical_dir.mkdir(parents=True, exist_ok=True)
-    canonical_path = canonical_dir / "pre_bmk_validation.json"
-    shutil.copy2(report_path, canonical_path)
-    return str(canonical_path.resolve())
-
-
-def _run_generation_with_repairs(task: dict, config: dict, workspace: Path, task_output_dir: Path, timeout: int) -> tuple[str, str, str, list[dict]]:
-    max_rounds = max(0, int(config.get("creation_repair_rounds") or 0))
-    attempts: list[dict] = []
-    status = stdout = stderr = ""
-    for attempt_index in range(max_rounds + 1):
-        status, stdout, stderr = run_generation(task["id"], str(workspace), config, timeout)
-        report = _validate_workspace_attempt(
-            task=task,
-            config=config,
-            workspace=workspace,
-            task_output_dir=task_output_dir,
-            attempt_index=attempt_index,
-            status=status,
-            stdout=stdout,
-            stderr=stderr,
-        )
-        attempts.append(report)
-        _append_repair_report(task_output_dir, report)
-        snapshot_dir = task_output_dir / f"attempt_{attempt_index}"
-        if snapshot_dir.exists():
-            shutil.rmtree(snapshot_dir)
-        _copy_workspace_contents(workspace, snapshot_dir)
-        if report.get("gate_pass") is True:
-            break
-        if attempt_index < max_rounds:
-            _write_repair_instruction(workspace, task_output_dir, report, attempt_index + 1)
-    return status, stdout, stderr, attempts
 
 
 def run_task(task: dict, config: dict, output_dir: Path) -> dict:
@@ -908,76 +1008,21 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
         print(f"[{task_id}] error preparing workspace: {e}")
         return meta
 
-    timeout = config.get("timeout_minutes", 30) * 60
-    status, stdout, stderr, repair_attempts = _run_generation_with_repairs(
-        task,
-        config,
-        Path(workspace),
-        task_output_dir,
-        timeout,
-    )
-
+    timeout_minutes = config.get("timeout_minutes")
+    if timeout_minutes in (None, "", 0, "0", "none", "None", "null", "Null"):
+        timeout = None
+    else:
+        timeout = int(timeout_minutes) * 60
+    status, stdout, stderr = run_generation(task_id, workspace, config, timeout)
     _copy_workspace_contents(Path(workspace), task_output_dir)
-    gate_before = repair_attempts[0].get("gate_pass") if repair_attempts else None
-    gate_after = repair_attempts[-1].get("gate_pass") if repair_attempts else None
-    pre_bmk_report_path = _persist_selected_pre_bmk_report(task_output_dir, repair_attempts)
-    repair_failure_reasons = [
-        str(attempt.get("gate_failure_reason") or "")
-        for attempt in repair_attempts
-        if attempt.get("gate_pass") is not True and attempt.get("gate_failure_reason")
-    ]
 
-    meta = {
-        "task_id": task_id,
-        "status": status,
-        "run_id": config.get("run_id"),
-        "meta_harness": config.get("meta_harness", "claude-code"),
-        "creation_profile": config.get("creation_profile", "interface_tool"),
-        "scaffold_source": "vendor/harness_scaffold"
-        if is_scaffold_resource_profile(str(config.get("creation_profile") or ""))
-        else None,
-        "pre_bmk_gate": config.get("pre_bmk_gate", "soft"),
-        "generation_model_input": config.get("model_name_input"),
-        "generation_model": config.get("model_name"),
-        "eval_model_input": config.get("eval_model_name_input"),
-        "eval_model": config.get("eval_model_name"),
-        "claude_model_name": config.get("claude_model_name", "claude-sonnet-4-6"),
-        "codex_bin": config.get("codex_bin") if config.get("meta_harness") == "codex" else None,
-        "codex_sandbox": config.get("codex_sandbox") if config.get("meta_harness") == "codex" else None,
-        "codex_enable_search": bool(config.get("codex_enable_search")) if config.get("meta_harness") == "codex" else None,
-        "reasoning_effort": config.get("reasoning_effort"),
-        "system_prompt_file": config.get("system_prompt_file") if config.get("include_system_prompt", True) else None,
-        "task_prompt_file": task.get("prompt_file"),
-        "stdout": stdout[-5000:] if stdout else "",
-        "stderr": stderr[-5000:] if stderr else "",
-        "creation_attempts": len(repair_attempts) if repair_attempts else 1,
-        "repair_rounds": max(0, (len(repair_attempts) - 1) if repair_attempts else 0),
-        "gate_pass_before_repair": gate_before,
-        "gate_pass_after_repair": gate_after,
-        "repair_failure_reasons": repair_failure_reasons,
-        "selected_attempt_path": str((task_output_dir / f"attempt_{len(repair_attempts) - 1}").resolve()) if repair_attempts else "",
-        "pre_bmk_report_path": pre_bmk_report_path,
-        "repair_reports_path": str((task_output_dir / "repair_reports.jsonl").resolve()) if (task_output_dir / "repair_reports.jsonl").exists() else "",
-    }
-
-    metrics_file = task_output_dir / "metrics.json"
-    if metrics_file.exists():
-        try:
-            metrics = json.loads(metrics_file.read_text())
-            meta["metrics"] = {
-                "total_requests": metrics.get("total_requests", 0),
-                "total_input_tokens": metrics.get("total_input_tokens", 0),
-                "total_output_tokens": metrics.get("total_output_tokens", 0),
-                "total_cache_read_tokens": metrics.get("total_cache_read_tokens", 0),
-                "total_cache_creation_tokens": metrics.get("total_cache_creation_tokens", 0),
-                "total_tokens": metrics.get("total_input_tokens", 0) + metrics.get("total_output_tokens", 0),
-                "effective_requests": metrics.get("effective_requests", 0),
-                "effective_input_tokens": metrics.get("effective_input_tokens", 0),
-                "effective_output_tokens": metrics.get("effective_output_tokens", 0),
-                "retry_requests": metrics.get("retry_requests", 0),
-            }
-        except (json.JSONDecodeError, KeyError):
-            pass
+    meta = _generation_meta(task, config, status=status, stdout=stdout, stderr=stderr)
+    meta["creation_attempts"] = 1
+    meta["repair_rounds"] = 0
+    meta["external_repair_loop"] = "disabled"
+    meta["formal_public_gate"] = "disabled"
+    meta["dev_bmk_runs_index"] = str((task_output_dir / "dev_bmk_runs" / "index.jsonl").resolve()) if (task_output_dir / "dev_bmk_runs" / "index.jsonl").exists() else ""
+    _attach_generation_metrics(meta, task_output_dir)
 
     (task_output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -1054,32 +1099,50 @@ def parse_args() -> argparse.Namespace:
         help="Harness creation profile. Main experiment default: interface_tool.",
     )
     parser.add_argument(
+        "--disable-dev-bmk-feedback",
+        dest="enable_dev_bmk_feedback",
+        action="store_false",
+        default=True,
+        help="Do not install run_dev_bmk.py / DEV_BMK_COMMANDS.md into generation workspaces.",
+    )
+    parser.add_argument(
+        "--dev-bmk-task-limit",
+        type=int,
+        default=None,
+        help="Number of public/dev tasks per BMK exposed to the creation agent. Default: config or 3.",
+    )
+    parser.add_argument(
         "--pre-bmk-gate",
         default=None,
         choices=["off", "soft", "hard"],
-        help="Pre-BMK validation gate used by --eval-after. soft records failures but still runs BMK; hard skips failed harnesses.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--creation-repair-rounds",
         type=int,
         default=None,
-        help="Number of public-contract repair rounds to run after initial creation. Default: 0.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--repair-gate",
         default=None,
         choices=["public-contract"],
-        help="Repair feedback source. public-contract uses only static, CLI, toy, and public artifact checks.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--repair-mode",
         default=None,
         choices=["same-workspace"],
-        help="Repair mode. same-workspace reruns the same meta harness in the existing generation workspace.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--no-system-prompt", action="store_true", help="Do not prepend system prompt.")
     parser.add_argument("--max-concurrent", type=int, default=None)
-    parser.add_argument("--timeout-minutes", type=int, default=None)
+    parser.add_argument(
+        "--timeout-minutes",
+        type=int,
+        default=None,
+        help="Per-creation-task timeout in minutes. Omit or pass 0 for no timeout.",
+    )
     parser.add_argument("--list-model-aliases", action="store_true", help="Print built-in and config-defined model aliases and exit.")
     parser.add_argument("--list-tasks", action="store_true", help="List available creation tasks and exit.")
     parser.add_argument(
@@ -1166,7 +1229,6 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
     command.extend(["--run-id", eval_run_id])
     if args.eval_dry_run:
         command.append("--dry-run")
-    command.extend(["--pre-bmk-gate", str(config.get("pre_bmk_gate") or "soft")])
 
     print("\nRunning downstream BMK eval:")
     print(" ".join(command))
@@ -1177,10 +1239,6 @@ def main():
     args = parse_args()
     config = resolve_config_models(apply_cli_overrides(load_config(args.config), args))
     config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
-    config["pre_bmk_gate"] = str(config.get("pre_bmk_gate") or "soft")
-    config["creation_repair_rounds"] = max(0, int(config.get("creation_repair_rounds") or 0))
-    config["repair_gate"] = str(config.get("repair_gate") or "public-contract")
-    config["repair_mode"] = str(config.get("repair_mode") or "same-workspace")
 
     if args.list_model_aliases:
         print_model_aliases(config)
