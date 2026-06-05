@@ -1,26 +1,31 @@
 # Creation Profile: Claude Code Atomic Scaffold
 
-本 profile 会在工作区中提供一个可复用的 `harness_scaffold/` runtime。它来自授权的 Claude Code 原子能力抽取版本，包含文件、shell、search、patch、git、artifact、trajectory、budget、permission、timeout、LLM client、adapter 和 validation 相关能力。
+This profile adds a reusable `harness_scaffold/` runtime to the workspace. It
+comes from an authorized extraction of Claude Code atomic capabilities:
+file I/O, shell, search, patch, git, artifacts, trajectory logging, budget,
+permission, timeout, LLM client, adapters, and validation-related utilities.
 
-你可以自由选择：
+You may choose to:
 
-- 直接使用 `harness_scaffold` 的 runtime CLI；
-- 复用其中的工具、schema、adapter 或 validation 逻辑；
-- 参考其实现后自行写完整 `harness/`；
-- 完全不用它，只要最终 harness 满足统一接口和下游 BMK 契约。
+- Use the `harness_scaffold` runtime CLI directly.
+- Reuse its tools, schemas, adapters, or validation utilities.
+- Study its implementation and write a traditional `harness/` package.
+- Ignore it if you still produce a runnable harness that satisfies the unified
+  interface and downstream BMK contracts.
 
-这不是 Claude Code 复刻任务，也不是固定模板填空任务。目标仍然是生成一个能在目标 domain 上真实工作的 agent harness。
+This is not a Claude Code cloning task and not a template-filling task. The
+goal is to create a real agent harness for the target domain.
 
-## 可用资源
+## Available Resources
 
-工作区中会包含：
+The workspace contains:
 
 ```text
 harness_scaffold/
 CLAUDE_CODE_SCAFFOLD.md
 ```
 
-如果选择直接使用 scaffold runtime，可参考：
+If you use the scaffold runtime directly:
 
 ```bash
 python -m harness_scaffold.adapters.cli \
@@ -29,15 +34,15 @@ python -m harness_scaffold.adapters.cli \
   --out-dir output
 ```
 
-也可以继续生成传统结构：
+Traditional structure is also acceptable:
 
 ```bash
 python -m harness -p "<natural language task>" --workdir <task workspace> --output-dir <artifact output dir>
 ```
 
-## 下游接口必须兼容
+## Downstream Interface
 
-无论是否使用 scaffold，最终产物必须能通过：
+The final artifact must support:
 
 ```bash
 python -m harness \
@@ -47,56 +52,50 @@ python -m harness \
   --max-steps <n>
 ```
 
-兼容别名：
+Alias support:
 
-- `-p` 与 `--prompt`；
-- `--workdir`、`--work-dir`、`--workspace`；
-- `--max-steps`、`--max-turns`。
+- `-p` and `--prompt`
+- `--workdir`, `--work-dir`, `--workspace`
+- `--max-steps`, `--max-turns`
 
-每次运行都要写出：
+Every run must write:
 
-- `result.json`：状态、错误、关键产物路径、结构化指标；
-- `trajectory.jsonl`：每轮 action/observation 或等价执行轨迹；
-- `stdout.log` / `stderr.log` 或等价日志；
-- domain-specific artifact，例如 patch、代码文件、submission.csv、REPORT.md、risk_scores.csv、图片、研究证据或浏览器结果。
+- `result.json`: status, errors, key artifact paths, structured metrics.
+- `trajectory.jsonl`: action/observation records or equivalent execution trace.
+- `stdout.log` and `stderr.log`, or equivalent logs.
+- Domain artifacts such as patches, code files, `submission.csv`, `REPORT.md`,
+  `risk_scores.csv`, images, evidence, or browser result files.
 
-## BMK dev feedback 自测标准
+## BMK Dev Feedback Self-Test
 
-工作区会提供 `DEV_BMK_COMMANDS.md` 和 `run_dev_bmk.py`。你可以用公开/dev subset 自己运行少量真实 BMK 任务，并从 score、stdout/stderr、raw result、artifact 和 trajectory 中判断 harness 是否可用。
+The workspace provides `DEV_BMK_COMMANDS.md` and `run_dev_bmk.py`. You may run
+a small public/dev subset of real BMKs and inspect score, stdout/stderr, raw
+results, artifacts, and trajectory to judge whether the harness is usable.
 
-你在自测和修改时至少应该关注：
+During self-testing and revision, at minimum check:
 
-- 语法、import、CLI probe；
-- `result.json`、`trajectory.jsonl`、stdout/stderr 日志；
-- 至少一次真实工具调用或可审计 action trace；
-- 没有 TODO/stub-only / `NotImplementedError`；
-- 预算被尊重，不能无限循环；
-- 失败时也要保留 best-effort artifact 和错误信息。
+- syntax, import, and CLI probe behavior
+- `result.json`, `trajectory.jsonl`, stdout/stderr logs
+- at least one real tool call or auditable action trace
+- no TODO-only, stub-only, or `NotImplementedError` runnable path
+- budget respected; no infinite loops
+- best-effort artifacts and errors preserved on failure
 
-## Domain 后置条件
+There is no external public gate or repair controller that will fix the
+harness for you. Run dev BMK feedback, read the evidence, modify the harness,
+test again, and write or say `FINISH` when the final harness is ready for
+formal evaluation.
 
-- **code**：必须真实修改工作目录文件或产出 patch，尽力运行测试/编译/verifier，记录 diff、命令和结果。
-- **data_analysis**：必须真实读取数据并计算，生成结构化结果文件和报告；不能只写流程说明。
-- **writing**：必须有 plan/draft/critique/revision 或等价写作过程，最终文本非空且满足任务约束。
-- **research**：必须有检索或证据收集 trace，答案需要引用或记录来源；不能只凭空总结。
-- **browser**：必须有动作轨迹、状态变化和最终结果；不能只写操作计划。
+## Domain Postconditions
 
-成功只能来自真实执行和真实产物。固定模板、文件列表、执行步骤列表不能标记为 `success`。
+- Code: make real file changes or patches, run tests/build/verifier when
+  feasible, and record diffs, commands, and results.
+- Data analysis: read data and compute real outputs; produce structured
+  result files and reports rather than process-only descriptions.
+- Writing: include plan/draft/critique/revision or an equivalent writing
+  process; final text must be non-empty and satisfy task constraints.
+- Research: include search/evidence traces and grounded sources.
+- Browser: include action trace, state changes, and final result.
 
-没有外部 public gate 或 repair controller 会替你判断并返修。你需要自己运行 dev BMK、读取反馈、修改 harness、再次测试，直到认为最终 harness 可以进入正式 eval，并输出或写下 `FINISH`。
-
-因此，harness 需要把真实执行证据写出来，方便从 dev BMK 轨迹中分析：
-
-- `result.json` 中写出 `status`、`artifacts`、`tool_calls`、`errors`、`commands_run` 或等价字段；
-- `trajectory.jsonl` 中保留每轮 action/observation；
-- 失败也要写出 best-effort artifact 和错误原因，不能静默成功；
-- 不要把运行日志当成最终答案文件。
-
-## Benchmark-aware public artifact contracts
-
-- **code / SWE / Terminal**：必须真实 inspect repo，真实修改文件或写 patch，尽力运行测试/validator；输出 changed files、diff/patch、commands_run 和 test/verifier 结果。
-- **data_analysis / MLE**：如果 workdir 中有 `sample_submission.csv`，必须生成 `submission.csv`，列名、行数、ID 顺序必须完全一致；预测列必须使用公开 sample 暗示的合法类型和值域。例如 `Transported` 是 `True/False` 标签时，不允许输出概率小数。
-- **data_analysis / DAComp**：必须真实读取数据并计算；报告里需要具体数值、表格或结构化决策，不能只有流程模板。
-- **writing / WritingBench / EQBench3**：最终 writing artifact 必须是用户可读正文，不是 JSON、adapter 日志或执行摘要；需要体现 plan/draft/critique/revision 或等价写作过程。
-- **research / DeepResearch / BrowseComp**：必须记录搜索、阅读、证据或 citation trace；答案需要可追溯来源。
-- **browser / TheAgentCompany**：必须记录 navigate/click/type/extract 等 action trace 和最终状态/结果文件。
+Success must come from real execution and real artifacts. A fixed template,
+file list, or execution plan is not success.

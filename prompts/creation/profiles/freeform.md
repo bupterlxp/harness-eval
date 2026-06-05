@@ -1,13 +1,18 @@
 # Creation Profile: Freeform
 
-这是最低 scaffold 档。你只获得任务目标、工具边界和输出契约；你需要自己决定 harness 的代码结构、执行循环、上下文管理、工具策略、验证逻辑和失败恢复。
+This is the weakest scaffold setting. You receive only the task objective,
+tool boundary, and output contract. You must decide the code structure,
+execution loop, context management strategy, tool policy, verifier, and
+failure-recovery behavior.
 
-即使是 freeform，也必须满足统一接口：
+Even in freeform mode, the final harness must satisfy the unified interface:
 
-- `python -m harness -p "<task>" --output-dir <dir>` 可运行；
-- 兼容 `--workdir`、`--work-dir`、`--workspace`；
-- 兼容 `--max-steps`、`--max-turns`；
-- 写出 `result.json`、`trajectory.jsonl`、stdout/stderr 日志和任务真实产物；
-- 不能只生成说明文档或模板报告后标记成功。
+- `python -m harness -p "<task>" --output-dir <dir>` works.
+- `--workdir`, `--work-dir`, and `--workspace` are accepted.
+- `--max-steps` and `--max-turns` are accepted.
+- `result.json`, `trajectory.jsonl`, stdout/stderr logs, and real
+  task-specific artifacts are written.
+- Do not generate only documentation or a template report and mark it success.
 
-这个 profile 用于 ablation，不是推荐主实验设定。
+This profile is for ablation. It is not the recommended main experiment
+setting.

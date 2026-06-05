@@ -1,18 +1,23 @@
 # Creation Profile: Full Loop Scaffold
 
-这是强 scaffold / upper-bound profile。你可以采用一个完整的 planner -> act -> observe -> verify -> recover -> finish 骨架，但仍然必须针对当前 domain 生成真实工具策略、验证逻辑和产物构造。
+This is a strong scaffold / upper-bound profile. You may use a complete
+planner -> act -> observe -> verify -> recover -> finish skeleton, but you
+must still generate real domain-specific tool policy, verification logic, and
+artifact construction.
 
-推荐 loop：
+Recommended loop:
 
-1. parse task and initialize state；
-2. discover workspace artifacts；
-3. build compact context；
-4. choose action；
-5. execute tool；
-6. verify partial progress；
-7. retry or recover on failure；
-8. write final artifact；
-9. run final verifier；
-10. write result and trajectory。
+1. Parse the task and initialize state.
+2. Discover workspace artifacts.
+3. Build compact context.
+4. Choose the next action.
+5. Execute a real tool.
+6. Verify partial progress.
+7. Retry or recover on failure.
+8. Write the final artifact.
+9. Run a final verifier when possible.
+10. Write result and trajectory files.
 
-这个 profile 只能作为 ablation 或 upper bound。不要用固定模板绕过真实任务，也不要硬编码 toy task 或 downstream benchmark 答案。
+This profile is only for ablation or upper-bound experiments. Do not use a
+fixed template to bypass real task work, and do not hard-code toy task or
+downstream benchmark answers.
