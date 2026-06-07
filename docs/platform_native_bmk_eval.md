@@ -93,6 +93,32 @@ python tools/submit_seed_job_jsonl.py \
   --events outputs/platform_jobs/events.jsonl
 ```
 
+For full SWE Pro runs, do not submit all 731 instance jobs at once. Use the
+batched submitter and cap active platform jobs, for example 32:
+
+```bash
+python tools/submit_seed_job_jsonl_batched.py \
+  --tasks outputs/platform_jobs/swepro_glm51_jobs.jsonl \
+  --watch outputs/platform_jobs/watch_tasks.jsonl \
+  --events outputs/platform_jobs/events.jsonl \
+  --max-active 32 \
+  --poll-seconds 60 \
+  --submit-sleep-seconds 1
+```
+
+Each line is one SWE Pro instance. With platform-native execution, a shard
+normally does not need a very large allocation. The instance manifest currently
+uses 8 CPU / 32GB memory by default; raise only known-heavy repo families after
+observing resource failures.
+
+Before a full run, launch one probe job and confirm the task reaches the actual
+container entrypoint. If the Seed UI reports `base_image in service config must
+be completed when build service image`, the job still entered the service-image
+build path. That is an image configuration problem, not a harness or BMK runtime
+failure. In that case, do not submit more shards until the image is represented
+as a direct runnable platform image, usually `imageSource=vid` with a valid
+`imageVid`, or the service-image build config explicitly has a `base_image`.
+
 ## Container Entrypoint Behavior
 
 Each generated job runs:
@@ -146,4 +172,3 @@ verify_cmd or external scorer = BMK score source
 Use the Docker runner on a DevBox with Docker socket when you need the closest
 official SWE/Terminal semantics. Use this platform-native shard path when the
 online task platform cannot run Docker.
-
