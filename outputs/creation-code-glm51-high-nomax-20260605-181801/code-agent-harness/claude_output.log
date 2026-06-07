@@ -1,0 +1,51 @@
+The harness is complete and tested. Here's a summary of what was built:
+
+## Harness Summary
+
+### Files Created/Modified
+
+1. **`generated_program.py`** (713 lines) — Main program implementing the `GeneratedHarnessProgram` class with a full ReAct-style code agent loop:
+   - Parses task prompts and extracts target files, test commands, constraints
+   - Inspects the repository using scaffold tools (tree, grep, glob, git_status)
+   - Builds a structured context window for the LLM with system prompt, task info, and conversation history
+   - Executes LLM-driven actions: `read_file`, `search`, `list_files`, `edit_file`, `write_file`, `run_command`, `finish`
+   - Normalizes LLM output strings (handles escaped newlines/quotes)
+   - Runs verification after edits: syntax checks, test commands, artifact validation
+   - Handles recovery when verification fails: feeds error context back to LLM
+   - Generates patch.diff via git_diff
+   - Writes complete `result.json`, `response.md`, and trajectory
+   - Gracefully degrades to a fallback heuristic agent when no LLM is available
+
+2. **`planner.py`** (280 lines) — Task parsing and repository inspection:
+   - Extracts file paths and test commands from the task prompt
+   - Inspects repository structure (languages, frameworks, test files, config files)
+   - Auto-detects test/build commands based on repo type
+   - Builds a structured `TaskPlan` with target files, test commands, success criteria
+
+3. **`context_manager.py`** (265 lines) — LLM context window management:
+   - Manages conversation history with character/token budgets
+   - Compresses older messages when context exceeds the budget
+   - Builds system prompts with action format instructions
+   - Formats tool results for LLM consumption (handles file content, grep results, bash output, etc.)
+   - Ensures messages end with user role and merges adjacent same-role messages
+
+4. **`verifier.py`** (177 lines) — Verification pipeline:
+   - Syntax checking for Python (.py) and JavaScript (.js/.ts) files
+   - Runs test commands with timeouts and captures results
+   - Validates artifact existence and non-emptiness
+   - Returns structured `VerificationResult` with pass/fail details
+
+5. **`recovery.py`** (202 lines) — Failure recovery and rollback:
+   - Diagnoses failure types from test output (syntax errors, import errors, test failures, timeouts, missing files)
+   - Creates and rolls back to checkpoints
+   - Builds retry prompts with strategy hints that escalate across iterations
+   - Tracks edit history to detect stuck patterns (repeated failing edits, oscillating changes)
+
+### Contract Compliance
+- `python -m harness -p "task" --output-dir ./output/` works
+- All CLI aliases (`-p`/`--prompt`, `--workdir`/`--work-dir`/`--workspace`, `--max-steps`/`--max-turns`) supported
+- Writes `result.json`, `trajectory.jsonl`, `response.md`, `patch.diff`, logs
+- Status is `success` only when tests pass and artifacts exist; `partial` for incomplete work; `failed` for no progress
+- LLM calls use OpenAI-compatible routing via `harness_scaffold.llm`
+- All loops have explicit stop conditions (max steps, budget, abort signal)
+- No `TODO`, `NotImplementedError`, or `...` in runnable paths
