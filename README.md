@@ -212,6 +212,47 @@ curve 字段口径：
 | `round_to_plateau` | 默认连续 `--plateau-patience 3` 个完成 eval 的 evolution round 没有提升 best score 时的停滞起点 |
 | `cost_adjusted_gain` | 相对 base 的 score gain 除以本轮 evolve+eval total tokens |
 
+### Platform-native BMK shards（无 Docker-in-Docker）
+
+如果 Seed/Arnold 任务平台不能在任务容器里启动 Docker daemon，旧的
+`swebench_pro` / `terminal_2_bench` Docker runner 会失败。当前新增 no-DinD
+路径：每个 instance 或 repo-family 对应一个预构建镜像，平台直接起这个镜像，
+容器里只运行 generated harness + eval LLM，并输出 patch、verifier 结果和
+`shard_result.jsonl`。
+
+生成一行一个 JSON object 的任务 JSONL：
+
+```bash
+python tools/generate_platform_bmk_jobs.py \
+  --template outputs/platform_jobs/template.seed_job.json \
+  --instances configs/platform_bmk_instances.swepro.jsonl \
+  --output outputs/platform_jobs/swepro_glm51_jobs.jsonl \
+  --benchmark swebench_pro \
+  --run-id swepro-glm51-platform-$(date +%Y%m%d-%H%M%S) \
+  --harness-path /opt/tiger/Harness_evolve/outputs/creation-code-glm51-high-nomax-20260605-181801/code-agent-harness
+```
+
+提交 JSONL：
+
+```bash
+export SEC_TOKEN_PATH=/path/to/sec_token
+python tools/submit_seed_job_jsonl.py \
+  --tasks outputs/platform_jobs/swepro_glm51_jobs.jsonl \
+  --watch outputs/platform_jobs/watch_tasks.jsonl \
+  --events outputs/platform_jobs/events.jsonl
+```
+
+合并 shard 结果：
+
+```bash
+python tools/merge_platform_bmk_shards.py \
+  --root platform_eval_results/<run_id> \
+  --out-jsonl platform_eval_results/<run_id>/summary.jsonl \
+  --out-csv platform_eval_results/<run_id>/summary.csv
+```
+
+完整说明见 [docs/platform_native_bmk_eval.md](/Users/bytedance/Downloads/harness-eval/docs/platform_native_bmk_eval.md)。
+
 ### 两层结构
 
 ```

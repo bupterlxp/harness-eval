@@ -18,3 +18,4 @@ metrics.json
 self_evolve_outputs/
 analysis_outputs/
 cache/
+logs/
