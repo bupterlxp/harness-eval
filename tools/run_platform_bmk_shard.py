@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -165,6 +167,88 @@ def score_from_verify(verify: dict[str, Any] | None) -> tuple[str, float | None]
     return "failed/verify", 0.0
 
 
+def parse_list_field(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    text = value.strip()
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            loaded = loader(text)
+        except Exception:
+            continue
+        if isinstance(loaded, list):
+            return [str(item) for item in loaded if str(item).strip()]
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def build_base_setup_cmd(instance: dict[str, Any]) -> str:
+    base_commit = str(field(instance, "base_commit", "") or "").strip()
+    if not base_commit:
+        return ""
+    return " && ".join(
+        [
+            f"git reset --hard {shlex.quote(base_commit)}",
+            "git clean -fd",
+            f"git checkout {shlex.quote(base_commit)}",
+        ]
+    )
+
+
+def build_test_injection_cmd(instance: dict[str, Any]) -> str:
+    before_cmd = str(field(instance, "before_repo_set_cmd", "") or "")
+    for line in before_cmd.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("git checkout ") and " -- " in stripped:
+            return stripped
+    return ""
+
+
+def infer_verify_cmd(instance: dict[str, Any]) -> str:
+    selected = parse_list_field(field(instance, "selected_test_files_to_run", ""))
+    if not selected:
+        return ""
+    repo_family = str(field(instance, "repo_family", "") or "").lower()
+    quoted = " ".join(shlex.quote(item) for item in selected)
+
+    if any(name in repo_family for name in ("qutebrowser", "ansible", "openlibrary")):
+        return f"python -m pytest -q {quoted}"
+
+    if "nodebb" in repo_family:
+        return (
+            "if [ -x ./node_modules/.bin/mocha ]; then "
+            f"./node_modules/.bin/mocha {quoted}; "
+            "elif command -v npx >/dev/null 2>&1; then "
+            f"npx mocha {quoted}; "
+            "else "
+            f"npm test -- {quoted}; "
+            "fi"
+        )
+
+    if "element-hq__element-web" in repo_family or "element-web" in repo_family:
+        return (
+            "if [ -x ./node_modules/.bin/jest ]; then "
+            f"./node_modules/.bin/jest --runInBand {quoted}; "
+            "elif command -v yarn >/dev/null 2>&1; then "
+            f"yarn jest --runInBand {quoted}; "
+            "else "
+            f"npm test -- --runInBand {quoted}; "
+            "fi"
+        )
+
+    if any(name in repo_family for name in ("flipt", "navidrome", "vuls", "teleport")):
+        test_names = [item for item in selected if not item.endswith(".go") and "/" not in item]
+        if test_names:
+            regex = "^(" + "|".join(re.escape(item) for item in test_names) + ")$"
+            return f"go test ./... -run {shlex.quote(regex)}"
+        package_dirs = sorted({str(Path(item).parent) for item in selected if item.endswith(".go")})
+        package_args = " ".join(shlex.quote("./" + d if d != "." else ".") for d in package_dirs)
+        return f"go test {package_args or './...'}"
+
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -200,6 +284,30 @@ def main() -> int:
     )
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    base_setup_cmd = build_base_setup_cmd(instance)
+    base_setup_result = None
+    if base_setup_cmd:
+        base_setup_result = run_cmd(base_setup_cmd, cwd=task_work_dir, timeout=args.timeout_seconds)
+        (output_dir / "base_setup_stdout.log").write_text(base_setup_result["stdout"], encoding="utf-8")
+        (output_dir / "base_setup_stderr.log").write_text(base_setup_result["stderr"], encoding="utf-8")
+        if base_setup_result["returncode"] != 0:
+            row = {
+                "run_id": args.run_id,
+                "benchmark": benchmark,
+                "instance_id": instance_id,
+                "repo": field(instance, "repo", ""),
+                "repo_family": field(instance, "repo_family", ""),
+                "task_work_dir": str(task_work_dir),
+                "eval_status": "failed/base_setup",
+                "score": 0.0,
+                "base_setup": {key: value for key, value in base_setup_result.items() if key not in {"stdout", "stderr"}},
+            }
+            write_json(output_dir / "shard_result.json", row)
+            write_jsonl(output_dir / "shard_result.jsonl", row)
+            print(json.dumps(row, ensure_ascii=False))
+            return 1
+
     prompt = build_prompt(benchmark, instance, task_work_dir)
     prompt_path = output_dir / "prompt.txt"
     prompt_path.write_text(prompt, encoding="utf-8")
@@ -234,9 +342,26 @@ def main() -> int:
         runtime.close()
 
     patch_info = git_diff(task_work_dir, output_dir / "prediction.patch")
-    verify_cmd = args.verify_cmd or str(field(instance, "verify_cmd", ""))
+    test_injection_cmd = build_test_injection_cmd(instance)
+    test_injection_result = None
+    if test_injection_cmd:
+        test_injection_result = run_cmd(test_injection_cmd, cwd=task_work_dir, timeout=args.timeout_seconds)
+        (output_dir / "test_injection_stdout.log").write_text(test_injection_result["stdout"], encoding="utf-8")
+        (output_dir / "test_injection_stderr.log").write_text(test_injection_result["stderr"], encoding="utf-8")
+
+    verify_cmd = args.verify_cmd or str(field(instance, "verify_cmd", "")) or infer_verify_cmd(instance)
     verify_result = None
-    if verify_cmd:
+    if test_injection_result and test_injection_result["returncode"] != 0:
+        verify_result = {
+            "command": test_injection_cmd,
+            "returncode": test_injection_result["returncode"],
+            "stdout": test_injection_result["stdout"],
+            "stderr": test_injection_result["stderr"],
+            "elapsed_sec": test_injection_result["elapsed_sec"],
+        }
+        (output_dir / "verify_stdout.log").write_text(verify_result["stdout"], encoding="utf-8")
+        (output_dir / "verify_stderr.log").write_text(verify_result["stderr"], encoding="utf-8")
+    elif verify_cmd:
         verify_result = run_cmd(verify_cmd, cwd=task_work_dir, timeout=args.timeout_seconds)
         (output_dir / "verify_stdout.log").write_text(verify_result["stdout"], encoding="utf-8")
         (output_dir / "verify_stderr.log").write_text(verify_result["stderr"], encoding="utf-8")
@@ -262,6 +387,17 @@ def main() -> int:
         "harness_run_tokens": usage.get("total_tokens"),
         "harness_run_token_breakdown": usage,
         "patch": patch_info,
+        "base_setup": {
+            key: value
+            for key, value in (base_setup_result or {}).items()
+            if key not in {"stdout", "stderr"}
+        } if base_setup_result else None,
+        "test_injection": {
+            key: value
+            for key, value in (test_injection_result or {}).items()
+            if key not in {"stdout", "stderr"}
+        } if test_injection_result else None,
+        "verify_cmd": verify_cmd,
         "verify": {
             key: value
             for key, value in (verify_result or {}).items()
