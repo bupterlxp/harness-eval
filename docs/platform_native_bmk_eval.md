@@ -37,13 +37,44 @@ Fields:
 - `benchmark`: `swebench_pro` or `terminal_2_bench`.
 - `instance_id`: unique instance id.
 - `repo` / `repo_family`: used for reporting and task naming.
-- `imageVid`, `imageSid`, `icmName` + `icmVersion`, or `imageMeta`: the prebuilt image to run.
+- `imageVid` / `imageSource=vid`: the direct runnable platform image to run.
 - `task_work_dir`: repository/task directory inside the prebuilt image.
 - `problem_statement` or `task_prompt`: public task text shown to the generated harness.
 - `verify_cmd`: optional public/dev verifier command inside the image.
 - `resource`: optional per-row CPU/memory/queue override.
 
 Do not put hidden labels, hidden patches, or hidden answers in this manifest.
+
+For official platform-native SWE Pro runs, use direct images only. The earlier
+`icmName` + `icmVersion` path can be accepted by the submit API but then routed
+into service-image build, which fails before the task container starts if
+`base_image` is missing. Convert ICM-imported versions to `imageSource=vid` and
+non-empty `imageVid` first:
+
+```bash
+ICM_USERNAME=<user> ICM_PASSWORD=<password> \
+python tools/resolve_swepro_image_vids.py \
+  --input configs/platform_bmk_instances.swepro.jsonl \
+  --output configs/platform_bmk_instances.swepro.vid.jsonl \
+  --failures logs/platform_jobs/swepro_image_vid_resolution_failures.jsonl
+
+python tools/validate_platform_direct_images.py \
+  configs/platform_bmk_instances.swepro.vid.jsonl \
+  --expected-count 731 \
+  --check-direct-image \
+  --check-no-secrets
+```
+
+If the resolver cannot discover `imageVid` from the internal image APIs, export
+or provide a JSONL mapping with `instance_id` or `icm_version_id` plus `imageVid`
+and pass `--mapping <mapping.jsonl>`. Do not generate full job JSONL from an
+unresolved or partial manifest.
+
+The current Image Manager import records expose `image_id` and `version_id`.
+Those identifiers are not the same as Seed's runnable `imageVid`. If version
+detail APIs return only Image Manager metadata and no `imageVid`-like field, the
+remaining action is to export/directly obtain the platform image `imageVid`
+mapping; do not fall back to submitting `icmName`/`icmVersion` rows.
 
 ## Generate One-line Job JSONL
 
@@ -55,11 +86,12 @@ cd /opt/tiger/Harness_evolve
 
 python tools/generate_platform_bmk_jobs.py \
   --template outputs/platform_jobs/template.seed_job.json \
-  --instances configs/platform_bmk_instances.swepro.jsonl \
+  --instances configs/platform_bmk_instances.swepro.vid.jsonl \
   --output outputs/platform_jobs/swepro_glm51_jobs.jsonl \
   --benchmark swebench_pro \
   --run-id swepro-glm51-platform-$(date +%Y%m%d-%H%M%S) \
-  --harness-path /opt/tiger/Harness_evolve/outputs/creation-code-glm51-high-nomax-20260605-181801/code-agent-harness
+  --harness-path /opt/tiger/Harness_evolve/outputs/creation-code-glm51-high-nomax-20260605-181801/code-agent-harness \
+  --require-direct-image
 ```
 
 If you want to keep env vars from the UI template, pass:
@@ -76,6 +108,16 @@ rows:
 
 ```bash
 --allow-template-image
+```
+
+Before submitting, validate the generated job JSONL:
+
+```bash
+python tools/validate_platform_direct_images.py \
+  outputs/platform_jobs/swepro_glm51_jobs.jsonl \
+  --expected-count 731 \
+  --check-direct-image \
+  --check-no-secrets
 ```
 
 ## Submit Jobs
@@ -112,12 +154,23 @@ uses 8 CPU / 32GB memory by default; raise only known-heavy repo families after
 observing resource failures.
 
 Before a full run, launch one probe job and confirm the task reaches the actual
-container entrypoint. If the Seed UI reports `base_image in service config must
-be completed when build service image`, the job still entered the service-image
-build path. That is an image configuration problem, not a harness or BMK runtime
-failure. In that case, do not submit more shards until the image is represented
-as a direct runnable platform image, usually `imageSource=vid` with a valid
-`imageVid`, or the service-image build config explicitly has a `base_image`.
+container entrypoint:
+
+```bash
+python tools/submit_seed_job_jsonl_batched.py \
+  --tasks outputs/platform_jobs/swepro_glm51_jobs.jsonl \
+  --watch outputs/platform_jobs/probe_watch.jsonl \
+  --events outputs/platform_jobs/probe_events.jsonl \
+  --max-active 1 \
+  --max-submit 1 \
+  --poll-seconds 60
+```
+
+If the Seed UI reports `base_image in service config must be completed when
+build service image`, the job still entered the service-image build path. That
+is an image configuration problem, not a harness or BMK runtime failure. Do not
+submit more shards until every row is represented as `imageSource=vid` with a
+valid `imageVid`.
 
 ## Container Entrypoint Behavior
 

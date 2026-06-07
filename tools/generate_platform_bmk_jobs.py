@@ -62,7 +62,12 @@ def ensure_nested(obj: dict[str, Any], path: list[str]) -> dict[str, Any]:
     return current
 
 
-def image_meta(row: dict[str, Any], template: dict[str, Any], allow_template_image: bool) -> dict[str, Any]:
+def image_meta(
+    row: dict[str, Any],
+    template: dict[str, Any],
+    allow_template_image: bool,
+    require_direct_image: bool,
+) -> dict[str, Any]:
     explicit = row.get("imageMeta") or row.get("image_meta")
     if isinstance(explicit, dict):
         meta = dict(explicit)
@@ -95,6 +100,17 @@ def image_meta(row: dict[str, Any], template: dict[str, Any], allow_template_ima
     meta.setdefault("needBuild", False)
     meta.setdefault("icmName", "")
     meta.setdefault("icmVersion", "")
+    if require_direct_image:
+        if meta.get("imageSource") != "vid" or not str(meta.get("imageVid") or "").strip():
+            instance_id = row.get("instance_id") or row.get("task_id") or "unknown"
+            raise ValueError(
+                f"{instance_id}: direct runnable platform image required. "
+                "Use imageSource='vid' with a non-empty imageVid; icmName/icmVersion "
+                "can trigger service-image build and is intentionally rejected."
+            )
+        meta["needBuild"] = False
+        meta["icmName"] = ""
+        meta["icmVersion"] = ""
     return meta
 
 
@@ -251,6 +267,7 @@ def patch_job(
     run_id: str,
     output_root: str,
     allow_template_image: bool,
+    require_direct_image: bool,
     preserve_template_env: bool,
     install_deps: bool,
 ) -> dict[str, Any]:
@@ -264,7 +281,7 @@ def patch_job(
     main_mnt = str(get_nested(job, ["jobDefVersion", "gitRepo", "mnt"], "/opt/tiger/Harness_evolve"))
     subrepos = jd.get("subRepos") if isinstance(jd.get("subRepos"), list) else []
     evolve_root = str(subrepos[0].get("mnt")) if subrepos and isinstance(subrepos[0], dict) and subrepos[0].get("mnt") else "/opt/tiger/harness_evolve_project"
-    jd["imageMeta"] = image_meta(row, template, allow_template_image)
+    jd["imageMeta"] = image_meta(row, template, allow_template_image, require_direct_image)
     jd["entrypointMode"] = "FULL_SCRIPT"
     jd["name"] = str(caption)
     script = render_entrypoint(
@@ -303,6 +320,14 @@ def main() -> int:
     )
     parser.add_argument("--output-root", default="/opt/tiger/Harness_evolve/platform_eval_results")
     parser.add_argument("--allow-template-image", action="store_true")
+    parser.add_argument(
+        "--require-direct-image",
+        action="store_true",
+        help=(
+            "Reject rows unless imageMeta resolves to imageSource=vid and a non-empty imageVid. "
+            "Use this for full platform-native runs to avoid accidental service-image builds."
+        ),
+    )
     parser.add_argument("--preserve-template-env", action="store_true", help="Keep envsList from template. Use only for local/private JSONL with secrets.")
     parser.add_argument("--no-install-deps", action="store_true", help="Assume image already has venv/deps installed.")
     args = parser.parse_args()
@@ -323,6 +348,7 @@ def main() -> int:
                 run_id=args.run_id,
                 output_root=args.output_root,
                 allow_template_image=args.allow_template_image,
+                require_direct_image=args.require_direct_image,
                 preserve_template_env=args.preserve_template_env,
                 install_deps=not args.no_install_deps,
             )
