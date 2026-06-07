@@ -160,7 +160,7 @@ def platform_row(
     row["imageMeta"] = {
         "imageSid": "",
         "imageVid": "",
-        "imageSource": "",
+        "imageSource": "icm",
         "needBuild": False,
         "icmName": image_name,
         "icmVersion": specific_tag,

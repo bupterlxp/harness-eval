@@ -112,6 +112,12 @@ def main() -> int:
     parser.add_argument("--events", type=Path, default=Path("events.jsonl"))
     parser.add_argument("--submit-url", default=SUBMIT_URL_DEFAULT)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--sleep-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep after each real submit attempt to avoid platform rate limits.",
+    )
     args = parser.parse_args()
 
     if not args.tasks.exists():
@@ -188,6 +194,9 @@ def main() -> int:
             )
             print(f"[failed] {key}: {result}")
 
+        if not args.dry_run and args.sleep_seconds > 0:
+            time.sleep(args.sleep_seconds)
+
     if not args.dry_run:
         rewrite_jsonl(args.tasks, kept_lines)
     print(f"total={total} success={success} failed={failed} pending={len(kept_lines)}")
@@ -196,4 +205,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

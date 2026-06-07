@@ -70,7 +70,12 @@ def image_meta(row: dict[str, Any], template: dict[str, Any], allow_template_ima
         meta = {
             "imageSid": row.get("imageSid") or row.get("image_sid") or "",
             "imageVid": row.get("imageVid") or row.get("image_vid") or row.get("image") or "",
-            "imageSource": row.get("imageSource") or row.get("image_source") or ("vid" if (row.get("imageVid") or row.get("image_vid") or row.get("image")) else ""),
+            "imageSource": (
+                row.get("imageSource")
+                or row.get("image_source")
+                or ("vid" if (row.get("imageVid") or row.get("image_vid") or row.get("image")) else "")
+                or ("icm" if (row.get("icmName") or row.get("icm_name") or row.get("icmVersion") or row.get("icm_version")) else "")
+            ),
             "needBuild": bool(row.get("needBuild") or row.get("need_build") or False),
             "icmName": row.get("icmName") or row.get("icm_name") or "",
             "icmVersion": row.get("icmVersion") or row.get("icm_version") or "",
@@ -85,7 +90,8 @@ def image_meta(row: dict[str, Any], template: dict[str, Any], allow_template_ima
         )
     meta.setdefault("imageSid", "")
     meta.setdefault("imageVid", "")
-    meta.setdefault("imageSource", "vid" if meta.get("imageVid") else "")
+    if not meta.get("imageSource"):
+        meta["imageSource"] = "vid" if meta.get("imageVid") else "icm"
     meta.setdefault("needBuild", False)
     meta.setdefault("icmName", "")
     meta.setdefault("icmVersion", "")
@@ -251,7 +257,8 @@ def patch_job(
     job = copy.deepcopy(template)
     instance_id = slug(str(row.get("instance_id") or row.get("task_id") or "unknown"))
     repo_family = slug(str(row.get("repo_family") or row.get("repo") or "repo"))
-    caption = row.get("caption") or f"harness-evolve-{benchmark}-{repo_family}-{instance_id}"
+    default_caption = slug(f"he-{benchmark}-{repo_family}-{instance_id}", max_len=88)
+    caption = slug(str(row.get("caption") or default_caption), max_len=88)
     job["caption"] = str(caption)
     jd = ensure_nested(job, ["jobDefVersion"])
     main_mnt = str(get_nested(job, ["jobDefVersion", "gitRepo", "mnt"], "/opt/tiger/Harness_evolve"))
@@ -326,4 +333,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
