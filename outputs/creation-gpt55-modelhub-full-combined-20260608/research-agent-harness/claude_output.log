@@ -1,0 +1,24 @@
+Implemented the scaffold-native research harness.
+
+Changed:
+- `generated_program.py`
+  - Replaced `NotImplementedError` with a bounded research loop.
+  - Adds question classification, query planning, web search/fetch evidence collection, URL dedupe, context/evidence pruning, source ranking, synthesis, citation verification, and partial/failure handling.
+  - Writes `answer.md`, `answer.json`, `evidence.json`, and `sources.json`.
+  - Avoids fabricated answers when no evidence is available.
+  - Produces concise direct answers for closed factual questions when possible.
+
+- `harness/__main__.py`
+  - Enables scaffold network tools by default.
+  - Passes OpenAI-compatible LLM config from `MODEL_NAME`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY`.
+  - Writes required `result.json` with `status`, `trajectory`, `answer_path`, `evidence_path`, and `sources_path`.
+
+Validated:
+- `python3 -m py_compile /workspace/generated_program.py /workspace/harness/__main__.py`
+- `python3 -m harness -p "What is the capital of France?" --output-dir /workspace/smoke_output --max-steps 8`
+- `git diff --check`
+
+Dev BMK:
+- `python3 run_dev_bmk.py --bench auto --max-tasks 3` failed before running tasks because the eval provider proxy could not bind `127.0.0.1:3457` (`EADDRINUSE`), so no benchmark summaries were produced.
+
+FINISH

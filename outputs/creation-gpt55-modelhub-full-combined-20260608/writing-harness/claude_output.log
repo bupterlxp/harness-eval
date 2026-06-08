@@ -1,0 +1,29 @@
+Implemented the scaffold-native Writing Agent harness and compatibility wrapper.
+
+Changed:
+- `generated_program.py`
+  - Replaced stub/`NotImplementedError` with runnable `GeneratedHarnessProgram.run(...)`.
+  - Added bounded plan → draft → critique → revision → final flow.
+  - Writes required artifacts: `result.json`, `response.md`, `plan.json`, `draft.md`, `critique_0.md`, `quality_scores.json`, and `error.json` on partial/failure.
+  - Uses scaffold runtime artifact and trajectory APIs.
+  - Supports OpenAI-compatible LLM calls through scaffold client behavior.
+  - Merges adjacent same-role messages and ensures requests end with a user message.
+  - Retries LLM calls and falls back to deterministic best-effort prose if provider fails.
+  - Added verifier checks for prose quality, length, structure, emotional nuance, role consistency, phase artifacts, and final artifact references.
+  - Added branch-aware local fallback for emotional/EQ-style writing, creative continuation, rewriting, and general writing.
+- `harness/__main__.py`
+  - Added environment-based LLM config from `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `MODEL_NAME`.
+  - Preserves the scaffold-native `python -m harness ...` wrapper contract.
+
+Validation:
+- `python3 -m py_compile generated_program.py harness/__main__.py` passed.
+- Smoke tests through `python3 -m harness ...` produced required artifacts.
+- Since the configured LLM endpoint returns `ProviderError: OpenAI-compatible HTTP 404`, smoke runs correctly returned `partial` with verifier-clean fallback prose.
+- Dev BMK:
+  - Default `run_dev_bmk.py` failed before harness execution because proxy ports `3457/3458` were occupied.
+  - Manual retry on free ports reached evaluator; harness syntax/import/CLI probe passed.
+  - EQbench3 evaluator then failed due missing evaluator dependency: `ModuleNotFoundError: No module named 'dotenv'`, not a harness failure.
+
+Current working tree has modified harness files plus generated smoke/dev output directories from validation.
+
+FINISH

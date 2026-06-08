@@ -1,0 +1,21 @@
+Implemented the scaffold-native data-analysis harness.
+
+Changed:
+- `generated_program.py`: replaces the stub with a runnable data-analysis harness using scaffold `python_exec`, artifact registration, validation, and result writing.
+  - Discovers CSV/TSV/JSON/Parquet/XLSX/SQLite/readme/instruction files.
+  - Produces `REPORT.md`, `analysis_summary.json`, `metrics.csv`, charts when possible.
+  - Produces `submission.csv` from `sample_submission.csv` with schema/id-order preservation and model/baseline predictions.
+  - Handles DAComp-style risk/credit/invoice tasks with `risk_scores.csv`, `credit_allocation.csv`, tiers, allocation totals, and suggested rates.
+  - Writes contract `result.json` with status, artifact paths, report/submission paths, and errors.
+- `harness/__main__.py`: keeps scaffold wrapper behavior and raises per-tool runtime/output policy for larger data tasks.
+
+Validation:
+- `python3 -m py_compile generated_program.py harness/__main__.py`
+- Local MLE-style smoke test succeeded and produced valid `submission.csv`.
+- Local risk/credit DAComp-style smoke test succeeded and produced entity-level risk/allocation artifacts.
+- Missing-data partial-output test wrote `result.json`, `trajectory.jsonl`, logs, and report.
+
+Dev BMK:
+- `python3 run_dev_bmk.py --bench auto --max-tasks 3` failed before invoking the harness because the eval provider proxy could not bind `127.0.0.1:3457` (`EADDRINUSE`). Retried with the same external proxy failure.
+
+FINISH

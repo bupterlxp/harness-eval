@@ -1,0 +1,10 @@
+{
+  "success": 3,
+  "error": 0,
+  "combined_from": {
+    "data-analysis-harness": "outputs/creation-gpt55-modelhub-full-20260608-195031/data-analysis-harness",
+    "writing-harness": "outputs/creation-gpt55-writing-modelhub-full-20260608-201216/writing-harness",
+    "research-agent-harness": "outputs/creation-gpt55-research-modelhub-full-20260608-200040/research-agent-harness"
+  },
+  "created_at": 1780947336
+}
