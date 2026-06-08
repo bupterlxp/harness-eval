@@ -164,16 +164,20 @@ fi
     upload_block = ""
     if output_uri_prefix:
         upload_block = f"""
-  if command -v hdfs >/dev/null 2>&1; then
+  HDFS_BIN="$(command -v hdfs || true)"
+  if [ -z "$HDFS_BIN" ] && [ -x /opt/tiger/arnold/hdfs_client/hdfs ]; then
+    HDFS_BIN=/opt/tiger/arnold/hdfs_client/hdfs
+  fi
+  if [ -n "$HDFS_BIN" ]; then
     if [ -f /usr/local/bin/import_hdfs_envs.sh ]; then
       # shellcheck disable=SC1091
       source /usr/local/bin/import_hdfs_envs.sh >/dev/null 2>&1 || true
     fi
     HDFS_TARGET={shlex_quote(output_uri_prefix.rstrip('/') + '/' + run_id)}
-    hdfs dfs -mkdir -p "$HDFS_TARGET" >/dev/null 2>&1 || true
-    hdfs dfs -put -f "$RUN_OUTPUT_DIR/cluster_artifacts.tgz" "$HDFS_TARGET/cluster_artifacts.tgz" >/dev/null 2>&1 || true
-    hdfs dfs -put -f "$RUN_OUTPUT_DIR/summary.csv" "$HDFS_TARGET/summary.csv" >/dev/null 2>&1 || true
-    hdfs dfs -put -f "$RUN_OUTPUT_DIR/summary.jsonl" "$HDFS_TARGET/summary.jsonl" >/dev/null 2>&1 || true
+    "$HDFS_BIN" dfs -mkdir -p "$HDFS_TARGET" >/dev/null 2>&1 || true
+    "$HDFS_BIN" dfs -put -f "$RUN_OUTPUT_DIR/cluster_artifacts.tgz" "$HDFS_TARGET/cluster_artifacts.tgz" >/dev/null 2>&1 || true
+    "$HDFS_BIN" dfs -put -f "$RUN_OUTPUT_DIR/summary.csv" "$HDFS_TARGET/summary.csv" >/dev/null 2>&1 || true
+    "$HDFS_BIN" dfs -put -f "$RUN_OUTPUT_DIR/summary.jsonl" "$HDFS_TARGET/summary.jsonl" >/dev/null 2>&1 || true
   fi
 """
     return f"""set -euo pipefail
