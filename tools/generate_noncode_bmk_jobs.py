@@ -107,6 +107,11 @@ def render_entrypoint(
     env_exports = "\n".join(
         f"export {key}={shlex_quote(value)}" for key, value in sorted(cfg["extra_env"].items())
     )
+    bench_setup = ""
+    if bench == "eqbench3":
+        bench_setup = """
+"$PYTHON_BIN" -m pip install --user trueskill
+"""
     mle_prepare = ""
     if bench == "mle_bench":
         data_dir = cfg["extra_env"]["MLEBENCH_DATA_DIR"]
@@ -300,6 +305,7 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [ ! -x "$PYTHON_BIN" ]; then
 fi
 "$PYTHON_BIN" -m pip install --user -r requirements.txt
 "$PYTHON_BIN" -m pip install --user -e "$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench" || true
+{bench_setup}
 
 export PYTHONPATH="$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench:$HARNESS_EVAL_ROOT:${{PYTHONPATH:-}}"
 
