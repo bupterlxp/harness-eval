@@ -12,7 +12,12 @@ venv/
 node_modules/
 eval_results/
 outputs/
-external_benchmarks/
+external_benchmarks/*
+!external_benchmarks/mle-bench/
+!external_benchmarks/mle-bench/**
+external_benchmarks/mle-bench/runs/
+!external_benchmarks/simple-evals/
+!external_benchmarks/simple-evals/**
 exports/
 metrics.json
 self_evolve_outputs/

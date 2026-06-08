@@ -1,0 +1,2 @@
+[console_scripts]
+mlebench = mlebench.cli:main
