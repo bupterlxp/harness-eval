@@ -144,13 +144,13 @@ export MLE_PREPARE_RC
 python3 - <<'PY'
 import json, os, pathlib, time
 path = pathlib.Path(os.environ["CLUSTER_DIR"]) / "mle_prepare_status.json"
-path.write_text(json.dumps({
+path.write_text(json.dumps({{
     "stage": "mle_prepare",
     "returncode": int(os.environ.get("MLE_PREPARE_RC", "0")),
     "timestamp": int(time.time()),
     "stdout_path": str(path.parent / "mle_prepare_stdout.log"),
     "stderr_path": str(path.parent / "mle_prepare_stderr.log"),
-}, ensure_ascii=False, indent=2))
+}}, ensure_ascii=False, indent=2))
 PY
 if [ "$MLE_PREPARE_RC" -ne 0 ]; then
   echo "[mle] prepare failed rc=$MLE_PREPARE_RC; continuing so run_creation_eval can emit a structured failure row"
