@@ -188,19 +188,14 @@ if ! command -v node >/dev/null 2>&1; then
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
 fi
 
-if [ ! -d .venv ]; then
-  python3 -m venv .venv
-fi
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
-python -m pip install -e "$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench" || true
-
-export PYTHONPATH="$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench:${{PYTHONPATH:-}}"
 PYTHON_BIN={shlex_quote(python_bin)}
-if [ ! -x "$PYTHON_BIN" ]; then
-  PYTHON_BIN=.venv/bin/python
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 && [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN=python3
 fi
+"$PYTHON_BIN" -m pip install --user -r requirements.txt
+"$PYTHON_BIN" -m pip install --user -e "$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench" || true
+
+export PYTHONPATH="$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench:$HARNESS_EVAL_ROOT:${{PYTHONPATH:-}}"
 
 {mle_prepare}
 
@@ -317,7 +312,7 @@ def main() -> int:
         default="/opt/tiger/Harness_evolve/outputs/creation-glm51-high-devfeedback-20260608-170801",
     )
     parser.add_argument("--output-root", default="/opt/tiger/Harness_evolve/eval_results/cluster_full")
-    parser.add_argument("--python-bin", default=".venv/bin/python")
+    parser.add_argument("--python-bin", default="python3")
     parser.add_argument("--preserve-template-env", action="store_true")
     parser.add_argument("--git-branch", default=git_value(["branch", "--show-current"], "codex/platform-native-bmk-shards"))
     parser.add_argument("--git-commit", default=git_value(["rev-parse", "HEAD"], ""))
