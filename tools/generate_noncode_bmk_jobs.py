@@ -349,15 +349,9 @@ def patch_outputs(job: dict[str, Any], *, output_root: str, run_id: str, output_
         ("cluster_artifacts", "FILE", f"{run_output_dir}/cluster_artifacts.tgz"),
     ]
     job_def_outputs: list[dict[str, Any]] = []
-    run_outputs: dict[str, dict[str, Any]] = {}
     for name, typ, source_path in output_specs:
         item: dict[str, Any] = {
             "name": name,
-            "type": typ,
-            "sourcePath": source_path,
-            "required": False,
-        }
-        run_item: dict[str, Any] = {
             "type": typ,
             "sourcePath": source_path,
             "required": False,
@@ -366,11 +360,12 @@ def patch_outputs(job: dict[str, Any], *, output_root: str, run_id: str, output_
             suffix = "eval_results" if typ == "DIRECTORY" else source_path.rsplit("/", 1)[-1]
             target = f"{output_uri_prefix.rstrip('/')}/{run_id}/{suffix}"
             item["targetPath"] = target
-            run_item["targetPath"] = target
         job_def_outputs.append(item)
-        run_outputs[name] = run_item
     ensure_nested(job, ["jobDefVersion"])["outputs"] = job_def_outputs
-    ensure_nested(job, ["jobRunParams"])["outputs"] = run_outputs
+    # jobRunParams.outputs uses Seed's JobProduct schema, not sourcePath/targetPath
+    # filesystem artifacts. Keep it empty and rely on jobDefVersion.outputs plus
+    # the entrypoint-created cluster_artifacts.tgz.
+    ensure_nested(job, ["jobRunParams"])["outputs"] = {}
 
 
 def patch_job(
