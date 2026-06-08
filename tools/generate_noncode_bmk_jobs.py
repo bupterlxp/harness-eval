@@ -432,7 +432,19 @@ def main() -> int:
     )
     parser.add_argument("--output-root", default="/opt/tiger/Harness_evolve/eval_results/cluster_full")
     parser.add_argument("--python-bin", default="python3")
-    parser.add_argument("--preserve-template-env", action="store_true")
+    parser.add_argument(
+        "--preserve-template-env",
+        dest="preserve_template_env",
+        action="store_true",
+        default=True,
+        help="Keep envsList from the template job. This is the default so API envs survive template patching.",
+    )
+    parser.add_argument(
+        "--clear-template-env",
+        dest="preserve_template_env",
+        action="store_false",
+        help="Clear template envsList before writing the generated job JSONL.",
+    )
     parser.add_argument("--git-branch", default=git_value(["branch", "--show-current"], "codex/platform-native-bmk-shards"))
     parser.add_argument("--git-commit", default=git_value(["rev-parse", "HEAD"], ""))
     parser.add_argument("--dependency-branch", default="")
@@ -446,7 +458,7 @@ def main() -> int:
         default="",
         help=(
             "Optional persistent URI prefix, for example hdfs://.../harness_eval. "
-            "Even when omitted, job outputs still declare local source paths for platform collection."
+            "When set, the entrypoint uploads summary files and cluster_artifacts.tgz there."
         ),
     )
     args = parser.parse_args()
