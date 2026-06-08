@@ -114,6 +114,20 @@ def image_meta(
     return meta
 
 
+def platform_image_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Convert local camelCase imageMeta to Seed's persisted image_meta shape."""
+    return {
+        "image_sid": str(meta.get("imageSid") or meta.get("image_sid") or ""),
+        "image_vid": str(meta.get("imageVid") or meta.get("image_vid") or ""),
+        "image_source": str(meta.get("imageSource") or meta.get("image_source") or ""),
+        "need_build": bool(meta.get("needBuild") or meta.get("need_build") or False),
+        "icm_name": str(meta.get("icmName") or meta.get("icm_name") or ""),
+        "icm_version": str(meta.get("icmVersion") or meta.get("icm_version") or ""),
+        "image_url": str(meta.get("imageUrl") or meta.get("image_url") or ""),
+        "task_id": int(meta.get("taskId") or meta.get("task_id") or 0),
+    }
+
+
 def render_entrypoint(
     *,
     instance: dict[str, Any],
@@ -132,8 +146,13 @@ def render_entrypoint(
         setup = r'''
 if ! command -v node >/dev/null 2>&1; then
   echo "[setup] node is missing; installing nodejs/npm"
-  sudo DEBIAN_FRONTEND=noninteractive apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO=sudo
+  else
+    SUDO=
+  fi
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
 fi
 
 python3 -m venv .venv
@@ -281,7 +300,9 @@ def patch_job(
     main_mnt = str(get_nested(job, ["jobDefVersion", "gitRepo", "mnt"], "/opt/tiger/Harness_evolve"))
     subrepos = jd.get("subRepos") if isinstance(jd.get("subRepos"), list) else []
     evolve_root = str(subrepos[0].get("mnt")) if subrepos and isinstance(subrepos[0], dict) and subrepos[0].get("mnt") else "/opt/tiger/harness_evolve_project"
-    jd["imageMeta"] = image_meta(row, template, allow_template_image, require_direct_image)
+    meta = image_meta(row, template, allow_template_image, require_direct_image)
+    jd["imageMeta"] = meta
+    jd["image_meta"] = platform_image_meta(meta)
     jd["entrypointMode"] = "FULL_SCRIPT"
     jd["name"] = str(caption)
     script = render_entrypoint(

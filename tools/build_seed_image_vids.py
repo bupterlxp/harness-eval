@@ -6,7 +6,9 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from urllib import error, request
 
@@ -123,6 +125,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--start-index", type=int, default=1)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--concurrency", type=int, default=1, help="Number of image versions to build/poll concurrently.")
     parser.add_argument("--poll-interval", type=float, default=10.0)
     parser.add_argument("--poll-timeout", type=float, default=1800.0)
     args = parser.parse_args()
@@ -135,16 +138,22 @@ def main() -> int:
     xjwt = get_xjwt()
     sid = args.sid.strip() or create_seed_image(xjwt, args.seed_image_name)
     print(f"seed_image_sid={sid}", flush=True)
+    write_lock = Lock()
 
-    for index, row in indexed_rows:
+    def write_result(result: dict[str, Any]) -> None:
+        with write_lock:
+            append_jsonl(args.output, result)
+
+    def build_one(index: int, row: dict[str, Any], total_rows: int, concurrent: bool = False) -> dict[str, Any]:
         instance_id = str(row.get("instance_id") or f"row-{index}")
         if instance_id in done:
             print(f"[skip] {index}/{len(rows)} {instance_id}", flush=True)
-            continue
+            return {"ok": True, "skipped": True, "instance_id": instance_id}
         source = str(row.get("internal_image_url") or "").strip()
         if not source:
-            append_jsonl(args.output, {"ok": False, "instance_id": instance_id, "error": "missing internal_image_url"})
-            continue
+            result = {"ok": False, "instance_id": instance_id, "error": "missing internal_image_url"}
+            write_result(result)
+            return result
         tag = str(row.get("target_tag") or f"swepro-{index:04d}")
         payload = {
             "sid": sid,
@@ -156,7 +165,7 @@ def main() -> int:
             "archs": [args.arch],
             "is_sync": False,
         }
-        print(f"[build] {index}/{len(rows)} {instance_id}", flush=True)
+        print(f"[build] {index}/{total_rows} {instance_id}", flush=True)
         status, body, raw = post_json(BUILD_URL, payload, xjwt)
         result: dict[str, Any] = {
             "ok": False,
@@ -169,9 +178,9 @@ def main() -> int:
         }
         if status != 200:
             result["build_raw"] = raw[:4000]
-            append_jsonl(args.output, result)
+            write_result(result)
             print(f"[build-fail] {instance_id}", flush=True)
-            continue
+            return result
 
         deadline = time.time() + args.poll_timeout
         last_version: dict[str, Any] | None = None
@@ -185,7 +194,7 @@ def main() -> int:
                 if str(version.get("image_name") or version.get("name") or version.get("tag") or "") == tag:
                     match = version
                     break
-            if match is None and versions:
+            if match is None and versions and not concurrent:
                 # Seed currently returns newest first; use it as fallback for one-at-a-time builds.
                 match = versions[0]
             if not match:
@@ -204,18 +213,35 @@ def main() -> int:
                         "status_desc": status_desc,
                     }
                 )
-                append_jsonl(args.output, result)
+                write_result(result)
                 print(f"[ok] {instance_id} imageVid={vid}", flush=True)
-                break
+                return result
             if status_text and status_text.upper() in {"FAIL", "FAILED"}:
                 result.update({"region_status": status_text, "status_desc": status_desc, "version": match})
-                append_jsonl(args.output, result)
+                write_result(result)
                 print(f"[seed-fail] {instance_id}", flush=True)
-                break
+                return result
         else:
             result.update({"error": "poll_timeout", "last_version": last_version})
-            append_jsonl(args.output, result)
+            write_result(result)
             print(f"[timeout] {instance_id}", flush=True)
+            return result
+
+        return result
+
+    concurrency = max(1, args.concurrency)
+    if concurrency == 1:
+        for index, row in indexed_rows:
+            build_one(index, row, len(rows), concurrent=False)
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(build_one, index, row, len(rows), True)
+                for index, row in indexed_rows
+                if str(row.get("instance_id") or f"row-{index}") not in done
+            ]
+            for future in as_completed(futures):
+                future.result()
 
     return 0
 

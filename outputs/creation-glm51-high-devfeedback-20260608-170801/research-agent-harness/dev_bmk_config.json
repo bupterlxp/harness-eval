@@ -1,0 +1,10 @@
+{
+  "task_id": "research-agent-harness",
+  "domain": "research",
+  "default_benches": "browsecomp",
+  "default_max_tasks_per_bmk": 3,
+  "harness_eval_root": "/harness-eval",
+  "harness_evolve_root": "/harness-evolve",
+  "output_root": "dev_bmk_runs",
+  "notes": "Use run_dev_bmk.py during creation to test the current harness on public/dev BMK tasks. These runs are for the creation agent's own feedback, not a public validation gate."
+}

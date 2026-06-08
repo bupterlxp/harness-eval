@@ -727,7 +727,10 @@ def main() -> int:
 
     print("Running public/dev BMK feedback:")
     print(" ".join(command))
-    result = subprocess.run(command, cwd=ROOT, env=env)
+    # Run downstream dev feedback from a writable directory. Some benchmark
+    # dependencies create local caches relative to cwd; /harness-eval is mounted
+    # read-only inside creation containers.
+    result = subprocess.run(command, cwd=output_root, env=env)
     output_dir = output_root / run_id
     record = {
         "run_id": run_id,
@@ -754,6 +757,21 @@ if __name__ == "__main__":
 def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeout: int | None) -> tuple[str, str, str]:
     container_name = f"harness-eval-{task_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
     harness_evolve_root = Path(str(config.get("harness_evolve_root") or DEFAULT_HARNESS_EVOLVE_ROOT)).expanduser()
+    passthrough_env_names = [
+        # BMK/dev-feedback credentials. Values are supplied by the caller's
+        # environment and are not written into repo files or task metadata.
+        "KAGGLE_USERNAME",
+        "KAGGLE_KEY",
+        "KAGGLE_CONFIG_DIR",
+        "SERPER_KEY_ID",
+        "SERPER_API_KEY",
+        "SEARCH_API_KEY",
+        "TAVILY_API_KEY",
+        "BROWSECOMP_CSV_PATH",
+        "BROWSECOMP_JUDGE_API_KEY",
+        "EQBENCH3_DATASET_PATH",
+        "EQBENCH3_JUDGE_API_KEY",
+    ]
     docker_command = [
         "docker", "run",
         "--name", container_name,
@@ -777,6 +795,7 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
         "-e", f"PROVIDER_EXTRA_HEADERS_JSON={os.environ.get('PROVIDER_EXTRA_HEADERS_JSON', '')}",
         "-e", f"PROVIDER_STRIP_MAX_TOKENS={os.environ.get('PROVIDER_STRIP_MAX_TOKENS', '')}",
         "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
+        "-e", f"PROVIDER_FIX_CACHE_CONTROL={os.environ.get('PROVIDER_FIX_CACHE_CONTROL', '')}",
         "-e", f"PROVIDER_DEFAULT_MAX_TOKENS={os.environ.get('PROVIDER_DEFAULT_MAX_TOKENS', '')}",
         "-e", f"EVAL_BASE_URL={config.get('eval_base_url') or config.get('base_url') or ''}",
         "-e", f"EVAL_API_KEY={config.get('eval_api_key') or config.get('api_key') or ''}",
@@ -791,6 +810,9 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
         "-v", f"{harness_evolve_root}:/harness-evolve:ro",
         "-v", f"{workspace}:/workspace",
     ]
+    for name in passthrough_env_names:
+        if os.environ.get(name):
+            docker_command.extend(["-e", f"{name}={os.environ[name]}"])
     docker_sock = Path("/var/run/docker.sock")
     if docker_sock.exists():
         docker_command.extend([

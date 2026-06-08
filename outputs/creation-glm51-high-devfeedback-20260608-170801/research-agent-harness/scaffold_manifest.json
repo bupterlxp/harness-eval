@@ -1,0 +1,6 @@
+{
+  "style": "claude_code_scaffold_native",
+  "program": "generated_program.py",
+  "compat_entrypoint": "harness/__main__.py",
+  "contract": "Generated harness must run through harness_scaffold. Additional tools may be added, but the scaffold runtime remains the execution substrate."
+}

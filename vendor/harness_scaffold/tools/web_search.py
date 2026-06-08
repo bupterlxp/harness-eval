@@ -7,7 +7,9 @@ of these mechanisms (checked in order):
 1. ``ctx.metadata["web_search_backend"]`` — a callable
    ``backend(query, *, allowed_domains, blocked_domains, max_results, timeout)``
    returning a list of result dicts (or an object with such a method).
-2. ``ctx.metadata["serpapi_api_key"]`` / env ``SERPAPI_API_KEY`` — uses SerpApi
+2. ``ctx.metadata["serper_api_key"]`` / env ``SERPER_KEY_ID`` or
+   ``SERPER_API_KEY`` — uses Serper over HTTP (requires network).
+3. ``ctx.metadata["serpapi_api_key"]`` / env ``SERPAPI_API_KEY`` — uses SerpApi
    over HTTP (requires network + the stdlib/``requests`` fetch path).
 
 If no backend and no key are configured, the tool returns a STRUCTURED
@@ -232,7 +234,17 @@ class WebSearchTool(AtomicTool):
             if call is not None:
                 return ("custom", call)
 
-        # 2) SerpApi via metadata or env.
+        # 2) Serper via metadata or env.
+        serper_key = (
+            meta.get("serper_api_key")
+            or meta.get("serper_key_id")
+            or os.environ.get("SERPER_KEY_ID")
+            or os.environ.get("SERPER_API_KEY")
+        )
+        if serper_key:
+            return ("serper", lambda *a, **k: _serper_search(serper_key, *a, **k))
+
+        # 3) SerpApi via metadata or env.
         api_key = meta.get("serpapi_api_key") or os.environ.get("SERPAPI_API_KEY")
         if api_key:
             return ("serpapi", lambda *a, **k: _serpapi_search(api_key, *a, **k))
@@ -241,8 +253,59 @@ class WebSearchTool(AtomicTool):
 
 
 # --------------------------------------------------------------------------- #
-# Built-in SerpApi backend (HTTP; requests if present else stdlib urllib).
+# Built-in search backends (HTTP; requests if present else stdlib urllib).
 # --------------------------------------------------------------------------- #
+
+
+def _serper_search(
+    api_key: str,
+    query: str,
+    *,
+    allowed_domains: Optional[list] = None,
+    blocked_domains: Optional[list] = None,
+    max_results: int = 5,
+    timeout: float = 30.0,
+) -> list[dict]:
+    q = query
+    if allowed_domains:
+        q += " (" + " OR ".join(f"site:{d}" for d in allowed_domains) + ")"
+    if blocked_domains:
+        q += "".join(f" -site:{d}" for d in blocked_domains)
+    payload = {"q": q, "num": max_results}
+    raw = _http_post_json_bytes(
+        "https://google.serper.dev/search",
+        payload,
+        timeout,
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+    )
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:  # noqa: BLE001
+        raise HarnessError(
+            f"serper returned invalid JSON: {exc}",
+            error_code=ErrorCode.PROVIDER_ERROR,
+            stage="tool:web_search",
+        ) from exc
+    if isinstance(data, dict) and data.get("message") and not data.get("organic"):
+        raise HarnessError(
+            f"serper error: {data['message']}",
+            error_code=ErrorCode.PROVIDER_ERROR,
+            stage="tool:web_search",
+            details={"message": data.get("message")},
+        )
+    organic = data.get("organic", []) if isinstance(data, dict) else []
+    results: list[dict] = []
+    for item in organic[:max_results]:
+        if not isinstance(item, dict):
+            continue
+        results.append(
+            {
+                "title": str(item.get("title", "")),
+                "url": str(item.get("link", "")),
+                "snippet": str(item.get("snippet", "")),
+            }
+        )
+    return results
 
 
 def _serpapi_search(
@@ -328,6 +391,82 @@ def _http_get_bytes(url: str, timeout: float) -> bytes:
 
     req = urllib.request.Request(
         url, headers={"User-Agent": "harness_scaffold/1.0 (+web_search)"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return resp.read() or b""
+    except socket.timeout as exc:
+        raise TimeoutErrorH(
+            f"web_search timed out after {timeout:.1f}s",
+            stage="tool:web_search",
+            details={"timeout_seconds": timeout},
+        ) from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.timeout):
+            raise TimeoutErrorH(
+                f"web_search timed out after {timeout:.1f}s",
+                stage="tool:web_search",
+                details={"timeout_seconds": timeout},
+            ) from exc
+        raise HarnessError(
+            f"web_search http request failed: {reason}",
+            error_code=ErrorCode.PROVIDER_ERROR,
+            stage="tool:web_search",
+            details={"reason": str(reason)},
+        ) from exc
+
+
+def _http_post_json_bytes(
+    url: str,
+    payload: dict[str, Any],
+    timeout: float,
+    *,
+    headers: Optional[dict[str, str]] = None,
+) -> bytes:
+    """POST JSON using requests if available, else stdlib urllib."""
+    headers = dict(headers or {})
+    try:
+        from ..core.dependency import require
+
+        requests = require("requests", extra="http", purpose="web_search")
+    except HarnessError:
+        requests = None
+    if requests is not None:
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                timeout=timeout,
+                headers={
+                    "User-Agent": "harness_scaffold/1.0 (+web_search)",
+                    **headers,
+                },
+            )
+            return resp.content or b""
+        except requests.exceptions.Timeout as exc:  # type: ignore[attr-defined]
+            raise TimeoutErrorH(
+                f"web_search timed out after {timeout:.1f}s",
+                stage="tool:web_search",
+                details={"timeout_seconds": timeout},
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HarnessError(
+                f"web_search http request failed: {exc}",
+                error_code=ErrorCode.PROVIDER_ERROR,
+                stage="tool:web_search",
+            ) from exc
+
+    import socket
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"User-Agent": "harness_scaffold/1.0 (+web_search)", **headers},
+        method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310

@@ -15,6 +15,7 @@ const PROVIDER_EXTRA_BODY_JSON = process.env.PROVIDER_EXTRA_BODY_JSON || '';
 const PROVIDER_EXTRA_HEADERS_JSON = process.env.PROVIDER_EXTRA_HEADERS_JSON || '';
 const PROVIDER_STRIP_MAX_TOKENS = process.env.PROVIDER_STRIP_MAX_TOKENS === '1' || process.env.PROVIDER_STRIP_MAX_TOKENS === 'true';
 const PROVIDER_STRIP_CACHE_CONTROL = process.env.PROVIDER_STRIP_CACHE_CONTROL === '1' || process.env.PROVIDER_STRIP_CACHE_CONTROL === 'true';
+const PROVIDER_FIX_CACHE_CONTROL = process.env.PROVIDER_FIX_CACHE_CONTROL === '1' || process.env.PROVIDER_FIX_CACHE_CONTROL === 'true';
 const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 
@@ -226,6 +227,42 @@ function stripProviderOnlyFields(value) {
   return value;
 }
 
+function stripGeminiUnsupportedSchemaFields(value) {
+  if (Array.isArray(value)) {
+    return value.map(stripGeminiUnsupportedSchemaFields);
+  }
+  if (value && typeof value === 'object') {
+    const next = {};
+    for (const [key, item] of Object.entries(value)) {
+      if ([
+        '$schema',
+        '$id',
+        'propertyNames',
+        'exclusiveMinimum',
+        'exclusiveMaximum',
+        'const',
+        'examples',
+      ].includes(key)) {
+        continue;
+      }
+      if (key === 'additionalProperties') {
+        if (item === false || item === true) continue;
+      }
+      next[key] = stripGeminiUnsupportedSchemaFields(item);
+    }
+    return next;
+  }
+  return value;
+}
+
+function providerCompatibleToolParameters(parameters) {
+  let next = stripProviderOnlyFields(parameters);
+  if (String(MODEL_NAME).toLowerCase().includes('gemini')) {
+    next = stripGeminiUnsupportedSchemaFields(next);
+  }
+  return next;
+}
+
 function normalizeProviderTools(payload) {
   if (!Array.isArray(payload.tools)) return;
   const tools = [];
@@ -243,7 +280,7 @@ function normalizeProviderTools(payload) {
       function: {
         name,
         description: source.description || tool.description || '',
-        parameters: stripProviderOnlyFields(parameters),
+        parameters: providerCompatibleToolParameters(parameters),
       },
     });
   }
@@ -418,6 +455,9 @@ function shapeProviderRequest(bodyText) {
   if (PROVIDER_STRIP_CACHE_CONTROL) {
     stripCacheControl(payload);
   }
+  if (PROVIDER_FIX_CACHE_CONTROL) {
+    fixCacheControl(payload);
+  }
 
   normalizeProviderTools(payload);
 
@@ -455,6 +495,25 @@ function stripCacheControl(value) {
   delete value.cache_control;
   for (const item of Object.values(value)) {
     stripCacheControl(item);
+  }
+}
+
+function fixCacheControl(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) fixCacheControl(item);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  if (Object.prototype.hasOwnProperty.call(value, 'cache_control')) {
+    const current = value.cache_control;
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      value.cache_control = { type: 'ephemeral' };
+    } else if (!current.type) {
+      current.type = 'ephemeral';
+    }
+  }
+  for (const item of Object.values(value)) {
+    fixCacheControl(item);
   }
 }
 

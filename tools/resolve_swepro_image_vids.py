@@ -51,27 +51,29 @@ def auth_header() -> str:
     raise SystemExit("Missing ICM auth. Set ICM_BASIC_AUTH or ICM_USERNAME/ICM_PASSWORD.")
 
 
-def load_mapping(path: Path | None) -> dict[str, str]:
+def load_mapping(path: Path | None) -> dict[str, dict[str, str]]:
     if not path:
         return {}
     rows = read_jsonl(path)
-    mapping: dict[str, str] = {}
+    mapping: dict[str, dict[str, str]] = {}
     for row in rows:
         image_vid = str(row.get("imageVid") or row.get("image_vid") or row.get("vid") or "").strip()
         if not image_vid:
             continue
+        image_sid = str(row.get("imageSid") or row.get("image_sid") or row.get("sid") or "").strip()
+        payload = {"imageVid": image_vid, "imageSid": image_sid}
         for key_name in ("instance_id", "icm_version_id", "version_id", "icmVersion", "icm_version", "source_image"):
             value = row.get(key_name)
             if value is not None and str(value).strip():
-                mapping[str(value).strip()] = image_vid
+                mapping[str(value).strip()] = payload
         image_id = row.get("icm_image_id") or row.get("image_id")
         version_id = row.get("icm_version_id") or row.get("version_id")
         if image_id is not None and version_id is not None:
-            mapping[f"{image_id}:{version_id}"] = image_vid
+            mapping[f"{image_id}:{version_id}"] = payload
     return mapping
 
 
-def lookup_mapping(row: dict[str, Any], mapping: dict[str, str]) -> tuple[str | None, str | None]:
+def lookup_mapping(row: dict[str, Any], mapping: dict[str, dict[str, str]]) -> tuple[str | None, str | None, str | None]:
     keys = [
         row.get("instance_id"),
         row.get("icm_version_id"),
@@ -89,8 +91,8 @@ def lookup_mapping(row: dict[str, Any], mapping: dict[str, str]) -> tuple[str | 
             continue
         value = mapping.get(str(key).strip())
         if value:
-            return value, f"mapping:{key}"
-    return None, None
+            return value.get("imageVid"), value.get("imageSid"), f"mapping:{key}"
+    return None, None, None
 
 
 def extract_image_vid(obj: Any) -> str | None:
@@ -163,15 +165,17 @@ def resolve_from_api(
     return None, {"error": "imageVid not found in API responses", "attempts": attempts}
 
 
-def direct_row(row: dict[str, Any], image_vid: str, source: str) -> dict[str, Any]:
+def direct_row(row: dict[str, Any], image_vid: str, source: str, image_sid: str = "") -> dict[str, Any]:
     out = dict(row)
     out["imageVid"] = image_vid
+    if image_sid:
+        out["imageSid"] = image_sid
     out["imageSource"] = "vid"
     out["needBuild"] = False
     out["icmName"] = ""
     out["icmVersion"] = ""
     out["imageMeta"] = {
-        "imageSid": "",
+        "imageSid": image_sid,
         "imageVid": image_vid,
         "imageSource": "vid",
         "needBuild": False,
@@ -211,15 +215,16 @@ def main() -> int:
 
     for index, row in enumerate(rows, 1):
         instance_id = row.get("instance_id") or f"row-{index}"
-        image_vid, source = lookup_mapping(row, mapping)
+        image_vid, image_sid, source = lookup_mapping(row, mapping)
         detail: dict[str, Any] = {}
         if not image_vid:
             if header is None:
                 header = auth_header()
             image_vid, detail = resolve_from_api(row, namespace=args.namespace, endpoints=endpoints, header=header, timeout=args.timeout)
+            image_sid = ""
             source = detail.get("method") or "api"
         if image_vid:
-            resolved.append(direct_row(row, image_vid, str(source)))
+            resolved.append(direct_row(row, image_vid, str(source), image_sid or ""))
             print(f"[resolved] {index}/{len(rows)} {instance_id} imageVid={image_vid}")
         else:
             failure = {

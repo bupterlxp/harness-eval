@@ -25,6 +25,9 @@ def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
 
 
 def get_xjwt(session: requests.Session) -> str:
+    env_token = os.environ.get("SEED_X_JWT")
+    if env_token:
+        return env_token
     sec_token_path = os.environ.get("SEC_TOKEN_PATH")
     if not sec_token_path or not Path(sec_token_path).exists():
         raise FileNotFoundError(f"SEC_TOKEN_PATH is invalid: {sec_token_path}")
@@ -175,7 +178,6 @@ def main() -> int:
                     "job_run_id": job_run_id,
                     "status": "CREATED",
                     "submit_url": args.submit_url,
-                    "submit_body": job,
                 },
             )
             print(f"[submitted] {key} job_run_id={job_run_id}")

@@ -59,6 +59,8 @@ def resolve_model_alias(model_name: str | None, overrides: Mapping[str, str] | N
     raw = str(model_name).strip()
     if not raw:
         return raw
+    if raw.startswith("exact:"):
+        return raw.removeprefix("exact:").strip()
     aliases = merged_model_aliases(overrides)
     return aliases.get(_alias_key(raw)) or aliases.get(_relaxed_alias_key(raw)) or raw
 
@@ -69,6 +71,8 @@ def resolve_codex_model_alias(model_name: str | None, overrides: Mapping[str, st
     raw = str(model_name).strip()
     if not raw:
         return raw
+    if raw.startswith("exact:"):
+        return raw.removeprefix("exact:").strip()
     aliases = dict(BUILTIN_CODEX_MODEL_ALIASES)
     for key, value in (overrides or {}).items():
         aliases[_alias_key(str(key))] = str(value)

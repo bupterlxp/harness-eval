@@ -122,7 +122,6 @@ def submit_one(
             "job_run_id": job_run_id,
             "status": "CREATED",
             "submit_url": submit_url,
-            "submit_body": job,
         },
     )
     print(f"[submitted] {key} job_run_id={job_run_id}")
