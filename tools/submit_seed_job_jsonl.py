@@ -95,6 +95,15 @@ def extract_job_run_id(response: Any) -> str | None:
     return None
 
 
+def summarize_expected_outputs(job_body: dict[str, Any]) -> dict[str, Any]:
+    job_def = job_body.get("jobDefVersion") if isinstance(job_body.get("jobDefVersion"), dict) else {}
+    run_params = job_body.get("jobRunParams") if isinstance(job_body.get("jobRunParams"), dict) else {}
+    return {
+        "job_def_outputs": job_def.get("outputs") or [],
+        "run_outputs": run_params.get("outputs") or {},
+    }
+
+
 def rewrite_jsonl(path: Path, kept_lines: list[str]) -> None:
     backup = path.with_suffix(path.suffix + ".bak")
     if path.exists():
@@ -165,6 +174,7 @@ def main() -> int:
                     "task_key": key,
                     "lineno": lineno,
                     "job_run_id": job_run_id,
+                    "expected_outputs": summarize_expected_outputs(job),
                     "response": result,
                 },
             )
@@ -178,6 +188,7 @@ def main() -> int:
                     "job_run_id": job_run_id,
                     "status": "CREATED",
                     "submit_url": args.submit_url,
+                    "expected_outputs": summarize_expected_outputs(job),
                 },
             )
             print(f"[submitted] {key} job_run_id={job_run_id}")

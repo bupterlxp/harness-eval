@@ -62,7 +62,7 @@ def status_is_terminal(status: str, err_msg: str) -> bool:
     return bool(err_msg) and "Failed to build task image" in err_msg
 
 
-def get_job_status(session: requests.Session, xjwt: str, get_url: str, job_run_id: str) -> tuple[str, str]:
+def get_job_status(session: requests.Session, xjwt: str, get_url: str, job_run_id: str) -> dict[str, Any]:
     response = session.post(
         get_url,
         headers={"Domain": "seed_job", "content-type": "application/json", "x-jwt-token": xjwt},
@@ -72,15 +72,41 @@ def get_job_status(session: requests.Session, xjwt: str, get_url: str, job_run_i
     if response.status_code in (401, 403):
         raise PermissionError(response.text[:500])
     if response.status_code != 200:
-        return f"HTTP_{response.status_code}", response.text[:500]
+        return {"status": f"HTTP_{response.status_code}", "err_msg": response.text[:500]}
     data = response.json()
     job_run = data.get("job_run") or data.get("data", {}).get("job_run") or data.get("data") or data
     meta = job_run.get("meta") if isinstance(job_run, dict) else {}
     err_msg = ""
+    app_output: Any = {}
+    app_outputs: Any = {}
+    arnold_url = ""
+    trial_id = ""
+    trial_status = ""
+    job_def_outputs: Any = []
+    run_outputs: Any = {}
     if isinstance(meta, dict):
         err_msg = str(meta.get("err_msg") or meta.get("errMsg") or "")
+        app_output = meta.get("app_output") or {}
+        app_outputs = meta.get("app_outputs") or {}
+        arnold_url = str(meta.get("arnold_url") or "")
+        trial_id = str(meta.get("arnold_trial_id") or "")
+        trial_status = str(meta.get("arnold_trial_status") or "")
+        job_def_version = meta.get("job_def_version") if isinstance(meta.get("job_def_version"), dict) else {}
+        job_run_params = meta.get("job_run_params") if isinstance(meta.get("job_run_params"), dict) else {}
+        job_def_outputs = job_def_version.get("outputs") or []
+        run_outputs = job_run_params.get("outputs") or {}
     status = str(job_run.get("status") or job_run.get("jobRunStatus") or "UNKNOWN") if isinstance(job_run, dict) else "UNKNOWN"
-    return status, err_msg
+    return {
+        "status": status,
+        "err_msg": err_msg,
+        "app_output": app_output,
+        "app_outputs": app_outputs,
+        "arnold_url": arnold_url,
+        "trial_id": trial_id,
+        "trial_status": trial_status,
+        "job_def_outputs": job_def_outputs,
+        "run_outputs": run_outputs,
+    }
 
 
 def append_event(path: Path, obj: dict[str, Any]) -> None:
@@ -110,7 +136,14 @@ def submit_one(
     job_run_id = submit_lib.extract_job_run_id(result)
     append_event(
         events,
-        {"event": "SUBMIT_OK", "task_key": key, "lineno": lineno, "job_run_id": job_run_id, "response": result},
+        {
+            "event": "SUBMIT_OK",
+            "task_key": key,
+            "lineno": lineno,
+            "job_run_id": job_run_id,
+            "expected_outputs": submit_lib.summarize_expected_outputs(job),
+            "response": result,
+        },
     )
     submit_lib.append_jsonl(
         watch,
@@ -122,6 +155,7 @@ def submit_one(
             "job_run_id": job_run_id,
             "status": "CREATED",
             "submit_url": submit_url,
+            "expected_outputs": submit_lib.summarize_expected_outputs(job),
         },
     )
     print(f"[submitted] {key} job_run_id={job_run_id}")
@@ -164,10 +198,12 @@ def main() -> int:
         still_active: dict[str, dict[str, Any]] = {}
         for job_run_id, row in list(active.items()):
             try:
-                status, err_msg = get_job_status(session, xjwt, args.get_url, job_run_id)
+                status_info = get_job_status(session, xjwt, args.get_url, job_run_id)
             except PermissionError:
                 xjwt = submit_lib.get_xjwt(session)
-                status, err_msg = get_job_status(session, xjwt, args.get_url, job_run_id)
+                status_info = get_job_status(session, xjwt, args.get_url, job_run_id)
+            status = str(status_info.get("status") or "UNKNOWN")
+            err_msg = str(status_info.get("err_msg") or "")
             append_event(
                 args.events,
                 {
@@ -175,6 +211,13 @@ def main() -> int:
                     "job_run_id": job_run_id,
                     "status": status,
                     "err_msg": err_msg[:500],
+                    "trial_id": status_info.get("trial_id"),
+                    "trial_status": status_info.get("trial_status"),
+                    "arnold_url": status_info.get("arnold_url"),
+                    "app_output": status_info.get("app_output"),
+                    "app_outputs": status_info.get("app_outputs"),
+                    "job_def_outputs": status_info.get("job_def_outputs"),
+                    "run_outputs": status_info.get("run_outputs"),
                 },
             )
             if status_is_terminal(status, err_msg):

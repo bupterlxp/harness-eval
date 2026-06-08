@@ -99,8 +99,11 @@ def render_entrypoint(
     eval_reasoning_effort: str,
     provider_extra_body_json: str,
     provider_strip_max_tokens: str,
+    output_uri_prefix: str,
 ) -> str:
     cfg = BENCH_CONFIG[bench]
+    run_output_dir = f"{output_root.rstrip('/')}/{run_id}"
+    cluster_dir = f"{run_output_dir}/_cluster"
     env_exports = "\n".join(
         f"export {key}={shlex_quote(value)}" for key, value in sorted(cfg["extra_env"].items())
     )
@@ -128,7 +131,25 @@ path.chmod(0o600)
 PY
 fi
 echo "[mle] preparing all competitions into {data_dir}"
-"$PYTHON_BIN" -m mlebench.cli prepare --all --data-dir {shlex_quote(data_dir)}
+set +e
+"$PYTHON_BIN" -m mlebench.cli prepare --all --data-dir {shlex_quote(data_dir)} > "$CLUSTER_DIR/mle_prepare_stdout.log" 2> "$CLUSTER_DIR/mle_prepare_stderr.log"
+MLE_PREPARE_RC=$?
+set -e
+export MLE_PREPARE_RC
+python3 - <<'PY'
+import json, os, pathlib, time
+path = pathlib.Path(os.environ["CLUSTER_DIR"]) / "mle_prepare_status.json"
+path.write_text(json.dumps({
+    "stage": "mle_prepare",
+    "returncode": int(os.environ.get("MLE_PREPARE_RC", "0")),
+    "timestamp": int(time.time()),
+    "stdout_path": str(path.parent / "mle_prepare_stdout.log"),
+    "stderr_path": str(path.parent / "mle_prepare_stderr.log"),
+}, ensure_ascii=False, indent=2))
+PY
+if [ "$MLE_PREPARE_RC" -ne 0 ]; then
+  echo "[mle] prepare failed rc=$MLE_PREPARE_RC; continuing so run_creation_eval can emit a structured failure row"
+fi
 """
     provider_extra = (
         f"export PROVIDER_EXTRA_BODY_JSON={shlex_quote(provider_extra_body_json)}"
@@ -140,6 +161,21 @@ echo "[mle] preparing all competitions into {data_dir}"
         if provider_strip_max_tokens
         else "unset PROVIDER_STRIP_MAX_TOKENS"
     )
+    upload_block = ""
+    if output_uri_prefix:
+        upload_block = f"""
+  if command -v hdfs >/dev/null 2>&1; then
+    if [ -f /usr/local/bin/import_hdfs_envs.sh ]; then
+      # shellcheck disable=SC1091
+      source /usr/local/bin/import_hdfs_envs.sh >/dev/null 2>&1 || true
+    fi
+    HDFS_TARGET={shlex_quote(output_uri_prefix.rstrip('/') + '/' + run_id)}
+    hdfs dfs -mkdir -p "$HDFS_TARGET" >/dev/null 2>&1 || true
+    hdfs dfs -put -f "$RUN_OUTPUT_DIR/cluster_artifacts.tgz" "$HDFS_TARGET/cluster_artifacts.tgz" >/dev/null 2>&1 || true
+    hdfs dfs -put -f "$RUN_OUTPUT_DIR/summary.csv" "$HDFS_TARGET/summary.csv" >/dev/null 2>&1 || true
+    hdfs dfs -put -f "$RUN_OUTPUT_DIR/summary.jsonl" "$HDFS_TARGET/summary.jsonl" >/dev/null 2>&1 || true
+  fi
+"""
     return f"""set -euo pipefail
 
 cd {shlex_quote(harness_eval_root)}
@@ -148,6 +184,71 @@ export PATH="$HOME/.local/bin:$PATH"
 export HARNESS_EVAL_ROOT={shlex_quote(harness_eval_root)}
 export HARNESS_EVOLVE_ROOT={shlex_quote(harness_evolve_root)}
 export PYTHONUNBUFFERED=1
+export RUN_ID={shlex_quote(run_id)}
+export BENCH_NAME={shlex_quote(bench)}
+export BENCH_DOMAIN={shlex_quote(cfg["domain"])}
+export RUN_OUTPUT_DIR={shlex_quote(run_output_dir)}
+export CLUSTER_DIR={shlex_quote(cluster_dir)}
+mkdir -p "$CLUSTER_DIR"
+touch "$CLUSTER_DIR/entrypoint_stdout.log" "$CLUSTER_DIR/entrypoint_stderr.log"
+exec > >(tee -a "$CLUSTER_DIR/entrypoint_stdout.log") 2> >(tee -a "$CLUSTER_DIR/entrypoint_stderr.log" >&2)
+
+finalize_cluster_artifacts() {{
+  rc="${{CLUSTER_EXIT_RC:-$?}}"
+  set +e
+  python3 - <<'PY'
+import csv, json, os, pathlib, time
+run_dir = pathlib.Path(os.environ["RUN_OUTPUT_DIR"])
+cluster_dir = pathlib.Path(os.environ["CLUSTER_DIR"])
+run_dir.mkdir(parents=True, exist_ok=True)
+cluster_dir.mkdir(parents=True, exist_ok=True)
+status = {{
+    "run_id": os.environ.get("RUN_ID"),
+    "benchmark": os.environ.get("BENCH_NAME"),
+    "returncode": int(os.environ.get("CLUSTER_EXIT_RC", "0")),
+    "timestamp": int(time.time()),
+    "stdout_path": str(cluster_dir / "entrypoint_stdout.log"),
+    "stderr_path": str(cluster_dir / "entrypoint_stderr.log"),
+}}
+(cluster_dir / "entrypoint_status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2))
+summary_jsonl = run_dir / "summary.jsonl"
+summary_csv = run_dir / "summary.csv"
+if not summary_jsonl.exists():
+    row = {{
+        "generation_model": "",
+        "domain": os.environ.get("BENCH_DOMAIN", ""),
+        "harness_task_id": "",
+        "harness_path": os.environ.get("GENERATION_OUTPUT", ""),
+        "benchmark": os.environ.get("BENCH_NAME", ""),
+        "generation_status": "",
+        "syntax_ok": "",
+        "adapter_status": "",
+        "eval_status": "failed/cluster_entrypoint",
+        "score": "",
+        "score_breakdown": json.dumps({{"cluster_returncode": status["returncode"]}}, ensure_ascii=False),
+        "pass_rate": "",
+        "win_rate": "",
+        "reward": "",
+        "harness_run_tokens": "",
+        "harness_run_interactions": "",
+        "generation_tokens": "",
+        "missing_dependencies": "",
+        "stdout_path": str(cluster_dir / "entrypoint_stdout.log"),
+        "stderr_path": str(cluster_dir / "entrypoint_stderr.log"),
+        "raw_result_path": str(cluster_dir / "entrypoint_status.json"),
+    }}
+    summary_jsonl.write_text(json.dumps(row, ensure_ascii=False) + "\\n")
+    with summary_csv.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+PY
+  tar --exclude=cluster_artifacts.tgz -czf "$RUN_OUTPUT_DIR/cluster_artifacts.tgz" -C "$RUN_OUTPUT_DIR" . >/dev/null 2>&1 || true
+{upload_block}
+  exit "$rc"
+}}
+trap 'rc=$?; export CLUSTER_EXIT_RC="$rc"; finalize_cluster_artifacts' EXIT
+
 {strip_max}
 {provider_extra}
 export EVAL_MODEL_NAME="${{EVAL_MODEL_NAME:-{eval_model_name}}}"
@@ -176,6 +277,7 @@ if [ ! -d {shlex_quote(generation_output)} ]; then
   echo "ERROR: missing generated harness artifact root: {generation_output}"
   exit 2
 fi
+export GENERATION_OUTPUT={shlex_quote(generation_output)}
 
 mkdir -p "$HARNESS_EVAL_ROOT/external_benchmarks"
 ln -sfn "$HARNESS_EVOLVE_ROOT/external_benchmarks/mle-bench" "$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench"
@@ -238,6 +340,39 @@ def patch_resource(job: dict[str, Any], resource: dict[str, int]) -> None:
     job_def_resource["gpu"] = resource["gpu"]
 
 
+def patch_outputs(job: dict[str, Any], *, output_root: str, run_id: str, output_uri_prefix: str = "") -> None:
+    run_output_dir = f"{output_root.rstrip('/')}/{run_id}"
+    output_specs = [
+        ("eval_results", "DIRECTORY", run_output_dir),
+        ("summary_csv", "FILE", f"{run_output_dir}/summary.csv"),
+        ("summary_jsonl", "FILE", f"{run_output_dir}/summary.jsonl"),
+        ("cluster_artifacts", "FILE", f"{run_output_dir}/cluster_artifacts.tgz"),
+    ]
+    job_def_outputs: list[dict[str, Any]] = []
+    run_outputs: dict[str, dict[str, Any]] = {}
+    for name, typ, source_path in output_specs:
+        item: dict[str, Any] = {
+            "name": name,
+            "type": typ,
+            "sourcePath": source_path,
+            "required": False,
+        }
+        run_item: dict[str, Any] = {
+            "type": typ,
+            "sourcePath": source_path,
+            "required": False,
+        }
+        if output_uri_prefix:
+            suffix = "eval_results" if typ == "DIRECTORY" else source_path.rsplit("/", 1)[-1]
+            target = f"{output_uri_prefix.rstrip('/')}/{run_id}/{suffix}"
+            item["targetPath"] = target
+            run_item["targetPath"] = target
+        job_def_outputs.append(item)
+        run_outputs[name] = run_item
+    ensure_nested(job, ["jobDefVersion"])["outputs"] = job_def_outputs
+    ensure_nested(job, ["jobRunParams"])["outputs"] = run_outputs
+
+
 def patch_job(
     template: dict[str, Any],
     *,
@@ -255,6 +390,7 @@ def patch_job(
     eval_reasoning_effort: str,
     provider_extra_body_json: str,
     provider_strip_max_tokens: str,
+    output_uri_prefix: str,
 ) -> dict[str, Any]:
     job = copy.deepcopy(template)
     caption = f"he-{bench}-{run_id}"[:96]
@@ -291,6 +427,7 @@ def patch_job(
         eval_reasoning_effort=eval_reasoning_effort,
         provider_extra_body_json=provider_extra_body_json,
         provider_strip_max_tokens=provider_strip_max_tokens,
+        output_uri_prefix=output_uri_prefix,
     )
     jd["entrypointFullScript"] = script
     run_params = ensure_nested(job, ["jobRunParams"])
@@ -298,6 +435,7 @@ def patch_job(
     if not preserve_template_env:
         run_params["envsList"] = {}
     patch_resource(job, BENCH_CONFIG[bench]["resource"])
+    patch_outputs(job, output_root=output_root, run_id=run_id, output_uri_prefix=output_uri_prefix)
     return job
 
 
@@ -322,6 +460,14 @@ def main() -> int:
     parser.add_argument("--eval-reasoning-effort", default="high")
     parser.add_argument("--provider-extra-body-json", default='{"reasoning_effort":"high","thinking":{"type":"enabled"}}')
     parser.add_argument("--provider-strip-max-tokens", default="1")
+    parser.add_argument(
+        "--output-uri-prefix",
+        default="",
+        help=(
+            "Optional persistent URI prefix, for example hdfs://.../harness_eval. "
+            "Even when omitted, job outputs still declare local source paths for platform collection."
+        ),
+    )
     args = parser.parse_args()
 
     template = read_template(args.template)
@@ -352,6 +498,7 @@ def main() -> int:
                 eval_reasoning_effort=args.eval_reasoning_effort,
                 provider_extra_body_json=args.provider_extra_body_json,
                 provider_strip_max_tokens=args.provider_strip_max_tokens,
+                output_uri_prefix=args.output_uri_prefix,
             )
             handle.write(json.dumps(job, ensure_ascii=False, separators=(",", ":")) + "\n")
     print(f"Wrote {len(benches)} jobs to {args.output}")
