@@ -345,30 +345,12 @@ def patch_resource(job: dict[str, Any], resource: dict[str, int]) -> None:
 
 
 def patch_outputs(job: dict[str, Any], *, output_root: str, run_id: str, output_uri_prefix: str = "") -> None:
-    run_output_dir = f"{output_root.rstrip('/')}/{run_id}"
-    output_specs = [
-        ("eval_results", "DIRECTORY", run_output_dir),
-        ("summary_csv", "FILE", f"{run_output_dir}/summary.csv"),
-        ("summary_jsonl", "FILE", f"{run_output_dir}/summary.jsonl"),
-        ("cluster_artifacts", "FILE", f"{run_output_dir}/cluster_artifacts.tgz"),
-    ]
-    job_def_outputs: list[dict[str, Any]] = []
-    for name, typ, source_path in output_specs:
-        item: dict[str, Any] = {
-            "name": name,
-            "type": typ,
-            "sourcePath": source_path,
-            "required": False,
-        }
-        if output_uri_prefix:
-            suffix = "eval_results" if typ == "DIRECTORY" else source_path.rsplit("/", 1)[-1]
-            target = f"{output_uri_prefix.rstrip('/')}/{run_id}/{suffix}"
-            item["targetPath"] = target
-        job_def_outputs.append(item)
-    ensure_nested(job, ["jobDefVersion"])["outputs"] = job_def_outputs
-    # jobRunParams.outputs uses Seed's JobProduct schema, not sourcePath/targetPath
-    # filesystem artifacts. Keep it empty and rely on jobDefVersion.outputs plus
-    # the entrypoint-created cluster_artifacts.tgz.
+    _ = (output_root, run_id, output_uri_prefix)
+    # Seed's jobDefVersion.outputs and jobRunParams.outputs are UI/product
+    # schemas, not filesystem artifact schemas; they reject sourcePath/targetPath.
+    # Cluster artifacts are persisted by the entrypoint itself via optional HDFS
+    # upload, so keep both platform output fields empty.
+    ensure_nested(job, ["jobDefVersion"])["outputs"] = []
     ensure_nested(job, ["jobRunParams"])["outputs"] = {}
 
 
