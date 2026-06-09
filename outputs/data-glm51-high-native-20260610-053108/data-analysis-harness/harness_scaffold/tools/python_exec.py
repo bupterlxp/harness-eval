@@ -138,7 +138,12 @@ class PythonExecTool(AtomicTool):
             with open(fd, "w", encoding="utf-8") as fh:
                 fh.write(code)
 
-            cmd = [sys.executable, "-I", str(tmp_path)]
+            # Do not use ``-I`` here. Cluster BMK jobs install lightweight
+            # runtime dependencies (for example pandas / sklearn for MLE) into
+            # the active interpreter environment, often via ``pip --user``.
+            # Isolated mode hides those packages and makes otherwise valid
+            # generated data harnesses fall back to constant submissions.
+            cmd = [sys.executable, str(tmp_path)]
             if argv:
                 cmd.extend(argv)
 

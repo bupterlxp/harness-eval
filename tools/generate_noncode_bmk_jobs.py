@@ -115,6 +115,10 @@ def render_entrypoint(
         bench_setup = """
 "$PYTHON_BIN" -m pip install --user trueskill
 """
+    if bench == "mle_bench":
+        bench_setup = """
+"$PYTHON_BIN" -m pip install --user pandas numpy scipy scikit-learn pillow joblib
+"""
     matrix_setup = """
 export MATRIX_PATH=eval_matrix.yaml
 """

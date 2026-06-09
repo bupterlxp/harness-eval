@@ -18,6 +18,7 @@ const PROVIDER_STRIP_CACHE_CONTROL = process.env.PROVIDER_STRIP_CACHE_CONTROL ==
 const PROVIDER_FIX_CACHE_CONTROL = process.env.PROVIDER_FIX_CACHE_CONTROL === '1' || process.env.PROVIDER_FIX_CACHE_CONTROL === 'true';
 const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
+const IS_EXACT_PROVIDER_ENDPOINT = String(UPSTREAM_BASE_URL || '').toLowerCase().includes('/v2/crawl');
 
 // Rough estimate: 1 token ≈ 4 chars for English, ≈ 2 chars for Chinese
 const CHARS_PER_TOKEN = 3.5;
@@ -461,12 +462,13 @@ function shapeProviderRequest(bodyText) {
 
   normalizeProviderTools(payload);
 
-  // Claude Opus 4.7 uses adaptive thinking. OpenRouter recommends opting in
-  // with reasoning.enabled and controlling the overall effort with verbosity.
-  if (OPENROUTER_REASONING_ENABLED) {
+  // Claude/OpenRouter-style endpoints use reasoning.enabled and verbosity.
+  // Exact ModelHub crawl endpoints reject these OpenRouter-only fields; keep
+  // them governed by PROVIDER_EXTRA_BODY_JSON instead.
+  if (OPENROUTER_REASONING_ENABLED && !IS_EXACT_PROVIDER_ENDPOINT) {
     payload.reasoning = { ...(payload.reasoning || {}), enabled: true };
   }
-  if (OPENROUTER_VERBOSITY) {
+  if (OPENROUTER_VERBOSITY && !IS_EXACT_PROVIDER_ENDPOINT) {
     payload.verbosity = OPENROUTER_VERBOSITY;
   }
 
@@ -537,8 +539,16 @@ const providerProxy = http.createServer((req, res) => {
     const transport = options.protocol === 'https:' ? require('https') : http;
 
     const upstreamReq = transport.request(options, (upstreamRes) => {
-      res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-      upstreamRes.pipe(res, { end: true });
+      const chunks = [];
+      upstreamRes.on('data', (chunk) => chunks.push(chunk));
+      upstreamRes.on('end', () => {
+        const rawBody = Buffer.concat(chunks);
+        if ((upstreamRes.statusCode || 0) >= 400) {
+          console.error(`[provider_proxy] upstream ${upstreamRes.statusCode}: ${rawBody.toString('utf-8').slice(0, 1000)}`);
+        }
+        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
+        res.end(rawBody);
+      });
     });
 
     upstreamReq.on('error', (err) => {
