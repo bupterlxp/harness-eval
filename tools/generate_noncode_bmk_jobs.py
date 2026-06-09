@@ -6,6 +6,7 @@ import copy
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -516,7 +517,7 @@ from mlebench.registry import registry
 print(json.dumps(registry.list_competition_ids()))
 """
     out = subprocess.check_output(
-        ["python3", "-c", code],
+        [sys.executable, "-c", code],
         cwd=mle_root,
         text=True,
         stderr=subprocess.STDOUT,
