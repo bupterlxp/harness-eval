@@ -182,7 +182,6 @@ python tools/run_platform_bmk_shard.py \
   --instance-json <written by entrypoint> \
   --harness-path <generated harness artifact> \
   --domain code \
-  --adapter-mode strict \
   --eval-model-name glm-5.1 \
   --eval-reasoning-effort high
 ```
@@ -190,7 +189,7 @@ python tools/run_platform_bmk_shard.py \
 The runner:
 
 1. starts the local eval provider proxy for GLM/other crawl-style endpoints;
-2. calls the generated harness in strict adapter mode;
+2. calls the generated harness through `python -m harness run`;
 3. lets the harness edit the current task repo;
 4. writes `prediction.patch` from `git diff --binary`;
 5. runs `verify_cmd` if provided;

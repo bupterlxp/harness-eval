@@ -16,7 +16,7 @@ FIELDS = [
     "repo_family",
     "harness_path",
     "task_work_dir",
-    "adapter_mode",
+    "harness_invocation",
     "harness_status",
     "eval_status",
     "score",

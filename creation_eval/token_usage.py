@@ -14,12 +14,12 @@ USAGE_KEYS = ("usage", "token_usage", "llm_usage")
 JSON_FILENAMES = {
     "metadata.json",
     "result.json",
-    "adapter_result.json",
+    "harness_result.json",
     "metrics.json",
     "artifacts.json",
 }
 JSONL_FILENAMES = {"trajectory.jsonl", "events.jsonl"}
-TEXT_FILENAMES = {"stdout.log", "stderr.log", "adapter_stdout.log", "adapter_stderr.log"}
+TEXT_FILENAMES = {"stdout.log", "stderr.log", "harness_stdout.log", "harness_stderr.log"}
 
 
 def _safe_read_json(path: Path) -> Any:
@@ -178,7 +178,7 @@ def _candidate_roots(paths: Iterable[str | Path | None]) -> list[Path]:
 
 def _usage_from_json_files(roots: list[Path]) -> dict[str, Any]:
     # Prefer scaffold/runtime metadata because it already aggregates LLM calls.
-    for name in ("metadata.json", "metrics.json", "result.json", "adapter_result.json"):
+    for name in ("metadata.json", "metrics.json", "result.json", "harness_result.json"):
         for root in roots:
             for path in _iter_named_files(root, {name}):
                 data = _safe_read_json(path)
@@ -242,7 +242,7 @@ def _usage_from_text_files(roots: list[Path]) -> dict[str, Any]:
 
 
 def extract_harness_token_usage(*paths: str | Path | None) -> dict[str, Any]:
-    """Extract eval-time generated harness token usage from adapter artifacts.
+    """Extract eval-time generated harness token usage from harness CLI artifacts.
 
     This intentionally targets the generated/evolved harness execution logs,
     not downstream judge calls. Callers should record judge-token usage in

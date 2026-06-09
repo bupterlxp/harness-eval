@@ -44,7 +44,7 @@ class PublicContractValidatorTests(unittest.TestCase):
             out = root / "out"
             work.mkdir()
             out.mkdir()
-            write(out / "response.md", "status metadata trajectory stdout stderr tool_call adapter_status " * 12)
+            write(out / "response.md", "status metadata trajectory stdout stderr tool_call cli_status " * 12)
             result = validate_domain_artifacts("writing", work, out)
             self.assertFalse(result.passed)
 

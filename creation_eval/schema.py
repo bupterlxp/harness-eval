@@ -27,8 +27,8 @@ SUMMARY_FIELDS = [
     "syntax_ok",
     "import_ok",
     "cli_probe_ok",
-    "adapter_status",
-    "adapter_mode",
+    "cli_status",
+    "harness_invocation",
     "pre_bmk_gate_mode",
     "gate_pass",
     "gate_failure_reason",
@@ -67,7 +67,7 @@ class ValidationResult:
     syntax_ok: bool = False
     import_ok: bool = False
     cli_probe_ok: bool = False
-    adapter_status: str = "not_checked"
+    cli_status: str = "not_checked"
     generation_tokens: int | None = None
     creation_attempts: int | None = None
     repair_rounds: int | None = None
@@ -101,7 +101,7 @@ class ValidationResult:
             self.syntax_ok
             and self.import_ok
             and self.cli_probe_ok
-            and self.adapter_status == "ready"
+            and self.cli_status == "ready"
         )
 
 

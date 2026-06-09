@@ -101,16 +101,11 @@ DIRECT_TOKEN_KEYS = {
 }
 
 CREATION_PROFILE_CHOICES = [
-    "freeform",
-    "interface",
-    "interface_tool",
-    "interface-tool",
-    "full_loop",
-    "full-loop",
-    "claude_code_scaffold",
-    "claude-code-scaffold",
     "claude_code_scaffold_native",
     "claude-code-scaffold-native",
+    "claude_code_native",
+    "cc_native",
+    "native",
 ]
 
 GOAL_PRESETS = {
@@ -358,13 +353,13 @@ def detect_artifact_contract(artifact_dir: Path, creation_profile: str | None = 
 def artifact_contract_prompt(contract: dict[str, Any]) -> str:
     if contract.get("kind") in {"scaffold_native", "scaffold_program"}:
         return """- Preserve the scaffold-native artifact contract. Keep `generated_program.py` or the manifest-declared program, `scaffold_manifest.json`, and the available `harness_scaffold/` runtime usable.
-- You may improve the generated program and add supporting modules, but do not delete or bypass the scaffold runtime contract unless you also leave a compatible adapter path.
-- The downstream adapter may run the scaffold CLI/program contract instead of `python -m harness`; keep result/trajectory/log artifacts valid."""
+- You may improve the generated program and add supporting modules, but keep the public `python -m harness run --task-json ... --model-config ... --output-dir ...` CLI usable.
+- Downstream eval calls that public CLI directly; keep result/trajectory/log artifacts valid."""
     if contract.get("kind") == "legacy_harness":
         return """- Preserve the legacy generated harness contract under `harness/`.
-- Keep `python -m harness` or `python -m harness.cli` runnable with prompt/task input, workdir/workspace, output-dir, and max-steps/max-turns style arguments."""
-    return """- Preserve the current generated harness artifact structure and keep it discoverable by downstream eval adapters.
-- If you use scaffold-native files, keep `generated_program.py`, `scaffold_manifest.json`, and `harness_scaffold/` usable; if you use a legacy harness, keep `harness/` and `python -m harness` usable."""
+- Keep `python -m harness run --task-json ... --model-config ... --output-dir ...` runnable."""
+    return """- Preserve the current generated harness artifact structure and keep it runnable through the public harness CLI.
+- If you use scaffold-native files, keep `generated_program.py`, `scaffold_manifest.json`, and `harness_scaffold/` usable; always keep `python -m harness run --task-json ... --model-config ... --output-dir ...` usable."""
 
 
 def resolve_goal(args: argparse.Namespace, domain: str) -> str:
@@ -520,7 +515,9 @@ def apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> dic
             config[key] = value
     if args.codex_enable_search:
         config["codex_enable_search"] = True
-    config["creation_profile"] = normalize_creation_profile(str(args.creation_profile or config.get("creation_profile") or "interface_tool"))
+    config["creation_profile"] = normalize_creation_profile(
+        str(args.creation_profile or config.get("creation_profile") or "claude_code_scaffold_native")
+    )
     config["pre_bmk_gate"] = str(config.get("pre_bmk_gate") or "soft")
     config["run_id"] = args.run_id
     return config

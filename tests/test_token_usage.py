@@ -13,14 +13,14 @@ def write(path: Path, text: str) -> None:
 
 
 class TokenUsageExtractionTests(unittest.TestCase):
-    def test_extracts_scaffold_metadata_usage_from_adapter_result(self) -> None:
+    def test_extracts_scaffold_metadata_usage_from_harness_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifacts = root / "artifacts"
-            write(root / "adapter_result.json", f'{{"artifacts_dir": "{artifacts}"}}')
+            write(root / "harness_result.json", f'{{"artifacts_dir": "{artifacts}"}}')
             write(artifacts / "metadata.json", '{"usage": {"input_tokens": 10, "output_tokens": 5}}')
 
-            usage = extract_harness_token_usage(root / "adapter_result.json")
+            usage = extract_harness_token_usage(root / "harness_result.json")
 
             self.assertEqual(usage["total_tokens"], 15)
             self.assertEqual(usage["input_tokens"], 10)

@@ -300,8 +300,6 @@ def eval_command(args: argparse.Namespace, spec: ModelSpec, generation_output: P
         spec.effort,
         "--eval-provider-proxy-port",
         str(port),
-        "--adapter-mode",
-        args.adapter_mode,
         "--run-id",
         run_id,
     ]
@@ -333,7 +331,6 @@ def main() -> int:
     parser.add_argument("--generation-timeout-minutes", type=int, default=0)
     parser.add_argument("--eval-timeout-seconds", type=int, default=7200)
     parser.add_argument("--eval-provider-proxy-port-base", type=int, default=3658)
-    parser.add_argument("--adapter-mode", default="strict", choices=["strict", "permissive"])
     parser.add_argument("--output-root", type=Path, default=Path("outputs/full_experiment"))
     parser.add_argument("--eval-output-root", type=Path, default=Path("eval_results/full_experiment"))
     parser.add_argument("--run-root", type=Path, default=Path("eval_results/full_experiment_runs"))

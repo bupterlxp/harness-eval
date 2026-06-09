@@ -215,7 +215,6 @@ fi
   --domain code \\
   --output-dir {shlex_quote(output_root)}/{shlex_quote(run_id)}/{shlex_quote(instance_id)} \\
   --python-bin "$PYTHON_BIN" \\
-  --adapter-mode strict \\
   --timeout-seconds "${{BMK_TIMEOUT_SECONDS:-604800}}" \\
   --eval-base-url "$EVAL_BASE_URL" \\
   --eval-api-key "$EVAL_API_KEY" \\

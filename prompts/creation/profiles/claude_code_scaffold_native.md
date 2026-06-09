@@ -138,7 +138,7 @@ Every run must write:
   contain concrete values, tables, or structured decisions, not only workflow
   templates.
 - Writing: the final writing artifact must be user-readable prose, not JSON,
-  adapter logs, or execution summaries. Include plan/draft/critique/revision or
+  CLI logs, or execution summaries. Include plan/draft/critique/revision or
   an equivalent process.
 - Research: record search, reading, evidence, or citation traces. Answers must
   be source-traceable.

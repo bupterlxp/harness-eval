@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .adapter import run_generated_harness
+from .agent_cli import read_harness_response as read_agent_cli_response, run_agent_cli
 from .schema import HarnessArtifact, HarnessRunResult, ValidationResult
 from .token_usage import (
     extract_harness_token_usage,
@@ -343,9 +343,7 @@ def _common_generated_env(
     env = os.environ.copy()
     env["GENERATED_HARNESS_PATH"] = str(artifact.path)
     env["GENERATED_HARNESS_DOMAIN"] = artifact.domain
-    env["GENERATED_HARNESS_ADAPTER"] = str(harness_eval_root / "generated_harness_adapter.py")
     env["GENERATED_HARNESS_TIMEOUT"] = str(timeout)
-    env["HARNESS_EVAL_ADAPTER_MODE"] = os.environ.get("HARNESS_EVAL_ADAPTER_MODE", "strict")
     env["PYTHONPATH"] = str(harness_eval_root) + os.pathsep + env.get("PYTHONPATH", "")
     for name in ["OPENAI_BASE_URL", "BASE_URL", "OPENAI_API_KEY", "API_KEY"]:
         container_value = os.environ.get(f"CONTAINER_{name}")
@@ -358,14 +356,8 @@ def _container_env_value(name: str) -> str | None:
     return os.environ.get(f"CONTAINER_{name}") or os.environ.get(name)
 
 
-def _read_adapter_response(result: HarnessRunResult) -> str:
-    raw = read_json(Path(result.raw_result_path)) if result.raw_result_path else {}
-    selected_file = raw.get("selected_file")
-    if selected_file and Path(str(selected_file)).exists():
-        return Path(str(selected_file)).read_text(encoding="utf-8", errors="replace")
-    if result.stdout_path and Path(result.stdout_path).exists():
-        return Path(result.stdout_path).read_text(encoding="utf-8", errors="replace")
-    return ""
+def _read_harness_response(result: HarnessRunResult) -> str:
+    return read_agent_cli_response(result)
 
 
 def _http_head_ok(url: str, timeout: float = 5.0) -> tuple[bool, str]:
@@ -749,15 +741,11 @@ def run_terminalbench_generated(
         "--ak",
         f"harness_path={artifact.path}",
         "--ak",
-        f"adapter_path={harness_eval_root / 'generated_harness_adapter.py'}",
-        "--ak",
         f"domain={artifact.domain}",
         "--ak",
         f"task_work_dir={entry.get('task_work_dir', '/workspace')}",
         "--ak",
         f"timeout_sec={max(60, timeout - 60)}",
-        "--ak",
-        f"adapter_mode={os.environ.get('HARNESS_EVAL_ADAPTER_MODE', 'strict')}",
     ]
     n_limit = _limit_value(entry.get("n_limit"), default=1)
     if n_limit is not None:
@@ -772,7 +760,6 @@ def run_terminalbench_generated(
         "SEED2LITE_API_KEY",
         "SEED2LITE_BASE_URL",
         "SEED2LITE_MODEL_ID",
-        "HARNESS_EVAL_ADAPTER_MODE",
     ]:
         value = _container_env_value(env_name)
         if value:
@@ -868,10 +855,10 @@ def run_eqbench3(
         {
             "RUN_ID": run_id,
             "THREADS": str(entry.get("threads", 1)),
-            "KIMI_WRITER_PATH": str(harness_eval_root / "generated_harness_adapter.py"),
+            "KIMI_WRITER_PATH": str(harness_eval_root / "generated_harness_cli.py"),
             "GENERATED_HARNESS_PATH": str(artifact.path),
             "GENERATED_HARNESS_DOMAIN": artifact.domain,
-            "GENERATED_HARNESS_ADAPTER_OUTPUT_DIR": str(output_dir / "adapter_outputs"),
+            "GENERATED_HARNESS_OUTPUT_DIR": str(output_dir / "harness_outputs"),
             "GENERATED_HARNESS_TIMEOUT": str(min(timeout, int(entry.get("harness_timeout", timeout)))),
             "HARNESS_EVAL_PYTHON": python_bin,
         }
@@ -1033,7 +1020,7 @@ def run_dacomp_generated(
     env["PYTHONPATH"] = str(eval_root) + os.pathsep + env.get("PYTHONPATH", "")
     judge_model = str(entry.get("judge_model") or env.get("DACOMP_JUDGE_MODEL_CONFIG") or "ep-20260214145701-frz7j")
 
-    adapter_results: list[HarnessRunResult] = []
+    harness_results: list[HarnessRunResult] = []
     for task in tasks:
         instance_id = str(task["instance_id"])
         task_workspace = output_dir / "task_workspaces" / instance_id
@@ -1051,27 +1038,27 @@ def run_dacomp_generated(
             f"Task data directory: {task_workspace}\n{table_summary}\n\n"
             "Produce a complete English markdown report with quantitative analysis, conclusions, and any referenced chart files."
         )
-        adapter_result = run_generated_harness(
+        harness_result = run_agent_cli(
             artifact.path,
             "data_analysis",
             prompt,
-            output_dir / "adapter_outputs" / instance_id,
+            output_dir / "harness_outputs" / instance_id,
             task_work_dir=task_workspace,
             python_bin=python_bin,
             timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
         )
-        adapter_results.append(adapter_result)
-        response = _read_adapter_response(adapter_result)
+        harness_results.append(harness_result)
+        response = _read_harness_response(harness_result)
         instance_dir = model_dir / instance_id
         instance_dir.mkdir(parents=True, exist_ok=True)
         (instance_dir / f"{instance_id}.md").write_text(response, encoding="utf-8")
         (instance_dir / f"{instance_id}-traj.txt").write_text(
             json.dumps(
                 {
-                    "adapter_status": adapter_result.status,
-                    "raw_result_path": adapter_result.raw_result_path,
-                    "stdout_path": adapter_result.stdout_path,
-                    "stderr_path": adapter_result.stderr_path,
+                    "cli_status": harness_result.status,
+                    "raw_result_path": harness_result.raw_result_path,
+                    "stdout_path": harness_result.stdout_path,
+                    "stderr_path": harness_result.stderr_path,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1109,7 +1096,7 @@ def run_dacomp_generated(
         if path.name != "overall_results.csv"
     ]
     if judge.returncode != 0 and not score_csvs:
-        stdout_path.write_text("\n\n=== adapter ===\n" + "\n".join(r.stdout_path for r in adapter_results) + "\n\n=== judge ===\n" + judge.stdout, encoding="utf-8")
+        stdout_path.write_text("\n\n=== harness ===\n" + "\n".join(r.stdout_path for r in harness_results) + "\n\n=== judge ===\n" + judge.stdout, encoding="utf-8")
         stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr, encoding="utf-8")
         return HarnessRunResult(
             status="failed/timeout" if judge.returncode == 124 else "failed",
@@ -1124,7 +1111,7 @@ def run_dacomp_generated(
         env=env,
         timeout=600,
     )
-    stdout_path.write_text("\n\n=== adapter ===\n" + "\n".join(r.stdout_path for r in adapter_results) + "\n\n=== judge ===\n" + judge.stdout + "\n\n=== score ===\n" + score.stdout, encoding="utf-8")
+    stdout_path.write_text("\n\n=== harness ===\n" + "\n".join(r.stdout_path for r in harness_results) + "\n\n=== judge ===\n" + judge.stdout + "\n\n=== score ===\n" + score.stdout, encoding="utf-8")
     stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr + "\n\n=== score ===\n" + score.stderr, encoding="utf-8")
     if score.returncode != 0:
         return HarnessRunResult(
@@ -1139,7 +1126,7 @@ def run_dacomp_generated(
     rows = list(csv.DictReader(overall.open("r", encoding="utf-8"))) if overall.exists() else []
     total = None
     breakdown: dict[str, Any] = {"tasks": [task["instance_id"] for task in tasks], "metric": "DAComp weighted total"}
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
     if rows:
         row = rows[0]
         breakdown.update(row)
@@ -1156,7 +1143,7 @@ def run_dacomp_generated(
         score_breakdown=breakdown,
         harness_run_tokens=harness_tokens,
         token_breakdown=token_breakdown,
-        interactions=len(adapter_results),
+        interactions=len(harness_results),
     )
 
 
@@ -1186,22 +1173,22 @@ def run_writingbench_generated(
     if not selected:
         selected = _limit_sequence(all_rows, entry.get("n_limit"), default=1)
     criteria_limit = _limit_value(entry.get("criteria_limit"), default=5)
-    adapter_results: list[HarnessRunResult] = []
+    harness_results: list[HarnessRunResult] = []
     response_rows: list[dict[str, Any]] = []
     score_rows: list[dict[str, Any]] = []
     total_judge_tokens = 0
     for row in selected:
-        result = run_generated_harness(
+        result = run_agent_cli(
             artifact.path,
             "writing",
             str(row["query"]),
-            output_dir / "adapter_outputs" / f"index_{row['index']}",
+            output_dir / "harness_outputs" / f"index_{row['index']}",
             python_bin=python_bin,
             timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
         )
-        adapter_results.append(result)
-        response = _read_adapter_response(result)
-        response_rows.append({"index": row["index"], "response": response, "adapter_status": result.status})
+        harness_results.append(result)
+        response = _read_harness_response(result)
+        response_rows.append({"index": row["index"], "response": response, "cli_status": result.status})
         criteria_scores: dict[str, list[dict[str, Any]]] = {}
         checklist = row.get("checklist", [])
         if criteria_limit is not None:
@@ -1230,8 +1217,8 @@ Response:
         score_rows.append({"index": row["index"], "scores": criteria_scores})
     write_jsonl(responses_path, response_rows)
     write_jsonl(scores_path, score_rows)
-    stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
-    stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
+    stdout_path.write_text("\n".join(r.stdout_path for r in harness_results), encoding="utf-8")
+    stderr_path.write_text("\n".join(r.stderr_path for r in harness_results), encoding="utf-8")
     numeric_scores: list[float] = []
     for score_row in score_rows:
         for entries in score_row["scores"].values():
@@ -1241,7 +1228,7 @@ Response:
                 except (TypeError, ValueError):
                     continue
     score = statistics.mean(numeric_scores) * 10 if numeric_scores else None
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
     return HarnessRunResult(
         status="success" if score is not None else "failed",
         score=score,
@@ -1257,7 +1244,7 @@ Response:
             "criterion_scores": len(numeric_scores),
             "judge_tokens": total_judge_tokens or None,
         },
-        interactions=len(adapter_results),
+        interactions=len(harness_results),
     )
 
 
@@ -1290,49 +1277,49 @@ def run_deepresearch_generated(
     rows = _limit_sequence(rows, entry.get("n_limit"), default=1)
     predictions: list[dict[str, Any]] = []
     details: list[dict[str, Any]] = []
-    adapter_results: list[HarnessRunResult] = []
-    adapter_failures = 0
+    harness_results: list[HarnessRunResult] = []
+    harness_failures = 0
     correct_count = 0
     total_judge_tokens = 0
     for idx, row in enumerate(rows):
-        result = run_generated_harness(
+        result = run_agent_cli(
             artifact.path,
             "research",
             str(row["question"]),
-            output_dir / "adapter_outputs" / f"item_{idx}",
+            output_dir / "harness_outputs" / f"item_{idx}",
             python_bin=python_bin,
             timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
         )
-        adapter_results.append(result)
-        response = _read_adapter_response(result)
+        harness_results.append(result)
+        response = _read_harness_response(result)
         if result.status != "success" or not response.strip():
-            adapter_failures += 1
-            predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "adapter_status": result.status})
+            harness_failures += 1
+            predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "cli_status": result.status})
             details.append(
                 {
                     "question": row["question"],
                     "answer": row.get("answer", ""),
                     "prediction": response,
                     "correct": False,
-                    "adapter_status": result.status,
-                    "adapter_error": result.error,
+                    "cli_status": result.status,
+                    "harness_error": result.error,
                 }
             )
             continue
         correct, detail = _judge_short_answer(str(row["question"]), str(row.get("answer", "")), response, prefix="DEEPRESEARCH_JUDGE")
         total_judge_tokens += int((detail.get("usage") or {}).get("total_tokens") or 0)
         correct_count += int(correct)
-        predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "adapter_status": result.status})
+        predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "cli_status": result.status})
         details.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "correct": correct, **detail})
     write_jsonl(pred_path, predictions)
     write_jsonl(details_path, details)
-    evaluated_count = len(rows) - adapter_failures
-    accuracy = correct_count / len(rows) if rows and adapter_failures == 0 else None
-    write_json(report_path, {"accuracy": accuracy, "count": len(rows), "evaluated_count": evaluated_count, "adapter_failures": adapter_failures, "details_path": str(details_path)})
-    stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
-    stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
-    status = "success" if accuracy is not None else ("adapter_failed" if adapter_failures else "failed")
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
+    evaluated_count = len(rows) - harness_failures
+    accuracy = correct_count / len(rows) if rows and harness_failures == 0 else None
+    write_json(report_path, {"accuracy": accuracy, "count": len(rows), "evaluated_count": evaluated_count, "harness_failures": harness_failures, "details_path": str(details_path)})
+    stdout_path.write_text("\n".join(r.stdout_path for r in harness_results), encoding="utf-8")
+    stderr_path.write_text("\n".join(r.stderr_path for r in harness_results), encoding="utf-8")
+    status = "success" if accuracy is not None else ("harness_failed" if harness_failures else "failed")
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
     return HarnessRunResult(
         status=status,
         score=accuracy,
@@ -1345,10 +1332,10 @@ def run_deepresearch_generated(
         score_breakdown={
             "metric": "HLE-style short-answer judge accuracy",
             "items": len(rows),
-            "adapter_failures": adapter_failures,
+            "harness_failures": harness_failures,
             "judge_tokens": total_judge_tokens or None,
         },
-        interactions=len(adapter_results),
+        interactions=len(harness_results),
     )
 
 
@@ -1403,7 +1390,7 @@ def run_browsecomp_generated(
                 "status": "skipped/missing_dependency",
                 "accuracy": None,
                 "count": 0,
-                "adapter_failures": 0,
+                "harness_failures": 0,
                 "csv_url": csv_url,
                 "local_cache_paths": [str(path) for path in local_paths],
                 "missing_dependencies": missing,
@@ -1425,8 +1412,8 @@ def run_browsecomp_generated(
     predictions: list[dict[str, Any]] = []
     correct_count = 0
     total_judge_tokens = 0
-    adapter_results: list[HarnessRunResult] = []
-    adapter_failures = 0
+    harness_results: list[HarnessRunResult] = []
+    harness_failures = 0
     for idx, row in df.iterrows():
         question = _decrypt_xor(str(row["problem"]), str(row["canary"]))
         answer = _decrypt_xor(str(row["answer"]), str(row["canary"]))
@@ -1437,26 +1424,26 @@ def run_browsecomp_generated(
             "Exact Answer: your succinct final answer\n"
             "Confidence: confidence between 0% and 100%"
         )
-        result = run_generated_harness(
+        result = run_agent_cli(
             artifact.path,
             "research",
             prompt,
-            output_dir / "adapter_outputs" / f"item_{idx}",
+            output_dir / "harness_outputs" / f"item_{idx}",
             python_bin=python_bin,
             timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
         )
-        adapter_results.append(result)
-        response = _read_adapter_response(result)
+        harness_results.append(result)
+        response = _read_harness_response(result)
         if result.status != "success" or not response.strip():
-            adapter_failures += 1
+            harness_failures += 1
             predictions.append(
                 {
                     "question": question,
                     "answer": answer,
                     "prediction": response,
                     "correct": False,
-                    "adapter_status": result.status,
-                    "adapter_error": result.error,
+                    "cli_status": result.status,
+                    "harness_error": result.error,
                 }
             )
             continue
@@ -1465,21 +1452,21 @@ def run_browsecomp_generated(
         correct_count += int(correct)
         predictions.append({"question": question, "answer": answer, "prediction": response, "correct": correct, "judge": detail.get("judge")})
     write_jsonl(responses_path, predictions)
-    accuracy = correct_count / len(predictions) if predictions and adapter_failures == 0 else None
+    accuracy = correct_count / len(predictions) if predictions and harness_failures == 0 else None
     write_json(
         report_path,
         {
             "accuracy": accuracy,
             "count": len(predictions),
-            "adapter_failures": adapter_failures,
+            "harness_failures": harness_failures,
             "predictions_path": str(responses_path),
             "source": source_description,
         },
     )
-    stdout_path.write_text("\n".join(r.stdout_path for r in adapter_results), encoding="utf-8")
-    stderr_path.write_text("\n".join(r.stderr_path for r in adapter_results), encoding="utf-8")
-    status = "success" if accuracy is not None else ("adapter_failed" if adapter_failures else "failed")
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(adapter_results)
+    stdout_path.write_text("\n".join(r.stdout_path for r in harness_results), encoding="utf-8")
+    stderr_path.write_text("\n".join(r.stderr_path for r in harness_results), encoding="utf-8")
+    status = "success" if accuracy is not None else ("harness_failed" if harness_failures else "failed")
+    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
     return HarnessRunResult(
         status=status,
         score=accuracy,
@@ -1492,10 +1479,10 @@ def run_browsecomp_generated(
         score_breakdown={
             "metric": "BrowseComp accuracy with encrypted official answer set",
             "items": len(predictions),
-            "adapter_failures": adapter_failures,
+            "harness_failures": harness_failures,
             "judge_tokens": total_judge_tokens or None,
         },
-        interactions=len(adapter_results),
+        interactions=len(harness_results),
     )
 
 
@@ -1644,18 +1631,18 @@ print(json.dumps({{
         f"Write a valid submission CSV into this output directory: {task_workspace}\n"
         "Use the same columns and row ids as the sample submission."
     )
-    result = run_generated_harness(
+    result = run_agent_cli(
         artifact.path,
         "data_analysis",
         prompt,
-        output_dir / "adapter_output",
+        output_dir / "harness_output",
         task_work_dir=Path(info["public_dir"]),
         python_bin=python_bin,
         timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
     )
     artifacts = read_json(Path(result.raw_result_path)).get("artifacts_dir") if result.raw_result_path else None
     csv_candidates = []
-    for root in [Path(str(artifacts)) if artifacts else None, output_dir / "adapter_output"]:
+    for root in [Path(str(artifacts)) if artifacts else None, output_dir / "harness_output"]:
         if root and root.exists():
             csv_candidates.extend(path for path in root.rglob("*.csv") if path.is_file())
     if not csv_candidates:
@@ -1665,8 +1652,8 @@ print(json.dumps({{
             "submission_exists": False,
             "valid_submission": False,
             "failure_mode": "no_submission",
-            "adapter_status": result.status,
-            "adapter_error": result.error,
+            "cli_status": result.status,
+            "harness_error": result.error,
             "metric_source": "no_submission_zero_score",
         }
         write_json(report_path, report)
@@ -1967,23 +1954,23 @@ def run_the_agent_company_generated(
         "Original task:\n"
         f"{task_text.strip()}\n"
     )
-    adapter_result = run_generated_harness(
+    harness_result = run_agent_cli(
         artifact.path,
         "browser",
         browser_prompt,
-        output_dir / "adapter_outputs" / "the_agent_company",
+        output_dir / "harness_outputs" / "the_agent_company",
         task_work_dir=workspace_dir,
         python_bin=python_bin,
         timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
     )
     trajectory_path = output_dir / "generated_trajectory.txt"
     trajectory_bits = {
-        "adapter_status": adapter_result.status,
-        "adapter_error": adapter_result.error,
-        "raw_result_path": adapter_result.raw_result_path,
-        "stdout_path": adapter_result.stdout_path,
-        "stderr_path": adapter_result.stderr_path,
-        "response": _read_adapter_response(adapter_result),
+        "cli_status": harness_result.status,
+        "harness_error": harness_result.error,
+        "raw_result_path": harness_result.raw_result_path,
+        "stdout_path": harness_result.stdout_path,
+        "stderr_path": harness_result.stderr_path,
+        "response": _read_harness_response(harness_result),
     }
     trajectory_path.write_text(json.dumps(trajectory_bits, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -1999,8 +1986,8 @@ def run_the_agent_company_generated(
         task.stdout
         + "\n\n=== init ===\n"
         + init.stdout
-        + "\n\n=== adapter ===\n"
-        + (Path(adapter_result.stdout_path).read_text(encoding="utf-8", errors="replace") if adapter_result.stdout_path and Path(adapter_result.stdout_path).exists() else "")
+        + "\n\n=== harness ===\n"
+        + (Path(harness_result.stdout_path).read_text(encoding="utf-8", errors="replace") if harness_result.stdout_path and Path(harness_result.stdout_path).exists() else "")
         + "\n\n=== evaluator ===\n"
         + evaluate.stdout,
         encoding="utf-8",
@@ -2009,8 +1996,8 @@ def run_the_agent_company_generated(
         task.stderr
         + "\n\n=== init ===\n"
         + init.stderr
-        + "\n\n=== adapter ===\n"
-        + (Path(adapter_result.stderr_path).read_text(encoding="utf-8", errors="replace") if adapter_result.stderr_path and Path(adapter_result.stderr_path).exists() else "")
+        + "\n\n=== harness ===\n"
+        + (Path(harness_result.stderr_path).read_text(encoding="utf-8", errors="replace") if harness_result.stderr_path and Path(harness_result.stderr_path).exists() else "")
         + "\n\n=== evaluator ===\n"
         + evaluate.stderr,
         encoding="utf-8",
@@ -2022,9 +2009,9 @@ def run_the_agent_company_generated(
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             error=evaluate.stderr[-2000:] or evaluate.stdout[-2000:],
-            score_breakdown={"stage": "evaluator", "task_image": task_image, "adapter_status": adapter_result.status},
-            harness_run_tokens=adapter_result.harness_run_tokens,
-            token_breakdown=_result_token_usage(adapter_result),
+            score_breakdown={"stage": "evaluator", "task_image": task_image, "cli_status": harness_result.status},
+            harness_run_tokens=harness_result.harness_run_tokens,
+            token_breakdown=_result_token_usage(harness_result),
             interactions=1,
         )
     result = read_json(eval_result_path) if eval_result_path.exists() else {}
@@ -2040,7 +2027,7 @@ def run_the_agent_company_generated(
         {
             "task_image": task_image,
             "dependencies": deps_text.strip(),
-            "adapter_status": adapter_result.status,
+            "cli_status": harness_result.status,
             "score": score,
             "raw_eval": result,
         },
@@ -2053,8 +2040,8 @@ def run_the_agent_company_generated(
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
         score_breakdown={"metric": "TheAgentCompany final_score.result / total", "task_image": task_image, **final},
-        harness_run_tokens=adapter_result.harness_run_tokens,
-        token_breakdown=_result_token_usage(adapter_result),
+        harness_run_tokens=harness_result.harness_run_tokens,
+        token_breakdown=_result_token_usage(harness_result),
         interactions=1,
     )
 
@@ -2068,7 +2055,7 @@ def run_proxy_smoke(
     timeout: int,
 ) -> HarnessRunResult:
     prompt = str(entry.get("proxy_prompt") or entry.get("name") or artifact.task_id)
-    result = run_generated_harness(
+    result = run_agent_cli(
         artifact.path,
         artifact.domain,
         prompt,
@@ -2202,9 +2189,9 @@ def run_benchmark(
     if runner == "unsupported":
         if proxy_smoke_for_unsupported and not dry_run:
             return run_proxy_smoke(artifact, entry, output_dir, python_bin=python_bin, timeout=timeout)
-        reason = str(entry.get("unsupported_reason") or "No generated-harness adapter is implemented for this benchmark runner yet")
+        reason = str(entry.get("unsupported_reason") or "No generated-harness CLI runner is implemented for this benchmark yet")
         return HarnessRunResult(
-            status="skipped/unsupported_adapter",
+            status="skipped/unsupported_harness_cli",
             missing_dependencies=[reason],
             score_breakdown={"runner": runner},
         )
@@ -2251,8 +2238,8 @@ def base_row(
         "syntax_ok": validation.syntax_ok,
         "import_ok": validation.import_ok,
         "cli_probe_ok": validation.cli_probe_ok,
-        "adapter_status": validation.adapter_status,
-        "adapter_mode": os.environ.get("HARNESS_EVAL_ADAPTER_MODE", "strict"),
+        "cli_status": validation.cli_status,
+        "harness_invocation": "python -m harness run",
         "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
         "gate_pass": validation.pre_bmk_gate_pass,
         "gate_failure_reason": validation.pre_bmk_failure_reason,

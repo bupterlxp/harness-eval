@@ -53,8 +53,7 @@ include_system_prompt: true
 # 主实验 creation profile。RQ1 主 setting 推荐 claude_code_scaffold_native：
 # 固定 Claude Code atomic scaffold/runtime，让模型主要设计 harness policy、编排、
 # verifier、recovery 和 artifact 组织。
-# 可选：freeform / interface / interface_tool / full_loop /
-#       claude_code_scaffold / claude_code_scaffold_native
+# 当前只保留 claude_code_scaffold_native 主路径。
 creation_profile: "claude_code_scaffold_native"
 
 # Creation 阶段给 meta harness + LLM 暴露公开/dev BMK feedback 命令。

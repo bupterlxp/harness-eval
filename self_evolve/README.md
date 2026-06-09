@@ -2,7 +2,7 @@
 
 `run_self_evolve.py` 是 RQ2 的当前可运行入口。它从 RQ1 已生成的 harness artifact 出发，让 meta harness 在同一类任务上继续修改 harness，并在每轮后调用 downstream BMK eval。
 
-这个 runner 不负责重新 creation。`--creation-profile` 在这里表示 base artifact 的结构和 contract，用来告诉 prompt、snapshot、validation 和 adapter 如何保留产物。
+这个 runner 不负责重新 creation。`--creation-profile` 在这里表示 base artifact 的结构和 contract，用来告诉 prompt、snapshot 和 validation 如何保留产物。下游 eval 统一调用 generated harness 的公开 CLI。
 
 ## 两种实验模式
 
@@ -62,10 +62,10 @@ runner 同时支持两种 base artifact：
 
 | Artifact | Contract |
 |---|---|
-| legacy harness | 保留 `harness/`，并保持 `python -m harness` 或 `python -m harness.cli` 可运行 |
-| scaffold-native | 保留 `generated_program.py`、`scaffold_manifest.json`、`harness_scaffold/` 和 scaffold CLI/program contract |
+| legacy harness | 保留 `harness/`，并保持 `python -m harness run --task-json ... --model-config ... --output-dir ...` 可运行 |
+| scaffold-native | 保留 `generated_program.py`、`scaffold_manifest.json`、`harness_scaffold/`，并保持上面的公开 CLI 可运行 |
 
-每轮 snapshot 会记录 `self_evolve_artifact_contract`，用于排查 adapter 是否走了正确分支。不要删除 `generated_program.py`、`scaffold_manifest.json` 或 `harness_scaffold/`，否则 scaffold-native base 可能无法进入 eval。
+每轮 snapshot 会记录 `self_evolve_artifact_contract`，用于排查 base artifact 是否还满足公开 CLI。不要删除 `generated_program.py`、`scaffold_manifest.json` 或 `harness_scaffold/`，否则 scaffold-native base 可能无法进入 eval。
 
 ## 输出
 
@@ -112,7 +112,7 @@ Plateau 默认口径：连续 `--plateau-patience 3` 个完成 eval 的 evolutio
 .venv/bin/python -m py_compile \
   run_self_evolve.py \
   creation_eval/token_usage.py \
-  creation_eval/adapter.py \
+  creation_eval/agent_cli.py \
   creation_eval/benchmarks.py \
   tools/validate_fused_update_counts.py
 

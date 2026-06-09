@@ -33,7 +33,7 @@ FIELDS = [
     "gate_pass_after_repair_rate",
     "gate_yield",
     "downstream_success_rate",
-    "adapter_failure_rate",
+    "harness_cli_failure_rate",
     "avg_score",
     "avg_end_to_end_score",
     "transfer_score",
@@ -153,7 +153,7 @@ def load_generation_rows(path: Path) -> list[dict[str, Any]]:
 def summarize_rows(label: str, path: Path, source_type: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(rows)
     harnesses = len({str(row.get("harness_task_id") or row.get("harness_path") or i) for i, row in enumerate(rows)})
-    adapter_failures = sum(1 for row in rows if str(row.get("adapter_status") or "").lower() == "adapter_failed")
+    harness_cli_failures = sum(1 for row in rows if str(row.get("cli_status") or "").lower() == "harness_failed")
     eval_success = sum(1 for row in rows if str(row.get("eval_status") or "").lower() == "success")
     repair_rounds = [to_float(row.get("repair_rounds")) for row in rows]
     repair_rounds = [x for x in repair_rounds if x is not None]
@@ -184,7 +184,7 @@ def summarize_rows(label: str, path: Path, source_type: str, rows: list[dict[str
         "gate_pass_after_repair_rate": bool_rate(rows, "gate_pass_after_repair") or bool_rate(rows, "gate_pass"),
         "gate_yield": bool_rate(rows, "gate_pass"),
         "downstream_success_rate": rate(eval_success, total),
-        "adapter_failure_rate": rate(adapter_failures, total),
+        "harness_cli_failure_rate": rate(harness_cli_failures, total),
         "avg_score": avg_float(row.get("score") for row in rows),
         "avg_end_to_end_score": avg_float(row.get("end_to_end_score") for row in rows),
         "transfer_score": round(statistics.mean(transfer_scores), 4) if transfer_scores else "",
@@ -248,7 +248,7 @@ def collect_failure_modes(rows: list[dict[str, Any]]) -> Counter[str]:
         "repair_failure_reasons",
         "missing_dependencies",
         "eval_status",
-        "adapter_status",
+        "cli_status",
     ]
     for row in rows:
         for field in fields:
@@ -264,7 +264,7 @@ def normalize_failure_text(text: str) -> list[str]:
     lowered = text.lower()
     patterns = [
         ("missing_dependency", r"missing|dependency|env:|path:|executable:"),
-        ("adapter_failed", r"adapter_failed|unsupported_adapter"),
+        ("harness_failed", r"harness_failed|unsupported_harness_cli"),
         ("invalid_submission", r"submission\.csv|sample_submission|true/false|boolean"),
         ("no_real_code_change", r"no patch|no diff|changed_files|verifier/test"),
         ("template_data_report", r"template|too few concrete numbers|numeric"),

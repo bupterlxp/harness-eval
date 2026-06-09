@@ -231,7 +231,7 @@ if not summary_jsonl.exists():
         "benchmark": os.environ.get("BENCH_NAME", ""),
         "generation_status": "",
         "syntax_ok": "",
-        "adapter_status": "",
+        "cli_status": "",
         "eval_status": "failed/cluster_entrypoint",
         "score": "",
         "score_breakdown": json.dumps({{"cluster_returncode": status["returncode"]}}, ensure_ascii=False),
@@ -321,7 +321,6 @@ mkdir -p {shlex_quote(output_root)}
   --eval-output-root {shlex_quote(output_root)} \\
   --harness-evolve-root "$HARNESS_EVOLVE_ROOT" \\
   --python-bin "$PYTHON_BIN" \\
-  --adapter-mode strict \\
   --eval-base-url "$EVAL_BASE_URL" \\
   --eval-api-key "$EVAL_API_KEY" \\
   --eval-model-name "$EVAL_MODEL_NAME" \\

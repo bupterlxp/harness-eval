@@ -45,7 +45,7 @@ def apply_max_tasks_per_bmk(matrix: list[dict], limit: int) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run generated harness artifacts through downstream benchmark adapters."
+        description="Run generated harness artifacts through downstream benchmark evaluators."
     )
     parser.add_argument("--generation-output", type=Path, required=True)
     parser.add_argument("--matrix", type=Path, default=Path("eval_matrix.yaml"))
@@ -80,18 +80,9 @@ def main() -> int:
     parser.add_argument(
         "--proxy-smoke-for-unsupported",
         action="store_true",
-        help="For unsupported BMK adapters, run a generated-harness smoke proxy and mark it as non-downstream-BMK.",
+        help="For unsupported BMKs, run a generated-harness smoke proxy and mark it as non-downstream-BMK.",
     )
     parser.add_argument("--max-harnesses", type=int, default=0)
-    parser.add_argument(
-        "--adapter-mode",
-        default="strict",
-        choices=["strict", "permissive"],
-        help=(
-            "Generated harness invocation mode. strict uses only the fixed scaffold/canonical "
-            "contract; permissive keeps legacy CLI probing and runtime patches for debugging."
-        ),
-    )
     args = parser.parse_args()
 
     harness_eval_root = Path(__file__).resolve().parent
@@ -100,7 +91,7 @@ def main() -> int:
         args.dry_run = True
     load_env_file(harness_eval_root / "secrets.local.env")
     load_env_file(args.harness_evolve_root / "secrets.local.env")
-    os.environ["HARNESS_EVAL_ADAPTER_MODE"] = args.adapter_mode
+    harness_invocation = "python -m harness run"
     run_id = args.run_id or "creation-eval-" + datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = (args.eval_output_root / run_id).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -155,8 +146,8 @@ def main() -> int:
                 "syntax_ok": validation.syntax_ok,
                 "import_ok": validation.import_ok,
                 "cli_probe_ok": validation.cli_probe_ok,
-                "adapter_status": validation.adapter_status,
-                "adapter_mode": args.adapter_mode,
+                "cli_status": validation.cli_status,
+                "harness_invocation": harness_invocation,
                 "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
                 "gate_pass": validation.pre_bmk_gate_pass,
                 "gate_failure_reason": validation.pre_bmk_failure_reason,
@@ -214,7 +205,7 @@ def main() -> int:
                 "eval_reasoning_effort": args.eval_reasoning_effort or os.environ.get("REASONING_EFFORT") or "",
                 "eval_provider_proxy": (not args.no_eval_provider_proxy and not args.dry_run),
                 "eval_provider_proxy_log": str(runtime.log_path) if runtime.log_path else None,
-                "adapter_mode": args.adapter_mode,
+                "harness_invocation": harness_invocation,
                 "python_bin": python_bin,
                 "harness_evolve_root": str(args.harness_evolve_root),
                 "rows": len(rows),

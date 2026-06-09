@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from creation_eval.adapter import run_generated_harness
+from creation_eval.agent_cli import read_harness_response, run_agent_cli
 from creation_eval.llm_runtime import LLMRuntime, configure_eval_llm
 from creation_eval.token_usage import extract_harness_token_usage_from_result
 from creation_eval.utils import write_json
@@ -263,7 +263,6 @@ def main() -> int:
     parser.add_argument("--task-work-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--python-bin", default=sys.executable)
-    parser.add_argument("--adapter-mode", default="strict", choices=["strict", "permissive"])
     parser.add_argument("--timeout-seconds", type=int, default=3600)
     parser.add_argument("--verify-cmd", default=None, help="Optional verifier command in the task image.")
     parser.add_argument("--run-id", default=os.environ.get("BMK_RUN_ID", "platform-native-shard"))
@@ -314,7 +313,7 @@ def main() -> int:
     instance_path = output_dir / "instance.json"
     write_json(instance_path, instance)
 
-    adapter_output = output_dir / "adapter_output"
+    harness_output = output_dir / "harness_output"
     started = time.time()
     runtime = LLMRuntime()
     try:
@@ -328,15 +327,14 @@ def main() -> int:
             provider_proxy_port=args.eval_provider_proxy_port,
             log_path=output_dir / "eval_provider_proxy.log",
         )
-        harness_result = run_generated_harness(
+        harness_result = run_agent_cli(
             args.harness_path.resolve(),
             args.domain,
             prompt,
-            adapter_output,
+            harness_output,
             task_work_dir=task_work_dir,
             python_bin=args.python_bin,
             timeout=args.timeout_seconds,
-            adapter_mode=args.adapter_mode,
         )
     finally:
         runtime.close()
@@ -380,7 +378,7 @@ def main() -> int:
         "repo_family": field(instance, "repo_family", ""),
         "harness_path": str(args.harness_path.resolve()),
         "task_work_dir": str(task_work_dir),
-        "adapter_mode": args.adapter_mode,
+        "harness_invocation": "python -m harness run",
         "harness_status": harness_result.status,
         "eval_status": eval_status,
         "score": score,

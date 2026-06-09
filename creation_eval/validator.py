@@ -141,9 +141,14 @@ def _validate_scaffold_artifact(
     apply_scaffold_pythonpath(env, artifact.path, program_path)
     env["PYTHONPATH"] = os.pathsep.join([str(shim_dir), env.get("PYTHONPATH", "")])
     import_code = (
+        "import importlib.util; "
         "from pathlib import Path; "
-        "from harness_scaffold.adapters.generated_harness_adapter import load_program; "
-        f"load_program(Path({str(program_path)!r})); "
+        f"path = Path({str(program_path)!r}); "
+        "spec = importlib.util.spec_from_file_location('generated_program_probe', path); "
+        "mod = importlib.util.module_from_spec(spec); "
+        "assert spec and spec.loader; "
+        "spec.loader.exec_module(mod); "
+        "assert hasattr(mod, 'PROGRAM') or hasattr(mod, 'get_program'); "
         "print('ok')"
     )
     imported = run_command([python_bin, "-c", import_code], cwd=artifact.path, env=env, timeout=timeout)
@@ -155,20 +160,20 @@ def _validate_scaffold_artifact(
         result.errors.append(f"scaffold_import_check_failed: {imported.stderr.strip() or imported.stdout.strip()}")
 
     probe = run_command(
-        [python_bin, "-m", "harness_scaffold.adapters.cli", "--help"],
+        [python_bin, "-m", "harness", "run", "--help"],
         cwd=artifact.path,
         env=env,
         timeout=30,
     )
-    result.cli_probe_ok = probe.returncode == 0 and "harness_scaffold.adapters.cli" in probe.stdout
+    result.cli_probe_ok = probe.returncode == 0 and ("--task-json" in probe.stdout or "usage:" in probe.stdout.lower())
     if not result.cli_probe_ok:
-        result.errors.append(f"scaffold_cli_probe_failed: {probe.stderr.strip() or probe.stdout.strip()}")
+        result.errors.append(f"harness_cli_probe_failed: {probe.stderr.strip() or probe.stdout.strip()}")
 
     result.meta["scaffold_program"] = str(program_path)
     if result.syntax_ok and result.import_ok and result.cli_probe_ok:
-        result.adapter_status = "ready"
+        result.cli_status = "ready"
     else:
-        result.adapter_status = "invalid"
+        result.cli_status = "invalid"
     return result
 
 
@@ -215,7 +220,7 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
         result.syntax_ok = False
         result.import_ok = False
         result.cli_probe_ok = False
-        result.adapter_status = "invalid"
+        result.cli_status = "invalid"
         result.meta["scaffold_native_required"] = True
         return result
 
@@ -227,7 +232,7 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
 
     if not harness_dir.is_dir():
         result.errors.append("missing harness/ directory")
-        result.adapter_status = "invalid"
+        result.cli_status = "invalid"
         return result
 
     syntax = run_command([python_bin, "-m", "compileall", "-q", str(harness_dir)], timeout=timeout)
@@ -271,7 +276,7 @@ def validate_artifact(artifact: HarnessArtifact, python_bin: str, timeout: int =
         result.errors.append("cli_probe_failed: python -m harness --help and python -m harness.cli --help both failed")
 
     if result.syntax_ok and result.import_ok and result.cli_probe_ok:
-        result.adapter_status = "ready"
+        result.cli_status = "ready"
     else:
-        result.adapter_status = "invalid"
+        result.cli_status = "invalid"
     return result

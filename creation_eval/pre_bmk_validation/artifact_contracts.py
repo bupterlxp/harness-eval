@@ -253,8 +253,27 @@ def validate_writing_artifacts(work_dir: Path, output_dir: Path) -> ArtifactCont
     checked = [str(p) for p in candidates]
     text = "\n".join(_read_text(path) for path in candidates)
     words = re.findall(r"\b[\w'-]+\b", text)
-    log_markers = len(re.findall(r"adapter_|metadata|trajectory|stdout|stderr|status|tool_call", text.lower()))
+    log_markers = len(re.findall(r"cli_|metadata|trajectory|stdout|stderr|status|tool_call", text.lower()))
     has_process = any(term in text.lower() for term in ("outline", "draft", "critique", "revision", "revised"))
+    json_envelopes = 0
+    for path in candidates:
+        payload = _load_json(path)
+        if isinstance(payload, dict):
+            envelope_keys = {
+                "status",
+                "trajectory",
+                "trajectory_path",
+                "artifacts",
+                "artifacts_dir",
+                "metadata_path",
+                "stdout_path",
+                "stderr_path",
+                "selected_file",
+                "scores",
+                "out_dir",
+            }
+            if len(envelope_keys.intersection(payload.keys())) >= 2:
+                json_envelopes += 1
     failures: list[str] = []
     hints: list[str] = []
     if not candidates:
@@ -266,12 +285,20 @@ def validate_writing_artifacts(work_dir: Path, output_dir: Path) -> ArtifactCont
     if candidates and log_markers > max(5, len(words) // 20):
         failures.append("writing artifact appears to be logs/metadata rather than user-facing prose")
         hints.append("Separate logs from final writing output; final artifact should contain only the answer/prose.")
+    if json_envelopes:
+        failures.append("writing artifact is a JSON result/metadata envelope rather than final prose")
+        hints.append("Write result metadata to result.json/metadata.json and final user-facing prose only to response.md/final.md.")
     return ArtifactContractResult(
         not failures,
         failures,
         hints,
         checked,
-        {"candidate_count": len(candidates), "word_count": len(words), "has_process_terms": has_process},
+        {
+            "candidate_count": len(candidates),
+            "word_count": len(words),
+            "has_process_terms": has_process,
+            "json_envelope_count": json_envelopes,
+        },
     )
 
 

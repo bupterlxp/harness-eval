@@ -17,7 +17,6 @@ MANIFEST_CANDIDATE_NAMES = (
 )
 
 SCAFFOLD_RESOURCE_PROFILES = {
-    "claude_code_scaffold",
     "claude_code_scaffold_native",
 }
 

@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..adapter import run_generated_harness
+from ..agent_cli import run_agent_cli
 from ..schema import HarnessArtifact, ValidationResult
 from ..scaffold_runtime import (
     find_scaffold_program,
@@ -341,7 +341,7 @@ def run_pre_bmk_validation(
                 report["toy"] = {"status": "skipped", "reason": f"no toy task for domain {artifact.domain}"}
             else:
                 toy_output = output_dir / "toy_run"
-                result = run_generated_harness(
+                result = run_agent_cli(
                     artifact.path,
                     artifact.domain,
                     prompt,

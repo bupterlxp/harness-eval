@@ -72,7 +72,7 @@ def default_config() -> dict:
         "tasks_file": "./tasks.jsonl",
         "system_prompt_file": "./prompts/system_prompt.md",
         "include_system_prompt": True,
-        "creation_profile": os.environ.get("CREATION_PROFILE", "interface_tool"),
+        "creation_profile": os.environ.get("CREATION_PROFILE", "claude_code_scaffold_native"),
         "creation_profile_dir": "./prompts/creation/profiles",
         "enable_dev_bmk_feedback": os.environ.get("ENABLE_DEV_BMK_FEEDBACK", "1").lower() not in {"0", "false", "no"},
         "dev_bmk_task_limit": int(os.environ.get("DEV_BMK_TASK_LIMIT", "3") or "3"),
@@ -122,7 +122,6 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "eval_api_key": args.eval_api_key,
         "eval_model_name": args.eval_model_name,
         "eval_reasoning_effort": args.eval_reasoning_effort,
-        "eval_adapter_mode": args.eval_adapter_mode,
         "meta_harness": args.meta_harness,
         "codex_bin": args.codex_bin,
         "codex_sandbox": args.codex_sandbox,
@@ -155,33 +154,26 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
 
 
 def normalize_creation_profile(value: str | None) -> str:
-    profile = (value or "interface_tool").strip().lower().replace("-", "_")
+    profile = (value or "claude_code_scaffold_native").strip().lower().replace("-", "_")
     aliases = {
-        "claude_code_scaffold": "claude_code_scaffold",
-        "claudecodescaffold": "claude_code_scaffold",
         "claude_code_scaffold_native": "claude_code_scaffold_native",
         "claude_code_native": "claude_code_scaffold_native",
         "claudecodenative": "claude_code_scaffold_native",
         "cc_native": "claude_code_scaffold_native",
         "ccnative": "claude_code_scaffold_native",
-        "interface_tool": "interface_tool",
-        "interfacetool": "interface_tool",
-        "interface": "interface",
-        "freeform": "freeform",
-        "full_loop": "full_loop",
-        "fullloop": "full_loop",
+        "native": "claude_code_scaffold_native",
+        "default": "claude_code_scaffold_native",
     }
     if profile not in aliases:
         raise ValueError(
             f"Unsupported creation_profile={value!r}. "
-            "Supported values: freeform, interface, interface_tool, full_loop, "
-            "claude_code_scaffold, claude_code_scaffold_native."
+            "Supported value: claude_code_scaffold_native."
         )
     return aliases[profile]
 
 
 def load_creation_profile_prompt(config: dict) -> tuple[str, str]:
-    profile = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    profile = normalize_creation_profile(str(config.get("creation_profile") or "claude_code_scaffold_native"))
     profile_dir = Path(str(config.get("creation_profile_dir") or "./prompts/creation/profiles"))
     profile_path = profile_dir / f"{profile}.md"
     if not profile_path.is_file():
@@ -356,7 +348,7 @@ def prepare_workspace(task: dict, workspace: str):
 
 
 def install_scaffold_resources(workspace: Path, config: dict) -> None:
-    profile = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    profile = normalize_creation_profile(str(config.get("creation_profile") or "claude_code_scaffold_native"))
     if not is_scaffold_resource_profile(profile):
         return
     if not scaffold_source_available():
@@ -475,46 +467,61 @@ def _load_manifest(root: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scaffold-native generated harness wrapper")
+    subparsers = parser.add_subparsers(dest="command")
+
+    run_parser = subparsers.add_parser("run", help="Run one benchmark task through this harness")
+    run_parser.add_argument("--task-json", required=True)
+    run_parser.add_argument("--model-config", default=None)
+    run_parser.add_argument("--output-dir", "--output", dest="output_dir", required=True)
+
     parser.add_argument("positional_prompt", nargs="*", help="Optional prompt words")
     parser.add_argument("-p", "--prompt", default=None)
     parser.add_argument("--workdir", "--work-dir", "--workspace", dest="workdir", default=".")
-    parser.add_argument("--output-dir", "--output", dest="output_dir", required=True)
+    parser.add_argument("--output-dir", "--output", dest="output_dir", default=None)
     parser.add_argument("--max-steps", "--max-turns", dest="max_steps", default=None)
     parser.add_argument("--model-name", default=None)
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[1]
+    if not args.output_dir:
+        parser.error("--output-dir is required")
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest = _load_manifest(root)
     program = (root / str(manifest.get("program") or "generated_program.py")).resolve()
-    prompt = args.prompt or " ".join(args.positional_prompt).strip()
 
-    task_json = out_dir / "task.json"
-    config_json = out_dir / "config.json"
-    task_json.write_text(
-        json.dumps(
-            {
-                "task_id": "generated-harness-task",
-                "prompt": prompt,
-                "workdir": str(Path(args.workdir).resolve()),
-                "metadata": {"adapter": "scaffold_native_wrapper"},
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    policy = {}
-    if args.max_steps:
-        try:
-            policy["max_steps"] = int(args.max_steps)
-        except ValueError:
-            policy["max_steps"] = args.max_steps
-    config_json.write_text(
-        json.dumps({"policy": policy, "include_optional_tools": True}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    if args.command == "run":
+        task_json = Path(args.task_json).resolve()
+        config_json = Path(args.model_config).resolve() if args.model_config else out_dir / "config.json"
+        if not config_json.exists():
+            config_json.write_text(json.dumps({"policy": {}, "include_optional_tools": True}, ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        prompt = args.prompt or " ".join(args.positional_prompt).strip()
+        task_json = out_dir / "task.json"
+        config_json = out_dir / "config.json"
+        task_json.write_text(
+            json.dumps(
+                {
+                    "task_id": "generated-harness-task",
+                    "prompt": prompt,
+                    "workdir": str(Path(args.workdir).resolve()),
+                    "metadata": {"wrapper": "scaffold_native_cli"},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        policy = {}
+        if args.max_steps:
+            try:
+                policy["max_steps"] = int(args.max_steps)
+            except ValueError:
+                policy["max_steps"] = args.max_steps
+        config_json.write_text(
+            json.dumps({"policy": policy, "include_optional_tools": True}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     return run_cli(
         [
             "--task-json",
@@ -614,7 +621,7 @@ Each run writes under `dev_bmk_runs/<timestamp>/`:
 
 - `summary.csv`
 - `summary.jsonl`
-- `validation.json` with minimal adapter/CLI status only
+- `validation.json` with minimal CLI status only
 - per-BMK stdout/stderr/raw result artifacts
 
 Use these files, plus any generated `trajectory.jsonl`, harness artifacts, and
@@ -969,7 +976,7 @@ def _generation_meta(task: dict, config: dict, *, status: str, stdout: str, stde
         "status": status,
         "run_id": config.get("run_id"),
         "meta_harness": config.get("meta_harness", "claude-code"),
-        "creation_profile": config.get("creation_profile", "interface_tool"),
+        "creation_profile": config.get("creation_profile", "claude_code_scaffold_native"),
         "scaffold_source": "vendor/harness_scaffold"
         if is_scaffold_resource_profile(str(config.get("creation_profile") or ""))
         else None,
@@ -1105,21 +1112,14 @@ def parse_args() -> argparse.Namespace:
         "--creation-profile",
         default=None,
         choices=[
-            "freeform",
-            "interface",
-            "interface_tool",
-            "interface-tool",
-            "full_loop",
-            "full-loop",
-            "claude_code_scaffold",
-            "claude-code-scaffold",
             "claude_code_scaffold_native",
             "claude-code-scaffold-native",
             "claude_code_native",
             "claude-code-native",
             "cc_native",
+            "native",
         ],
-        help="Harness creation profile. Main experiment default: interface_tool.",
+        help="Harness creation profile. Current mainline supports claude_code_scaffold_native only.",
     )
     parser.add_argument(
         "--disable-dev-bmk-feedback",
@@ -1199,15 +1199,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-provider-proxy-port", type=int, default=3458)
     parser.add_argument(
-        "--eval-adapter-mode",
-        default=None,
-        choices=["strict", "permissive"],
-        help=(
-            "Adapter mode for --eval-after. strict uses only the fixed generated-harness "
-            "contract; permissive keeps legacy CLI probing/fallbacks."
-        ),
-    )
-    parser.add_argument(
         "--harness-evolve-root",
         default="/Users/bytedance/Downloads/harness evolve project",
     )
@@ -1256,7 +1247,6 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
     if args.no_eval_provider_proxy:
         command.append("--no-eval-provider-proxy")
     command.extend(["--eval-provider-proxy-port", str(args.eval_provider_proxy_port)])
-    command.extend(["--adapter-mode", str(config.get("eval_adapter_mode") or "strict")])
     if args.eval_domain:
         command.extend(["--domain", args.eval_domain])
     command.extend(["--run-id", eval_run_id])
@@ -1271,7 +1261,7 @@ def run_downstream_eval(output_dir: Path, args: argparse.Namespace, config: dict
 def main():
     args = parse_args()
     config = resolve_config_models(apply_cli_overrides(load_config(args.config), args))
-    config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "interface_tool"))
+    config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "claude_code_scaffold_native"))
 
     if args.list_model_aliases:
         print_model_aliases(config)

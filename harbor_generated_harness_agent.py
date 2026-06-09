@@ -13,7 +13,7 @@ from harbor.models.trial.paths import EnvironmentPaths
 
 
 class GeneratedHarnessAgent(BaseAgent):
-    """Harbor agent adapter that runs a generated Harness-Evolve artifact."""
+    """Harbor agent that runs a generated Harness-Evolve artifact via its CLI."""
 
     SUPPORTS_ATIF: bool = False
     SUPPORTS_WINDOWS: bool = False
@@ -23,11 +23,9 @@ class GeneratedHarnessAgent(BaseAgent):
         logs_dir: Path,
         model_name: str | None = None,
         harness_path: str | None = None,
-        adapter_path: str | None = None,
         domain: str = "code",
         task_work_dir: str = "/app",
         timeout_sec: int = 900,
-        adapter_mode: str = "strict",
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -37,21 +35,10 @@ class GeneratedHarnessAgent(BaseAgent):
             or (extra_env or {}).get("GENERATED_HARNESS_PATH")
             or os.environ.get("GENERATED_HARNESS_PATH", "")
         )
-        self.adapter_path = Path(
-            adapter_path
-            or (extra_env or {}).get("GENERATED_HARNESS_ADAPTER")
-            or os.environ.get("GENERATED_HARNESS_ADAPTER", "")
-        )
         self.domain = domain or (extra_env or {}).get("GENERATED_HARNESS_DOMAIN", "code")
         self.task_work_dir = task_work_dir
         self.timeout_sec = int(timeout_sec)
         self.extra_env = dict(extra_env or {})
-        self.adapter_mode = (
-            self.extra_env.get("HARNESS_EVAL_ADAPTER_MODE")
-            or os.environ.get("HARNESS_EVAL_ADAPTER_MODE")
-            or adapter_mode
-            or "strict"
-        )
 
     @staticmethod
     def name() -> str:
@@ -63,27 +50,11 @@ class GeneratedHarnessAgent(BaseAgent):
     async def setup(self, environment: BaseEnvironment) -> None:
         if not self.harness_path.exists():
             raise FileNotFoundError(f"Generated harness path not found: {self.harness_path}")
-        if not self.adapter_path.exists():
-            raise FileNotFoundError(f"Generated harness adapter not found: {self.adapter_path}")
 
         await environment.exec(command="mkdir -p /installed-agent", user="root")
-        await environment.upload_file(
-            source_path=self.adapter_path,
-            target_path="/installed-agent/generated_harness_adapter.py",
-        )
-        creation_eval_dir = self.adapter_path.parent / "creation_eval"
-        if creation_eval_dir.exists():
-            await environment.upload_dir(
-                source_dir=creation_eval_dir,
-                target_dir="/installed-agent/creation_eval",
-            )
         await environment.upload_dir(
             source_dir=self.harness_path,
             target_dir="/installed-agent/generated_harness",
-        )
-        await environment.exec(
-            command="chmod +x /installed-agent/generated_harness_adapter.py",
-            user="root",
         )
 
         python_bootstrap = (
@@ -98,13 +69,12 @@ class GeneratedHarnessAgent(BaseAgent):
         )
         await environment.exec(command=python_bootstrap, user="root", timeout_sec=600)
 
-        if self.adapter_mode == "permissive":
-            install_cmd = (
-                "if [ -f /installed-agent/generated_harness/requirements.txt ]; then "
-                "PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user -q -r /installed-agent/generated_harness/requirements.txt; "
-                "fi"
-            )
-            await environment.exec(command=install_cmd, timeout_sec=240)
+        install_cmd = (
+            "if [ -f /installed-agent/generated_harness/requirements.txt ]; then "
+            "PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user -q -r /installed-agent/generated_harness/requirements.txt; "
+            "fi"
+        )
+        await environment.exec(command=install_cmd, timeout_sec=240)
 
     def _runtime_env(self) -> dict[str, str]:
         env: dict[str, str] = {}
@@ -136,17 +106,32 @@ class GeneratedHarnessAgent(BaseAgent):
         escaped_instruction = shlex.quote(instruction)
         escaped_work_dir = shlex.quote(self.task_work_dir)
         escaped_output_dir = shlex.quote(output_dir)
+        task_json = str(env_paths.agent_dir / "generated_harness_task.json")
+        config_json = str(env_paths.agent_dir / "generated_harness_model_config.json")
 
         await environment.exec(command=f"mkdir -p {escaped_output_dir}", user="root")
+        write_payload = (
+            "python3 - <<'PY'\n"
+            "import json, os\n"
+            f"task = {{'task_id': 'terminalbench-task', 'domain': {self.domain!r}, 'prompt': {instruction!r}, "
+            f"'workdir': {self.task_work_dir!r}, 'output_dir': {output_dir!r}}}\n"
+            "cfg = {'policy': {}, 'include_optional_tools': True, 'llm': {\n"
+            "  'provider': 'openai_compatible',\n"
+            "  'model': os.environ.get('MODEL_NAME') or os.environ.get('MODEL_ID') or '',\n"
+            "  'base_url': os.environ.get('OPENAI_BASE_URL') or os.environ.get('BASE_URL') or '',\n"
+            "  'api_key': os.environ.get('OPENAI_API_KEY') or os.environ.get('API_KEY') or '',\n"
+            "}}\n"
+            f"open({task_json!r}, 'w').write(json.dumps(task, ensure_ascii=False, indent=2))\n"
+            f"open({config_json!r}, 'w').write(json.dumps(cfg, ensure_ascii=False, indent=2))\n"
+            "PY"
+        )
+        await environment.exec(command=write_payload, cwd=self.task_work_dir, env=self._runtime_env(), timeout_sec=60)
         command = (
-            "python3 /installed-agent/generated_harness_adapter.py "
-            "--harness-path /installed-agent/generated_harness "
-            f"--domain {shlex.quote(self.domain)} "
-            f"--work-dir {escaped_work_dir} "
+            "PYTHONPATH=/installed-agent/generated_harness:$PYTHONPATH "
+            "python3 -m harness run "
+            f"--task-json {shlex.quote(task_json)} "
+            f"--model-config {shlex.quote(config_json)} "
             f"--output-dir {escaped_output_dir} "
-            f"--timeout {self.timeout_sec} "
-            f"--adapter-mode {shlex.quote(self.adapter_mode)} "
-            f"{escaped_instruction} "
             f"2>&1 | tee {shlex.quote(str(env_paths.agent_dir / 'generated_harness_stdout.log'))}"
         )
         result = await environment.exec(

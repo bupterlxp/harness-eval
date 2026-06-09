@@ -32,7 +32,7 @@ Requirements:
   `style.py`, and `verifier.py` are allowed only if called by the program.
 - Do not deliver only README files, architecture notes, or disconnected helper
   modules.
-- Do not return "Task completed", "Here is the plan", JSON metadata, adapter
+- Do not return "Task completed", "Here is the plan", JSON metadata, CLI
   logs, or short status messages as the writing artifact.
 - If the task cannot be fully satisfied, return `partial` or `failed`, write a
   best-effort text, error reason, and diagnostic trajectory.
