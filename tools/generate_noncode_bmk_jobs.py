@@ -141,6 +141,9 @@ PY
     mle_prepare = ""
     if bench == "mle_bench":
         data_dir = cfg["extra_env"]["MLEBENCH_DATA_DIR"]
+        prepare_target = "--all"
+        if scenario_id:
+            prepare_target = f"-c {shlex_quote(scenario_id)}"
         mle_prepare = f"""
 mkdir -p {shlex_quote(data_dir)}
 if [ ! -f "$HOME/.kaggle/kaggle.json" ] && [ -n "${{KAGGLE_JSON_B64:-}}" ]; then
@@ -161,9 +164,9 @@ path.write_text(json.dumps({{"username": os.environ["KAGGLE_USERNAME"], "key": o
 path.chmod(0o600)
 PY
 fi
-echo "[mle] preparing all competitions into {data_dir}"
+echo "[mle] preparing {scenario_id or 'all competitions'} into {data_dir}"
 set +e
-"$PYTHON_BIN" -m mlebench.cli prepare --all --data-dir {shlex_quote(data_dir)} > "$CLUSTER_DIR/mle_prepare_stdout.log" 2> "$CLUSTER_DIR/mle_prepare_stderr.log"
+"$PYTHON_BIN" -m mlebench.cli prepare {prepare_target} --data-dir {shlex_quote(data_dir)} > "$CLUSTER_DIR/mle_prepare_stdout.log" 2> "$CLUSTER_DIR/mle_prepare_stderr.log"
 MLE_PREPARE_RC=$?
 set -e
 export MLE_PREPARE_RC
@@ -181,6 +184,27 @@ PY
 if [ "$MLE_PREPARE_RC" -ne 0 ]; then
   echo "[mle] prepare failed rc=$MLE_PREPARE_RC; continuing so run_creation_eval can emit a structured failure row"
 fi
+"""
+    if bench == "mle_bench" and scenario_id:
+        matrix_setup = f"""
+export MLE_COMPETITION_ID={shlex_quote(scenario_id)}
+export MATRIX_PATH="$CLUSTER_DIR/eval_matrix_mle_${{MLE_COMPETITION_ID}}.yaml"
+"$PYTHON_BIN" - <<'PY'
+import os
+import pathlib
+import yaml
+
+competition_id = os.environ["MLE_COMPETITION_ID"]
+src = pathlib.Path("eval_matrix.yaml")
+data = yaml.safe_load(src.read_text())
+for entry in data.get("benchmarks", []):
+    if entry.get("id") == "mle_bench":
+        entry["competition_id"] = competition_id
+        entry["default_subset"] = competition_id
+path = pathlib.Path(os.environ["MATRIX_PATH"])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+PY
 """
     provider_extra = (
         f"export PROVIDER_EXTRA_BODY_JSON={shlex_quote(provider_extra_body_json)}"
@@ -478,6 +502,31 @@ def parse_eqbench3_scenario_ids(value: str, harness_evolve_root: Path) -> list[s
     return ids
 
 
+def parse_mle_competition_ids(value: str, harness_eval_root: Path) -> list[str]:
+    value = value.strip()
+    if not value:
+        return []
+    if value.lower() != "all":
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    mle_root = harness_eval_root / "external_benchmarks" / "mle-bench"
+    code = """
+import json
+from mlebench.registry import registry
+print(json.dumps(registry.list_competition_ids()))
+"""
+    out = subprocess.check_output(
+        ["python3", "-c", code],
+        cwd=mle_root,
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    ids = json.loads(out.strip().splitlines()[-1])
+    if not ids:
+        raise RuntimeError(f"No MLE competitions parsed from {mle_root}")
+    return [str(item) for item in ids]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Seed job JSONL for non-Docker downstream BMK full evals.")
     parser.add_argument("--template", type=Path, required=True)
@@ -520,6 +569,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--mle-competitions",
+        default="",
+        help=(
+            "Optional comma-separated MLE competition ids, or 'all' to emit "
+            "one Seed job per registered MLE-bench competition."
+        ),
+    )
+    parser.add_argument(
         "--output-uri-prefix",
         default="",
         help=(
@@ -542,15 +599,22 @@ def main() -> int:
         args.eqbench3_scenarios,
         Path("/Users/bytedance/Downloads/harness evolve project"),
     ) if args.eqbench3_scenarios else []
+    mle_competitions = parse_mle_competition_ids(args.mle_competitions, Path.cwd()) if args.mle_competitions else []
 
     jobs_written = 0
     with args.output.open("w", encoding="utf-8") as handle:
         for bench in benches:
             cfg = BENCH_CONFIG[bench]
             generation_output = f"{args.generation_output_root.rstrip('/')}/{cfg['task_id']}"
-            scenario_ids = eqbench3_scenarios if bench == "eqbench3" and eqbench3_scenarios else [""]
+            scenario_ids = [""]
+            if bench == "eqbench3" and eqbench3_scenarios:
+                scenario_ids = eqbench3_scenarios
+            elif bench == "mle_bench" and mle_competitions:
+                scenario_ids = mle_competitions
             for scenario_id in scenario_ids:
-                scenario_suffix = f"-s{scenario_id}" if scenario_id else ""
+                scenario_suffix = f"-s{scenario_id}" if scenario_id and bench == "eqbench3" else ""
+                if scenario_id and bench == "mle_bench":
+                    scenario_suffix = f"-{scenario_id}"
                 run_id = f"{args.run_id_prefix}-{bench}{scenario_suffix}"
                 job = patch_job(
                     template,
