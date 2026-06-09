@@ -432,7 +432,10 @@ def patch_job(
     output_uri_prefix: str,
 ) -> dict[str, Any]:
     job = copy.deepcopy(template)
-    caption = f"he-{bench}-{run_id}"[:96]
+    # Seed rejects captions longer than 90 characters. Keep a small safety
+    # margin because some platform paths append or validate multibyte strings
+    # conservatively.
+    caption = f"he-{bench}-{run_id}"[:88]
     job["caption"] = caption
     jd = ensure_nested(job, ["jobDefVersion"])
     jd["name"] = caption

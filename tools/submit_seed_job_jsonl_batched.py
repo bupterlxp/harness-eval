@@ -15,6 +15,8 @@ import submit_seed_job_jsonl as submit_lib
 GET_URL_DEFAULT = "https://paas-gw.byted.org/openapi/v1/job_run/get"
 
 TERMINAL_STATUS_KEYWORDS = (
+    "DONE",
+    "FINISHED",
     "SUCCESS",
     "SUCCEEDED",
     "FAILED",
