@@ -67,6 +67,7 @@ def default_config() -> dict:
         "codex_extra_args": "",
         "max_concurrent": 1,
         "timeout_minutes": None,
+        "docker_memory": os.environ.get("HARNESS_EVAL_DOCKER_MEMORY", ""),
         "workspace_dir": "/workspace",
         "output_dir": "./outputs",
         "tasks_file": "./tasks.jsonl",
@@ -134,6 +135,7 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "harness_evolve_root": args.harness_evolve_root,
         "max_concurrent": args.max_concurrent,
         "timeout_minutes": args.timeout_minutes,
+        "docker_memory": args.docker_memory,
     }
     for key, value in override_fields.items():
         if value is not None:
@@ -817,6 +819,9 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
         "-v", f"{harness_evolve_root}:/harness-evolve:ro",
         "-v", f"{workspace}:/workspace",
     ]
+    docker_memory = str(config.get("docker_memory") or os.environ.get("HARNESS_EVAL_DOCKER_MEMORY") or "").strip()
+    if docker_memory:
+        docker_command[2:2] = ["--memory", docker_memory, "--memory-swap", docker_memory]
     for name in passthrough_env_names:
         if os.environ.get(name):
             docker_command.extend(["-e", f"{name}={os.environ[name]}"])
@@ -831,20 +836,33 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
             "DOCKER_HOST=unix:///var/run/docker.sock",
         ])
     docker_command.append("harness-eval")
+    stdout_path = Path(workspace) / "docker_stdout.log"
+    stderr_path = Path(workspace) / "docker_stderr.log"
+
+    def read_tail(path: Path, max_chars: int = 20000) -> str:
+        if not path.exists():
+            return ""
+        data = path.read_text(encoding="utf-8", errors="replace")
+        if len(data) <= max_chars:
+            return data
+        return data[-max_chars:]
+
     try:
-        result = subprocess.run(
-            docker_command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+            result = subprocess.run(
+                docker_command,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                timeout=timeout,
+            )
         status = "success" if result.returncode == 0 else "failed"
-        return status, result.stdout, result.stderr
+        return status, read_tail(stdout_path), read_tail(stderr_path)
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "stop", "-t", "5", container_name], capture_output=True)
-        return "timeout", "", "Task timed out"
+        return "timeout", read_tail(stdout_path), f"Task timed out\n{read_tail(stderr_path)}"
     except Exception as e:
-        return "error", "", str(e)
+        return "error", read_tail(stdout_path), f"{e}\n{read_tail(stderr_path)}"
     finally:
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
 
@@ -1133,6 +1151,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Number of public/dev tasks per BMK exposed to the creation agent. Default: config or 3.",
+    )
+    parser.add_argument(
+        "--docker-memory",
+        default=None,
+        help="Memory limit passed to each Claude Code Docker creation container, e.g. 16g.",
     )
     parser.add_argument(
         "--pre-bmk-gate",

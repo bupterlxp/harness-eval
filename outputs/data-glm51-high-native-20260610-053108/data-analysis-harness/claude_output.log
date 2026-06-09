@@ -1,0 +1,52 @@
+The harness is complete and working. Here's a summary of what was built:
+
+## Summary
+
+Built a complete data-analysis harness on top of `harness_scaffold` with the following components:
+
+### `generated_program.py` (main program)
+- `GeneratedHarnessProgram.run()` implements a Plan-Code-Observe loop
+- LLM-guided analysis with tool calling when LLM is available
+- Automatic fallback to scripted analysis when LLM fails or is unavailable
+- Handles MLE-bench tasks (submission.csv with matching schema, True/False labels) and DAComp tasks (REPORT.md with concrete numbers, metrics, tables)
+- Failure recovery: always writes best-effort artifacts even on errors
+- Validates artifacts against domain contracts before finalizing
+
+### `planner.py`
+- Infers task type (MLE_SUBMISSION, DATA_ANALYSIS_REPORT, MIXED, UNKNOWN) from prompt keywords
+- Discovers and categorizes data files (train, test, sample_submission, data, readme, instructions)
+- Builds a structured execution plan
+
+### `context_manager.py`
+- Summarizes CSV/JSON files with compact schema, head rows, shape
+- Builds data context string within token budget
+- Parses sample_submission.csv for schema, ID column, target columns, prediction type
+
+### `verifier.py`
+- Validates submission.csv matches sample_submission.csv (columns, row count, ID order, boolean labels)
+- Validates REPORT.md has real content (not template), concrete numbers, sufficient length
+
+### `recovery.py`
+- Creates baseline submissions (majority/mean/constant) when modeling fails
+- Creates minimal but valid REPORT.md as fallback
+- Creates analysis_summary.json for machine-readable output
+
+### `custom_tools.py`
+- `DataDiscoveryTool`: discover and categorize data files
+- `DataSummarizeTool`: compact data summaries for LLM context
+- `SubmissionGenTool`: generate baseline submission.csv
+
+### `harness/__main__.py` (updated)
+- Fixed argparse to properly support `-p`/`--prompt` without subcommands
+- Added all required CLI aliases (`--workdir`/`--work-dir`/`--workspace`, `--max-steps`/`--max-turns`)
+- Auto-configures LLM from `MODEL_NAME`/`OPENAI_BASE_URL`/`OPENAI_API_KEY` environment variables
+
+### Verified working:
+- `python -m harness -p "task" --output-dir ./output/` with all alias combinations
+- MLE-bench tasks: binary classification and regression with submission.csv matching sample schema
+- DAComp tasks: reports with concrete numbers, metrics tables, structured findings
+- Empty workdir fallback (returns "partial" status)
+- LLM failure fallback (gracefully falls back to scripted analysis)
+- Mock LLM integration
+
+FINISH

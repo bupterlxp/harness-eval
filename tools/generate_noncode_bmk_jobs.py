@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ def git_value(args: list[str], fallback: str = "") -> str:
 def render_entrypoint(
     *,
     bench: str,
+    scenario_id: str,
     generation_output: str,
     run_id: str,
     harness_eval_root: str,
@@ -111,6 +113,30 @@ def render_entrypoint(
     if bench == "eqbench3":
         bench_setup = """
 "$PYTHON_BIN" -m pip install --user trueskill
+"""
+    matrix_setup = """
+export MATRIX_PATH=eval_matrix.yaml
+"""
+    if bench == "eqbench3" and scenario_id:
+        matrix_setup = f"""
+export EQBENCH3_SCENARIO={shlex_quote(scenario_id)}
+export MATRIX_PATH="$CLUSTER_DIR/eval_matrix_eqbench3_${{EQBENCH3_SCENARIO}}.yaml"
+"$PYTHON_BIN" - <<'PY'
+import os
+import pathlib
+import yaml
+
+scenario = os.environ["EQBENCH3_SCENARIO"]
+src = pathlib.Path("eval_matrix.yaml")
+data = yaml.safe_load(src.read_text())
+for entry in data.get("benchmarks", []):
+    if entry.get("id") == "eqbench3":
+        entry["default_subset"] = scenario
+        entry["threads"] = 1
+path = pathlib.Path(os.environ["MATRIX_PATH"])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+PY
 """
     mle_prepare = ""
     if bench == "mle_bench":
@@ -310,11 +336,12 @@ fi
 export PYTHONPATH="$HARNESS_EVAL_ROOT/external_benchmarks/mle-bench:$HARNESS_EVAL_ROOT:${{PYTHONPATH:-}}"
 
 {mle_prepare}
+{matrix_setup}
 
 mkdir -p {shlex_quote(output_root)}
 "$PYTHON_BIN" run_creation_eval.py \\
   --generation-output {shlex_quote(generation_output)} \\
-  --matrix eval_matrix.yaml \\
+  --matrix "$MATRIX_PATH" \\
   --bench {shlex_quote(bench)} \\
   --domain {shlex_quote(cfg["domain"])} \\
   --run-id {shlex_quote(run_id)} \\
@@ -363,6 +390,7 @@ def patch_job(
     template: dict[str, Any],
     *,
     bench: str,
+    scenario_id: str,
     run_id: str,
     generation_output: str,
     output_root: str,
@@ -403,6 +431,7 @@ def patch_job(
     )
     script = render_entrypoint(
         bench=bench,
+        scenario_id=scenario_id,
         generation_output=generation_output,
         run_id=run_id,
         harness_eval_root=harness_eval_root,
@@ -423,6 +452,30 @@ def patch_job(
     patch_resource(job, BENCH_CONFIG[bench]["resource"])
     patch_outputs(job, output_root=output_root, run_id=run_id, output_uri_prefix=output_uri_prefix)
     return job
+
+
+def parse_eqbench3_scenario_ids(value: str, harness_evolve_root: Path) -> list[str]:
+    value = value.strip()
+    if not value:
+        return []
+    if value.lower() != "all":
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    scenario_file = (
+        harness_evolve_root
+        / "writing_harness_eval"
+        / "third_party"
+        / "eqbench3"
+        / "data"
+        / "scenario_prompts.txt"
+    )
+    if not scenario_file.exists():
+        raise FileNotFoundError(f"Cannot auto-discover EQBench3 scenarios: {scenario_file}")
+    text = scenario_file.read_text(encoding="utf-8", errors="replace")
+    ids = re.findall(r"^#{5,}\s*(\d+)\s*\|", text, flags=re.MULTILINE)
+    if not ids:
+        raise RuntimeError(f"No EQBench3 scenario ids parsed from {scenario_file}")
+    return ids
 
 
 def main() -> int:
@@ -459,6 +512,14 @@ def main() -> int:
     parser.add_argument("--provider-extra-body-json", default='{"reasoning_effort":"high","thinking":{"type":"enabled"}}')
     parser.add_argument("--provider-strip-max-tokens", default="1")
     parser.add_argument(
+        "--eqbench3-scenarios",
+        default="",
+        help=(
+            "Optional comma-separated EQBench3 scenario ids, or 'all' to parse "
+            "the local scenario_prompts.txt and emit one job per scenario."
+        ),
+    )
+    parser.add_argument(
         "--output-uri-prefix",
         default="",
         help=(
@@ -475,31 +536,44 @@ def main() -> int:
         raise ValueError(f"unknown bench(es): {unknown}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    harness_evolve_root_local = Path(args.generation_output_root).anchor
+    _ = harness_evolve_root_local
+    eqbench3_scenarios = parse_eqbench3_scenario_ids(
+        args.eqbench3_scenarios,
+        Path("/Users/bytedance/Downloads/harness evolve project"),
+    ) if args.eqbench3_scenarios else []
+
+    jobs_written = 0
     with args.output.open("w", encoding="utf-8") as handle:
         for bench in benches:
             cfg = BENCH_CONFIG[bench]
             generation_output = f"{args.generation_output_root.rstrip('/')}/{cfg['task_id']}"
-            run_id = f"{args.run_id_prefix}-{bench}"
-            job = patch_job(
-                template,
-                bench=bench,
-                run_id=run_id,
-                generation_output=generation_output,
-                output_root=args.output_root,
-                python_bin=args.python_bin,
-                preserve_template_env=args.preserve_template_env,
-                git_branch=args.git_branch,
-                git_commit=args.git_commit,
-                dependency_branch=args.dependency_branch,
-                dependency_commit=args.dependency_commit,
-                eval_model_name=args.eval_model_name,
-                eval_reasoning_effort=args.eval_reasoning_effort,
-                provider_extra_body_json=args.provider_extra_body_json,
-                provider_strip_max_tokens=args.provider_strip_max_tokens,
-                output_uri_prefix=args.output_uri_prefix,
-            )
-            handle.write(json.dumps(job, ensure_ascii=False, separators=(",", ":")) + "\n")
-    print(f"Wrote {len(benches)} jobs to {args.output}")
+            scenario_ids = eqbench3_scenarios if bench == "eqbench3" and eqbench3_scenarios else [""]
+            for scenario_id in scenario_ids:
+                scenario_suffix = f"-s{scenario_id}" if scenario_id else ""
+                run_id = f"{args.run_id_prefix}-{bench}{scenario_suffix}"
+                job = patch_job(
+                    template,
+                    bench=bench,
+                    scenario_id=scenario_id,
+                    run_id=run_id,
+                    generation_output=generation_output,
+                    output_root=args.output_root,
+                    python_bin=args.python_bin,
+                    preserve_template_env=args.preserve_template_env,
+                    git_branch=args.git_branch,
+                    git_commit=args.git_commit,
+                    dependency_branch=args.dependency_branch,
+                    dependency_commit=args.dependency_commit,
+                    eval_model_name=args.eval_model_name,
+                    eval_reasoning_effort=args.eval_reasoning_effort,
+                    provider_extra_body_json=args.provider_extra_body_json,
+                    provider_strip_max_tokens=args.provider_strip_max_tokens,
+                    output_uri_prefix=args.output_uri_prefix,
+                )
+                handle.write(json.dumps(job, ensure_ascii=False, separators=(",", ":")) + "\n")
+                jobs_written += 1
+    print(f"Wrote {jobs_written} jobs to {args.output}")
     return 0
 
 
