@@ -1,9 +1,0 @@
-{
-  "status": "failed",
-  "charts": [],
-  "insights": [],
-  "report_path": "",
-  "script_path": "",
-  "trajectory": "",
-  "error": "ToolRegistry.execute() got multiple values for argument 'name'"
-}
