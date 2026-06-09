@@ -33,7 +33,11 @@ def _llm_config_from_env(model_name: str | None = None) -> dict[str, Any]:
     )
     reasoning_effort = os.environ.get("REASONING_EFFORT") or os.environ.get("EVAL_REASONING_EFFORT") or ""
     config: dict[str, Any] = {
-        "provider": "openai_compatible",
+        # `harness_scaffold.adapters.cli` accepts the provider names
+        # `openai_like` and `anthropic_like`. Keep the public generated-harness
+        # contract aligned with the scaffold runtime instead of leaking the
+        # internal alias used by some benchmark wrappers.
+        "provider": "openai_like",
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
