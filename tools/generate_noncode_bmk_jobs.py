@@ -564,7 +564,7 @@ def main() -> int:
     parser.add_argument("--git-commit", default=git_value(["rev-parse", "HEAD"], ""))
     parser.add_argument("--dependency-branch", default="")
     parser.add_argument("--dependency-commit", default="")
-    parser.add_argument("--eval-model-name", default="glm-5.1")
+    parser.add_argument("--eval-model-name", default="exact:glm-5.1")
     parser.add_argument("--eval-reasoning-effort", default="high")
     parser.add_argument("--provider-extra-body-json", default='{"reasoning_effort":"high","thinking":{"type":"enabled"}}')
     parser.add_argument("--provider-strip-max-tokens", default="1")
