@@ -19,6 +19,14 @@ const PROVIDER_FIX_CACHE_CONTROL = process.env.PROVIDER_FIX_CACHE_CONTROL === '1
 const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
 const PROVIDER_RETRY_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.PROVIDER_RETRY_MAX_ATTEMPTS || '5', 10) || 5);
 const PROVIDER_RETRY_BASE_MS = Math.max(100, parseInt(process.env.PROVIDER_RETRY_BASE_MS || '2000', 10) || 2000);
+// Force upstream streaming and reassemble the full completion in the proxy.
+// Non-streaming ModelHub gateway requests are cut at ~300s, which long
+// high-effort turns on large contexts routinely exceed; a streaming
+// connection stays alive while tokens flow. The client still receives a
+// complete response in whichever shape (JSON or SSE) it asked for, and
+// upstream retry stays possible because nothing is sent to the client until
+// the upstream finishes.
+const PROVIDER_UPSTREAM_STREAM = process.env.PROVIDER_UPSTREAM_STREAM === '1' || process.env.PROVIDER_UPSTREAM_STREAM === 'true';
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 const IS_EXACT_PROVIDER_ENDPOINT = String(UPSTREAM_BASE_URL || '').toLowerCase().includes('/v2/crawl');
 
@@ -440,6 +448,10 @@ function shapeProviderRequest(bodyText) {
 
   payload.model = MODEL_NAME;
 
+  if (PROVIDER_UPSTREAM_STREAM) {
+    payload.stream = true;
+  }
+
   if (PROVIDER_EXTRA_BODY_JSON) {
     try {
       const extraBody = JSON.parse(PROVIDER_EXTRA_BODY_JSON);
@@ -543,25 +555,184 @@ function isRetriableProviderFailure(statusCode, rawBody) {
   ].some((marker) => text.includes(marker));
 }
 
-function forwardProviderRequest({ options, transport, shapedBody, res, attempt = 1 }) {
+function reassembleOpenAiStream(rawText) {
+  const completion = {
+    id: '',
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: MODEL_NAME,
+    choices: [],
+    usage: null,
+  };
+  const choiceMap = new Map();
+  let sawDone = false;
+  let sawChunk = false;
+  let sawFinish = false;
+  for (const line of String(rawText || '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (data === '[DONE]') { sawDone = true; continue; }
+    let event;
+    try { event = JSON.parse(data); } catch (e) { continue; }
+    if (!event || typeof event !== 'object') continue;
+    sawChunk = true;
+    if (event.id && !completion.id) completion.id = event.id;
+    if (event.model) completion.model = event.model;
+    if (event.created) completion.created = event.created;
+    if (event.usage) completion.usage = event.usage;
+    for (const choice of event.choices || []) {
+      const index = choice.index != null ? choice.index : 0;
+      if (!choiceMap.has(index)) {
+        choiceMap.set(index, {
+          index,
+          role: 'assistant',
+          content: '',
+          reasoningContent: '',
+          finishReason: null,
+          toolCalls: new Map(),
+        });
+      }
+      const acc = choiceMap.get(index);
+      const delta = choice.delta || choice.message || {};
+      if (delta.role) acc.role = delta.role;
+      if (typeof delta.content === 'string') acc.content += delta.content;
+      if (typeof delta.reasoning_content === 'string') acc.reasoningContent += delta.reasoning_content;
+      for (const toolDelta of delta.tool_calls || []) {
+        const tcIndex = toolDelta.index != null ? toolDelta.index : acc.toolCalls.size;
+        if (!acc.toolCalls.has(tcIndex)) {
+          acc.toolCalls.set(tcIndex, { id: '', type: 'function', function: { name: '', arguments: '' } });
+        }
+        const tc = acc.toolCalls.get(tcIndex);
+        if (toolDelta.id) tc.id = toolDelta.id;
+        if (toolDelta.type) tc.type = toolDelta.type;
+        if (toolDelta.function && toolDelta.function.name) tc.function.name = toolDelta.function.name;
+        if (toolDelta.function && typeof toolDelta.function.arguments === 'string') {
+          tc.function.arguments += toolDelta.function.arguments;
+        }
+      }
+      if (choice.finish_reason) {
+        acc.finishReason = choice.finish_reason;
+        sawFinish = true;
+      }
+    }
+  }
+  for (const acc of [...choiceMap.values()].sort((a, b) => a.index - b.index)) {
+    const message = { role: acc.role || 'assistant', content: acc.content };
+    if (acc.reasoningContent) message.reasoning_content = acc.reasoningContent;
+    if (acc.toolCalls.size) {
+      message.tool_calls = [...acc.toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, tc]) => tc);
+      if (message.content === '') message.content = null;
+    }
+    completion.choices.push({
+      index: acc.index,
+      message,
+      finish_reason: acc.finishReason || (message.tool_calls ? 'tool_calls' : 'stop'),
+    });
+  }
+  if (!completion.id) completion.id = `chatcmpl-${Date.now()}`;
+  if (!completion.usage) delete completion.usage;
+  const complete = sawChunk && completion.choices.length > 0 && (sawDone || sawFinish);
+  return { completion, complete, sawChunk };
+}
+
+function clientPayloadFromCompletion(completion, clientWantsStream) {
+  if (!clientWantsStream) {
+    return { contentType: 'application/json', body: JSON.stringify(completion) };
+  }
+  const headChoices = completion.choices.map((choice) => {
+    const delta = { role: choice.message.role };
+    if (choice.message.content) delta.content = choice.message.content;
+    if (choice.message.reasoning_content) delta.reasoning_content = choice.message.reasoning_content;
+    if (choice.message.tool_calls) {
+      delta.tool_calls = choice.message.tool_calls.map((tc, i) => ({ index: i, ...tc }));
+    }
+    return { index: choice.index, delta, finish_reason: null };
+  });
+  const tailChoices = completion.choices.map((choice) => ({
+    index: choice.index,
+    delta: {},
+    finish_reason: choice.finish_reason,
+  }));
+  const base = { id: completion.id, object: 'chat.completion.chunk', created: completion.created, model: completion.model };
+  const head = { ...base, choices: headChoices };
+  const tail = { ...base, choices: tailChoices };
+  if (completion.usage) tail.usage = completion.usage;
+  return {
+    contentType: 'text/event-stream',
+    body: `data: ${JSON.stringify(head)}\n\ndata: ${JSON.stringify(tail)}\n\ndata: [DONE]\n\n`,
+  };
+}
+
+function forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream = false, attempt = 1 }) {
+  const scheduleRetry = (reason) => {
+    const delayMs = providerRetryDelayMs(attempt);
+    console.error(`[provider_proxy] ${reason}; retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
+    setTimeout(() => {
+      forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream, attempt: attempt + 1 });
+    }, delayMs);
+  };
   const upstreamReq = transport.request(options, (upstreamRes) => {
     const chunks = [];
+    let settled = false;
+    const failStream = (err) => {
+      if (settled) return;
+      settled = true;
+      if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
+        scheduleRetry(`upstream stream failed: ${err.message}`);
+        return;
+      }
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `Upstream stream failed: ${err.message}` } }));
+    };
     upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('aborted', () => failStream(new Error('upstream connection aborted')));
+    upstreamRes.on('error', failStream);
     upstreamRes.on('end', () => {
+      if (settled) return;
+      settled = true;
       const rawBody = Buffer.concat(chunks);
+      const rawText = rawBody.toString('utf-8');
       const statusCode = upstreamRes.statusCode || 502;
       if (statusCode >= 400) {
-        console.error(`[provider_proxy] upstream ${statusCode}: ${rawBody.toString('utf-8').slice(0, 1000)}`);
+        console.error(`[provider_proxy] upstream ${statusCode}: ${rawText.slice(0, 1000)}`);
       }
-      if (
-        attempt < PROVIDER_RETRY_MAX_ATTEMPTS &&
-        isRetriableProviderFailure(statusCode, rawBody.toString('utf-8'))
-      ) {
-        const delayMs = providerRetryDelayMs(attempt);
-        console.error(`[provider_proxy] retrying upstream request attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
-        setTimeout(() => {
-          forwardProviderRequest({ options, transport, shapedBody, res, attempt: attempt + 1 });
-        }, delayMs);
+      if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS && isRetriableProviderFailure(statusCode, rawText)) {
+        scheduleRetry('retrying upstream request');
+        return;
+      }
+      if (PROVIDER_UPSTREAM_STREAM && statusCode >= 200 && statusCode < 300) {
+        const looksSse = String(upstreamRes.headers['content-type'] || '').includes('event-stream')
+          || rawText.trimStart().startsWith('data:');
+        let result = null;
+        if (looksSse) {
+          result = reassembleOpenAiStream(rawText);
+        } else {
+          try {
+            const json = JSON.parse(rawText);
+            if (json && Array.isArray(json.choices)) {
+              result = { completion: json, complete: true, sawChunk: false };
+            }
+          } catch (e) {}
+        }
+        if (!result || !result.complete) {
+          if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
+            scheduleRetry('incomplete upstream stream');
+            return;
+          }
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'Upstream stream ended prematurely' } }));
+          return;
+        }
+        const payload = clientPayloadFromCompletion(result.completion, clientWantsStream);
+        const firstChoice = result.completion.choices[0] || {};
+        console.log(
+          `[provider_proxy] ${result.sawChunk ? 'sse_reassembled' : 'json_passthrough'} `
+          + `finish=${firstChoice.finish_reason || ''} tool_calls=${(firstChoice.message && firstChoice.message.tool_calls || []).length} `
+          + `usage=${result.completion.usage ? 'api' : 'none'}`,
+        );
+        res.writeHead(200, { 'Content-Type': payload.contentType });
+        res.end(payload.body);
         return;
       }
       res.writeHead(statusCode, upstreamRes.headers);
@@ -571,11 +742,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, attempt =
 
   upstreamReq.on('error', (err) => {
     if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
-      const delayMs = providerRetryDelayMs(attempt);
-      console.error(`[provider_proxy] upstream network error: ${err.message}; retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
-      setTimeout(() => {
-        forwardProviderRequest({ options, transport, shapedBody, res, attempt: attempt + 1 });
-      }, delayMs);
+      scheduleRetry(`upstream network error: ${err.message}`);
       return;
     }
     res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -601,10 +768,14 @@ const providerProxy = http.createServer((req, res) => {
       handleAnthropicNativeProvider(req, res, originalBody);
       return;
     }
+    let clientWantsStream = false;
+    try {
+      clientWantsStream = JSON.parse(originalBody || '{}').stream === true;
+    } catch (e) {}
     const shapedBody = shapeProviderRequest(originalBody);
     const options = buildUpstreamOptions(UPSTREAM_BASE_URL, req.method, req.headers, shapedBody.length);
     const transport = options.protocol === 'https:' ? require('https') : http;
-    forwardProviderRequest({ options, transport, shapedBody, res });
+    forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream });
   });
 });
 
