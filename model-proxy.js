@@ -27,6 +27,15 @@ const PROVIDER_RETRY_BASE_MS = Math.max(100, parseInt(process.env.PROVIDER_RETRY
 // upstream retry stays possible because nothing is sent to the client until
 // the upstream finishes.
 const PROVIDER_UPSTREAM_STREAM = process.env.PROVIDER_UPSTREAM_STREAM === '1' || process.env.PROVIDER_UPSTREAM_STREAM === 'true';
+// Verbatim Anthropic passthrough with retry. Claude Code in native Anthropic
+// mode talks directly to the endpoint and only has its own small retry
+// budget; pointing ANTHROPIC_BASE_URL at this proxy adds the
+// PROVIDER_RETRY_MAX_ATTEMPTS budget for 429 quota storms. Request bodies and
+// paths pass through untouched; successful responses are piped (streaming
+// included), only pre-body failures are retried.
+const PROVIDER_ANTHROPIC_PASSTHROUGH = process.env.PROVIDER_ANTHROPIC_PASSTHROUGH === '1' || process.env.PROVIDER_ANTHROPIC_PASSTHROUGH === 'true';
+// Cap exponential retry backoff so long retry budgets stay practical.
+const PROVIDER_RETRY_MAX_DELAY_MS = Math.max(1000, parseInt(process.env.PROVIDER_RETRY_MAX_DELAY_MS || '60000', 10) || 60000);
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 const IS_EXACT_PROVIDER_ENDPOINT = String(UPSTREAM_BASE_URL || '').toLowerCase().includes('/v2/crawl');
 
@@ -535,7 +544,8 @@ function fixCacheControl(value) {
 
 function providerRetryDelayMs(attempt) {
   const jitter = Math.floor(Math.random() * 500);
-  return PROVIDER_RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)) + jitter;
+  const delay = PROVIDER_RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)) + jitter;
+  return Math.min(delay, PROVIDER_RETRY_MAX_DELAY_MS);
 }
 
 function isRetriableProviderFailure(statusCode, rawBody) {
@@ -753,6 +763,64 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
   upstreamReq.end();
 }
 
+function forwardAnthropicPassthrough({ req, res, body, attempt = 1 }) {
+  const base = String(UPSTREAM_BASE_URL || '').replace(/\/$/, '');
+  const target = new URL(base + (req.url || '/'));
+  const headers = { ...req.headers };
+  headers.host = target.host;
+  headers.authorization = `Bearer ${UPSTREAM_API_KEY}`;
+  headers['x-api-key'] = UPSTREAM_API_KEY;
+  headers['content-length'] = body.length;
+  delete headers.connection;
+  delete headers['accept-encoding'];
+  const options = {
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    path: target.pathname + target.search,
+    method: req.method,
+    headers,
+  };
+  const transport = target.protocol === 'https:' ? require('https') : http;
+  const startedAt = Date.now();
+  const upstreamReq = transport.request(options, (upstreamRes) => {
+    const statusCode = upstreamRes.statusCode || 502;
+    if (statusCode >= 400) {
+      const chunks = [];
+      upstreamRes.on('data', (chunk) => chunks.push(chunk));
+      upstreamRes.on('end', () => {
+        const rawBody = Buffer.concat(chunks);
+        const rawText = rawBody.toString('utf-8');
+        console.error(`[anthropic_passthrough] upstream ${statusCode} (${Date.now() - startedAt}ms): ${rawText.slice(0, 300)}`);
+        if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS && isRetriableProviderFailure(statusCode, rawText)) {
+          const delayMs = providerRetryDelayMs(attempt);
+          console.error(`[anthropic_passthrough] retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
+          setTimeout(() => forwardAnthropicPassthrough({ req, res, body, attempt: attempt + 1 }), delayMs);
+          return;
+        }
+        res.writeHead(statusCode, upstreamRes.headers);
+        res.end(rawBody);
+      });
+      return;
+    }
+    console.log(`[anthropic_passthrough] ${req.method} ${(req.url || '').split('?')[0]} status=${statusCode} ttfb_ms=${Date.now() - startedAt} attempt=${attempt}`);
+    res.writeHead(statusCode, upstreamRes.headers);
+    upstreamRes.pipe(res);
+  });
+  upstreamReq.on('error', (err) => {
+    if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
+      const delayMs = providerRetryDelayMs(attempt);
+      console.error(`[anthropic_passthrough] network error: ${err.message}; retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
+      setTimeout(() => forwardAnthropicPassthrough({ req, res, body, attempt: attempt + 1 }), delayMs);
+      return;
+    }
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `Anthropic passthrough error: ${err.message}` } }));
+  });
+  upstreamReq.write(body);
+  upstreamReq.end();
+}
+
 const providerProxy = http.createServer((req, res) => {
   if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -764,6 +832,10 @@ const providerProxy = http.createServer((req, res) => {
   req.on('data', (chunk) => reqChunks.push(chunk));
   req.on('end', () => {
     const originalBody = Buffer.concat(reqChunks).toString('utf-8');
+    if (PROVIDER_ANTHROPIC_PASSTHROUGH) {
+      forwardAnthropicPassthrough({ req, res, body: Buffer.from(originalBody) });
+      return;
+    }
     if (isAnthropicNativeUrl(UPSTREAM_BASE_URL)) {
       handleAnthropicNativeProvider(req, res, originalBody);
       return;

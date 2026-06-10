@@ -61,8 +61,17 @@ fi
 
 if [ "${CLAUDE_NATIVE_ANTHROPIC:-}" = "1" ]; then
     echo "=== Using native Anthropic endpoint for Claude Code ==="
-    export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-${BASE_URL}}"
-    export ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-${API_KEY}}"
+    real_anthropic_base="${ANTHROPIC_BASE_URL:-${BASE_URL}}"
+    real_anthropic_token="${ANTHROPIC_AUTH_TOKEN:-${API_KEY}}"
+    if [ "${PROVIDER_ANTHROPIC_PASSTHROUGH:-}" = "1" ]; then
+        echo "=== Starting Anthropic passthrough retry proxy ==="
+        WORKSPACE=/workspace UPSTREAM_BASE_URL="${real_anthropic_base}" UPSTREAM_API_KEY="${real_anthropic_token}" node /model-proxy.js &
+        sleep 1
+        export ANTHROPIC_BASE_URL="http://127.0.0.1:3458"
+    else
+        export ANTHROPIC_BASE_URL="${real_anthropic_base}"
+    fi
+    export ANTHROPIC_AUTH_TOKEN="${real_anthropic_token}"
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN}}"
     export CLAUDE_MODEL_NAME="${ANTHROPIC_MODEL:-${MODEL_NAME}}"
 else
