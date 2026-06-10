@@ -562,6 +562,9 @@ function isRetriableProviderFailure(statusCode, rawBody) {
     'timeout',
     'time out',
     'temporarily unavailable',
+    // Mixed crawl pools route some attempts to broken Bedrock replicas;
+    // retrying usually lands on a healthy Vertex replica.
+    'not allowed for this account',
   ].some((marker) => text.includes(marker));
 }
 
@@ -744,6 +747,45 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
         res.writeHead(200, { 'Content-Type': payload.contentType });
         res.end(payload.body);
         return;
+      }
+      // Some ModelHub crawl routes answer OpenAI-shaped requests with
+      // Anthropic Messages JSON (content blocks). Convert so OpenAI clients
+      // (generated harness LLM clients, judges) can parse the response.
+      if (statusCode >= 200 && statusCode < 300) {
+        try {
+          const json = JSON.parse(rawText);
+          if (json && !Array.isArray(json.choices) && Array.isArray(json.content)) {
+            const text = json.content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('');
+            const toolCalls = json.content
+              .filter((b) => b && b.type === 'tool_use')
+              .map((b, i) => ({
+                id: b.id || `call_${i}`,
+                type: 'function',
+                function: { name: b.name || '', arguments: JSON.stringify(b.input || {}) },
+              }));
+            const message = { role: 'assistant', content: toolCalls.length && !text ? null : text };
+            if (toolCalls.length) message.tool_calls = toolCalls;
+            const completion = {
+              id: json.id || `chatcmpl-${Date.now()}`,
+              object: 'chat.completion',
+              created: Math.floor(Date.now() / 1000),
+              model: json.model || MODEL_NAME,
+              choices: [{ index: 0, message, finish_reason: json.stop_reason === 'tool_use' ? 'tool_calls' : 'stop' }],
+            };
+            if (json.usage) {
+              completion.usage = {
+                prompt_tokens: json.usage.input_tokens || 0,
+                completion_tokens: json.usage.output_tokens || 0,
+                total_tokens: (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0),
+              };
+            }
+            const payload = clientPayloadFromCompletion(completion, clientWantsStream);
+            console.log(`[provider_proxy] anthropic_json_converted finish=${completion.choices[0].finish_reason} usage=${completion.usage ? 'api' : 'none'}`);
+            res.writeHead(200, { 'Content-Type': payload.contentType });
+            res.end(payload.body);
+            return;
+          }
+        } catch (e) {}
       }
       res.writeHead(statusCode, upstreamRes.headers);
       res.end(rawBody);
