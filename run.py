@@ -856,6 +856,8 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
         "-e", f"PROVIDER_EXTRA_BODY_JSON={os.environ.get('PROVIDER_EXTRA_BODY_JSON', '')}",
         "-e", f"PROVIDER_EXTRA_HEADERS_JSON={os.environ.get('PROVIDER_EXTRA_HEADERS_JSON', '')}",
         "-e", f"PROVIDER_STRIP_MAX_TOKENS={os.environ.get('PROVIDER_STRIP_MAX_TOKENS', '')}",
+        "-e", f"PROVIDER_RETRY_MAX_ATTEMPTS={os.environ.get('PROVIDER_RETRY_MAX_ATTEMPTS', '')}",
+        "-e", f"PROVIDER_RETRY_BASE_MS={os.environ.get('PROVIDER_RETRY_BASE_MS', '')}",
         "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
         "-e", f"PROVIDER_FIX_CACHE_CONTROL={os.environ.get('PROVIDER_FIX_CACHE_CONTROL', '')}",
         "-e", f"PROVIDER_DEFAULT_MAX_TOKENS={os.environ.get('PROVIDER_DEFAULT_MAX_TOKENS', '')}",
