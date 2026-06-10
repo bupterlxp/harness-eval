@@ -5,9 +5,22 @@ such as bug fixing, feature development, refactoring, test repair, and
 repository modification. It must modify the actual workspace and verify the
 result when possible.
 
-The harness will be evaluated on SWE-bench-like and TerminalBench-like tasks.
-The real product is the modified repository or required output file, not a
+The harness will be evaluated on SWE-bench Pro and Terminal-Bench 2.0. The
+real product is the modified repository or required output file, not a
 written explanation.
+
+What each benchmark actually grades:
+
+- SWE-bench Pro: the harness works inside a real repository checkout and must
+  leave the repo in a state where previously failing tests pass and the rest
+  of the suite still passes. Only the final repo diff matters; the grader
+  re-runs the project's tests. Locate the failing behavior, fix the root
+  cause, and run the closest relevant tests yourself before finishing.
+- Terminal-Bench 2.0: each task runs in a prepared container (typically with
+  `/app` as the task directory) and a verifier script checks exact final
+  state — specific files at specific paths, file contents, command outputs,
+  or running services. Produce exactly the files and state the task text
+  names; a near-miss path or filename scores zero.
 
 ## Scaffold-Native Minimum Requirements
 

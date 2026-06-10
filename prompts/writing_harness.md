@@ -3,7 +3,15 @@
 Build a general writing harness for creative writing, role-play, emotional
 intelligence responses, long-form continuation, rewriting, revision, and style
 control. It must output real user-readable prose that can be scored by
-WritingBench and EQbench3.
+EQbench3.
+
+EQbench3 tasks are multi-turn role-play and emotional-intelligence scenarios:
+the harness receives an in-character situation (often messy interpersonal
+conflict, support, persuasion, or boundary-setting) and a judge scores the
+response on empathy, insight into the other party's state of mind, social
+dexterity, message tailoring, and staying in character across turns. The
+scored artifact is the in-character reply itself — meta commentary, analysis
+sections, or out-of-character notes lower the score.
 
 The minimum success criterion is not documentation. It is a runnable harness
 program that produces a final writing artifact.
@@ -100,8 +108,10 @@ Minimum `result.json`:
 7. Write `result.json` and `trajectory.jsonl`.
 
 For EQbench3-style tasks, preserve emotional nuance, theory of mind, role
-consistency, and empathy across turns. For WritingBench-style tasks, optimize
-for instruction following, structure, coherence, style, and usefulness.
+consistency, and empathy across turns. Respond as the character would —
+natural register, appropriate length, no headers or bullet lists unless the
+scene itself calls for them. For general writing tasks, optimize for
+instruction following, structure, coherence, style, and usefulness.
 
 ## Verifier Requirements
 
@@ -128,7 +138,7 @@ If checks fail, do not return `success`.
 
 ## Creation Self-Test
 
-Use `DEV_BMK_COMMANDS.md` and `run_dev_bmk.py` to run public/dev
-WritingBench or EQbench3 tasks. Inspect scores, stdout/stderr, trajectory, and
+Use `DEV_BMK_COMMANDS.md` and `run_dev_bmk.py --bench eqbench3` to run
+public/dev EQbench3 tasks. Inspect scores, stdout/stderr, trajectory, and
 artifacts. Modify the harness yourself until it consistently produces
-scoreable prose, then write or say `FINISH`.
+scoreable in-character prose, then write or say `FINISH`.

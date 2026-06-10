@@ -4,9 +4,11 @@ Build a general research-agent harness that accepts research questions,
 performs information retrieval, evaluates sources, organizes evidence, and
 produces grounded answers or structured reports.
 
-The harness will be evaluated on DeepResearch/HLE-style and BrowseComp-style
-tasks. Scores depend on answer correctness and evidence quality, not report
-length.
+The harness will be evaluated on BrowseComp-style tasks: short factual
+questions whose answers are deliberately hard to find and require multi-hop
+web search to pin down. A judge compares the final answer against a hidden
+exact answer. Scores depend entirely on answer correctness — report length,
+formatting, and citation volume earn nothing on their own.
 
 ## Scaffold-Native Minimum Requirements
 
@@ -66,6 +68,22 @@ The harness must:
 - Preserve a short final answer for closed factual questions such as numbers,
   names, dates, formulas, or multiple-choice decisions.
 
+For BrowseComp-style questions specifically:
+
+- The question usually encodes several independent constraints (time range,
+  nationality, role, numeric facts). Extract each constraint explicitly and
+  use intersections of constraints to drive search, not one long query.
+- End `response.md` with a single clearly marked final line containing only
+  the exact answer (for example `Final answer: <entity>`), because an
+  automated judge matches the answer string. Do not bury the answer inside a
+  report or hedge between multiple candidates.
+- Verify the chosen candidate against every constraint in the question before
+  finishing; one violated constraint usually means the candidate is wrong.
+- Search access comes from environment-provided APIs (for example
+  `SERPER_KEY_ID`, `TAVILY_API_KEY`, `SEARCH_API_KEY`). Detect what is
+  available at startup; if no search backend works, record the missing
+  dependency and return `partial` instead of answering from memory.
+
 ## Core Harness Behavior
 
 Implement a bounded research loop:
@@ -121,7 +139,7 @@ inventing evidence.
 
 ## Dev BMK Feedback
 
-During creation, use `run_dev_bmk.py` to run public/dev DeepResearch and
+During creation, use `run_dev_bmk.py --bench browsecomp` to run public/dev
 BrowseComp tasks. Inspect accuracy, judge feedback, stdout/stderr, evidence
-files, and trajectory. Modify the harness until answers are grounded and
-scoreable, then write or say `FINISH`.
+files, and trajectory. Modify the harness until answers are grounded,
+correctly formatted for the judge, and scoreable, then write or say `FINISH`.

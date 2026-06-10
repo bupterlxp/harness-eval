@@ -130,13 +130,15 @@ Every run must write:
 
 - Code: inspect the repo, modify files or write a patch, run tests or verifier
   when feasible, and output changed files, diff/patch, commands, and results.
-- Data analysis / MLE: read train/test/sample submission. If
-  `sample_submission.csv` exists, output a compatible `submission.csv` with
-  matching columns, row count, ID order, and value domain. Do not mark an
+- Data analysis / MLE: read train/test/sample submission AND the competition
+  description. The official grader defines the submission contract, not just
+  `sample_submission.csv`: some competitions require RLE-encoded mask
+  strings, ordered ID sequences, string labels instead of probabilities, or
+  probability columns that form a distribution. Output a `submission.csv`
+  that satisfies that contract with matching columns, row count, ID order,
+  and value domain. Constant predictions make correlation/rank metrics NaN —
+  never use them as the fallback for such metrics, and do not mark an
   unsupported all-constant fallback as high-quality success.
-- Data analysis / DAComp: read data and compute numeric outputs. Reports must
-  contain concrete values, tables, or structured decisions, not only workflow
-  templates.
 - Writing: the final writing artifact must be user-readable prose, not JSON,
   CLI logs, or execution summaries. Include plan/draft/critique/revision or
   an equivalent process.

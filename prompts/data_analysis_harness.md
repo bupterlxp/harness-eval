@@ -4,9 +4,10 @@ Build a general data-analysis harness that accepts datasets and analysis
 instructions, explores the data, runs computation, creates artifacts, and
 produces benchmark-readable outputs.
 
-The harness will be evaluated on MLE-bench-like and DAComp-like tasks. Scores
-come from real artifacts such as `submission.csv`, structured reports, tables,
-and judge-readable results, not from process descriptions.
+The harness will be evaluated on MLE-bench: real Kaggle competitions scored by
+the official MLE-bench grader (`grade_csv`). The score comes from one artifact
+only: a `submission.csv` that the official grader accepts and can compute a
+numeric metric from. Reports, plans, and process descriptions earn nothing.
 
 ## Scaffold-Native Minimum Requirements
 
@@ -23,11 +24,11 @@ Requirements:
 - Do not deliver only README files, architecture notes, or disconnected helper
   modules.
 - Every run must write `result.json`, `trajectory.jsonl`, logs, and real
-  artifacts such as `submission.csv`, `REPORT.md`, `analysis_summary.json`,
-  `metrics.csv`, or plots.
-- Fallback submissions or reports may be returned as `partial`, but unsupported
-  constants, templates, and process summaries must not be marked high-quality
-  success.
+  artifacts. For competition tasks the primary artifact is `submission.csv`;
+  `REPORT.md` and summary tables are secondary diagnostics.
+- Fallback submissions may be returned as `partial`, but they must still be
+  grader-valid. Unsupported constants, templates, and process summaries must
+  not be marked high-quality success.
 
 ## Unified Entry Point
 
@@ -62,71 +63,65 @@ Minimum `result.json`:
 The harness must:
 
 - Discover `*.csv`, `*.tsv`, `*.json`, `*.parquet`, `*.xlsx`, `*.sqlite`,
-  `*.db`, `train*`, `test*`, `sample_submission*`, `README*`, and
-  `instructions*`.
+  `*.db`, `train*`, `test*`, `sample_submission*`, `README*`,
+  `description*`, and `instructions*`.
 - Treat `--workdir` as the root for input data and task files.
 - Write all final artifacts under `--output-dir`, and store absolute artifact
   paths in `result.json`.
 - On failure, still write `result.json`, `trajectory.jsonl`, error logs, and a
   best-effort report.
 
-## MLE-Bench Artifact Contract
+## MLE-Bench Grader Contract
 
-If `sample_submission.csv` exists or the task asks for a submission:
+Matching `sample_submission.csv` columns, row count, and ID order is necessary
+but NOT sufficient. The official grader enforces competition-specific
+semantics that the sample file alone does not reveal. The harness must:
 
-- Read the sample submission columns, row count, ID order, and target columns.
-- Produce `submission.csv` with the same schema.
-- Write its path to `result.json.submission_path`.
-- If modeling fails, use an explainable baseline such as majority class, mean,
-  median, or training-set statistics. Do not return no submission.
-- In `REPORT.md`, describe data used, feature processing, model or baseline,
-  validation strategy, and known limitations.
+- Read the full competition description / task instructions before modeling.
+  The required submission semantics are defined there and in the metric, not
+  only in `sample_submission.csv`.
+- Detect the prediction value type the grader expects and produce it exactly:
+  - class labels as strings vs. probabilities as floats;
+  - multi-class probability columns that must form a distribution;
+  - run-length-encoded (RLE) mask strings for segmentation tasks — an empty
+    or integer cell where an RLE string is expected makes the whole
+    submission invalid;
+  - ordered ID sequences for ranking/ordering tasks — the predicted sequence
+    must contain exactly the same elements as the ground truth, in the
+    predicted order;
+  - free-text answers for QA/normalization tasks.
+- Never submit degenerate constant predictions when the metric is a
+  correlation or rank statistic (Spearman, Pearson, AUC over a single class):
+  constants make the metric NaN or undefined and score zero. The fallback for
+  such metrics must still produce varying predictions (e.g. a simple feature
+  - based model or noisy baseline derived from training statistics, recorded
+  honestly in the report).
+- Validate the finished `submission.csv` before declaring success: same row
+  count and IDs as the sample, no missing/NaN cells, value types and ranges
+  consistent with the description, predictions not all identical unless the
+  task genuinely allows it.
+- Write the submission path to `result.json.submission_path`.
+- If modeling fails, fall back to the strongest grader-valid baseline
+  available (majority class, per-group mean/median, training-set statistics)
+  rather than returning no submission — but keep the value-type and
+  non-degeneracy rules above.
 
-The prediction value domain must match the sample/task contract. For example,
-boolean labels must be booleans, not probabilities.
-
-## DAComp Artifact Contract
-
-For open-ended data-analysis reports:
-
-- Generate `REPORT.md` with problem understanding, data checks, key
-  calculations, conclusions, and limitations.
-- Generate at least one machine-readable artifact such as
-  `analysis_summary.json`, `metrics.csv`, `risk_scores.csv`, or
-  `credit_allocation.csv`.
-- Save charts under `--output-dir` and reference them in the report.
-
-For credit, invoice, or business-risk tasks, include:
-
-- entity-level metric table
-- risk-tier rule, such as A/B/C or low/medium/high
-- credit allocation plan whose total matches the stated budget
-- interest-rate or pricing policy tied to risk and churn
-- conclusion table with entity counts, allocation share, suggested rate, and
-  risk explanation
-- a machine-readable summary file
-
-Low-quality reports must fail internal verification:
-
-- only listing files
-- only listing steps
-- no real calculations
-- no numeric results
-- no entity-level or group-level table when the task asks for decisions
-- generic template conclusions
+In `REPORT.md`, describe data used, feature processing, model or baseline,
+validation strategy, and known limitations.
 
 ## Core Harness Behavior
 
 Implement a Plan-Code-Observe loop:
 
-1. Parse the task and expected artifact type.
+1. Parse the task, the competition description, and the expected submission
+   semantics.
 2. Discover files and infer schema.
 3. Build a compact data summary.
 4. Execute Python/pandas or SQL in a controlled workspace.
 5. Validate intermediate outputs.
 6. Train or compute a baseline/model when needed.
-7. Write final submission/report/tables/charts.
-8. Verify artifact schema and semantic minimums.
+7. Write the final submission and diagnostics.
+8. Verify the submission against the grader contract above.
 9. Write result and trajectory.
 
 The harness should keep a stateful Python namespace when useful, capture stdout
@@ -150,7 +145,9 @@ Always preserve logs, attempted commands, and best-effort artifacts.
 
 ## Dev BMK Feedback
 
-During creation, use `run_dev_bmk.py` to run public/dev MLE-bench and DAComp
-tasks. Inspect submission validity, DAComp scores, stdout/stderr, artifacts,
-and trajectory. Modify the harness yourself until it reliably produces
-benchmark-readable artifacts, then write or say `FINISH`.
+During creation, use `run_dev_bmk.py --bench mle_bench` to run public/dev
+MLE-bench tasks. Inspect `valid_submission`, the numeric score, grader
+stdout/stderr, artifacts, and trajectory. A run where `valid_submission` is
+false or the score is null/NaN is a failure signal you must fix. Modify the
+harness yourself until it reliably produces grader-valid submissions, then
+write or say `FINISH`.

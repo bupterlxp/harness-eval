@@ -4,9 +4,24 @@ Build a general browser-automation harness that accepts web tasks such as
 navigation, form filling, data extraction, file download, multi-page
 workflows, and long-horizon digital employee actions.
 
-The harness will be evaluated on TheAgentCompany or similar browser/workflow
-benchmarks. Evaluation checks real environment state and action traces, not
-only written explanations.
+The harness will be evaluated on TheAgentCompany: long-horizon digital
+employee tasks inside a simulated company environment with real self-hosted
+services (GitLab, ownCloud, RocketChat, Plane). Evaluation is programmatic:
+checkpoint scripts inspect the final environment state — files created or
+moved, repository contents, chat messages sent, tickets updated — and the
+score is the fraction of checkpoints satisfied. Written explanations satisfy
+no checkpoint.
+
+Practical implications:
+
+- Real state changes are what count. Use whatever interface reliably changes
+  service state: HTTP/REST API calls, git operations, or browser actions.
+- Service endpoints, hostnames, and credentials come from the task
+  description and environment; discover and reuse them instead of assuming
+  defaults.
+- Tasks often have several checkpoints. Completing some checkpoints scores
+  partial credit, so finish as many independent subgoals as possible even if
+  one step is blocked.
 
 ## Scaffold-Native Minimum Requirements
 
