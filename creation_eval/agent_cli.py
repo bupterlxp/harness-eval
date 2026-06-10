@@ -44,6 +44,33 @@ def _llm_config_from_env(model_name: str | None = None) -> dict[str, Any]:
     return config
 
 
+def _policy_config_from_env() -> dict[str, Any]:
+    """Build optional scaffold runtime policy overrides from eval env vars.
+
+    The generated scaffold-native programs receive their per-run limits through
+    the public model_config.json contract. Provider proxies may retry rate
+    limits for several minutes, so cluster eval jobs need to raise the LLM
+    client timeout without editing the generated harness artifact itself.
+    """
+
+    fields: dict[str, tuple[str, type]] = {
+        "max_seconds": ("EVAL_HARNESS_MAX_SECONDS", float),
+        "max_steps": ("EVAL_HARNESS_MAX_STEPS", int),
+        "max_tool_seconds": ("EVAL_HARNESS_MAX_TOOL_SECONDS", float),
+        "max_llm_seconds": ("EVAL_HARNESS_MAX_LLM_SECONDS", float),
+    }
+    policy: dict[str, Any] = {}
+    for key, (env_name, caster) in fields.items():
+        raw = os.environ.get(env_name) or os.environ.get(env_name.replace("EVAL_", "", 1))
+        if raw in (None, ""):
+            continue
+        try:
+            policy[key] = caster(raw)
+        except (TypeError, ValueError):
+            continue
+    return policy
+
+
 def _write_task_files(
     output_dir: Path,
     *,
@@ -68,7 +95,7 @@ def _write_task_files(
         model_config_json,
         {
             "llm": _llm_config_from_env(model_name),
-            "policy": {},
+            "policy": _policy_config_from_env(),
             "include_optional_tools": True,
         },
     )
