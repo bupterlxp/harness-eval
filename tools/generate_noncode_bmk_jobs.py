@@ -315,6 +315,8 @@ trap 'rc=$?; export CLUSTER_EXIT_RC="$rc"; finalize_cluster_artifacts' EXIT
 
 {strip_max}
 {provider_extra}
+export PROVIDER_RETRY_MAX_ATTEMPTS="${{PROVIDER_RETRY_MAX_ATTEMPTS:-8}}"
+export PROVIDER_RETRY_BASE_MS="${{PROVIDER_RETRY_BASE_MS:-3000}}"
 export EVAL_MODEL_NAME="${{EVAL_MODEL_NAME:-{eval_model_name}}}"
 export EVAL_REASONING_EFFORT="${{EVAL_REASONING_EFFORT:-{eval_reasoning_effort}}}"
 export EVAL_PROVIDER_PROXY_PORT="${{EVAL_PROVIDER_PROXY_PORT:-4568}}"
