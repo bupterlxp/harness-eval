@@ -63,15 +63,6 @@ enable_dev_bmk_feedback: true
 dev_bmk_task_limit: 3
 harness_evolve_root: "/Users/bytedance/Downloads/harness evolve project"
 
-# Self-evolve 默认设置。run_self_evolve.py 仍然可以用命令行覆盖这些项。
-# mode=goal: 给 harness 一个目标，让它根据 BMK 分数/轨迹自我迭代。
-# mode=commit: 给一串 human-commit 转写任务，让 agent 实现同等功能，再和 human reference 比较。
-self_evolve:
-  mode: "goal"
-  rounds: 3
-  goal: "Improve the generated harness so it scores higher on the selected downstream benchmark while preserving the standard CLI and artifact contract."
-  evolution_tasks_file: "./self_evolve_tasks.example.jsonl"
-
 # Docker settings
 max_concurrent: 4
 # RQ1 正式 creation 默认不设 timeout；如需 pilot/debug 可临时设置分钟数。
