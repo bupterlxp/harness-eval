@@ -967,11 +967,41 @@ const server = http.createServer((req, res) => {
   }
 });
 
+// Node 18+ defaults server.requestTimeout to 300000ms and destroys the
+// inbound socket when a response takes longer — proxies that hold a request
+// while retrying or while the upstream model thinks for >5 minutes get cut
+// at ~302s and the client sees a 500. The upstream gateway allows 1800s, so
+// disable the per-request deadline here (0 = no limit) and keep a sane
+// headers timeout.
+const SERVER_REQUEST_TIMEOUT_MS = Math.max(0, parseInt(process.env.PROXY_SERVER_REQUEST_TIMEOUT_MS || '0', 10) || 0);
+for (const srv of [server, providerProxy]) {
+  srv.requestTimeout = SERVER_REQUEST_TIMEOUT_MS;
+  srv.headersTimeout = 120000;
+  srv.timeout = 0;
+}
+
+// The metrics relay (PROXY_PORT) is only used by the Claude Code chain. When
+// a second proxy instance runs inside the same container for dev-BMK eval,
+// that port may already be taken by the creation-side proxy — that must not
+// kill the eval provider proxy, which binds its own dedicated port.
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`[model_proxy] metrics relay port ${PROXY_PORT} already in use; continuing with provider proxy only`);
+    return;
+  }
+  console.error(`[model_proxy] metrics relay server error: ${err.message}`);
+});
+
+providerProxy.on('error', (err) => {
+  console.error(`[provider_proxy] fatal server error: ${err.message}`);
+  process.exit(1);
+});
+
 server.listen(PROXY_PORT, '127.0.0.1', () => {
-  console.log(`Model proxy listening on 127.0.0.1:${PROXY_PORT}, forwarding to CCR on ${CCR_PORT}`);
+  console.log(`Model proxy listening on 127.0.0.1:${PROXY_PORT}, forwarding to CCR on ${CCR_PORT} (requestTimeout=${SERVER_REQUEST_TIMEOUT_MS || 'disabled'})`);
 });
 
 providerProxy.listen(PROVIDER_PROXY_PORT, PROVIDER_PROXY_HOST, () => {
   const effort = OPENROUTER_VERBOSITY || 'default';
-  console.log(`Provider proxy listening on ${PROVIDER_PROXY_HOST}:${PROVIDER_PROXY_PORT}, upstream effort=${effort}`);
+  console.log(`Provider proxy listening on ${PROVIDER_PROXY_HOST}:${PROVIDER_PROXY_PORT}, upstream effort=${effort} (requestTimeout=${SERVER_REQUEST_TIMEOUT_MS || 'disabled'})`);
 });

@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y \
 
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     appdirs \
+    diskcache \
+    py7zr \
+    tenacity \
+    tqdm \
     numpy \
     pandas \
     pyyaml \

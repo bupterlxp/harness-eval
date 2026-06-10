@@ -14,7 +14,7 @@ cat > "$HOME/.claude-code-router/config.json" <<EOF
   "HOST": "127.0.0.1",
   "PORT": 3456,
   "APIKEY": "",
-  "API_TIMEOUT_MS": "${api_timeout_ms}",
+  "API_TIMEOUT_MS": ${api_timeout_ms},
   "PROXY_URL": "",
   "NON_INTERACTIVE_MODE": true,
   "transformers": [],

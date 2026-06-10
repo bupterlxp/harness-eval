@@ -1,12 +1,39 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from creation_eval.model_aliases import resolve_model_alias
+
+
+def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def resolve_provider_proxy_port(preferred: int) -> int:
+    """Use the preferred provider-proxy port unless it (or the metrics relay
+    port right below it) is taken — e.g. by the creation container's own
+    Claude Code proxy on 3457/3458. Falling back to an ephemeral free port
+    lets dev-BMK eval proxies coexist with the creation proxy."""
+    if _port_is_free(preferred) and _port_is_free(max(1, preferred - 1)):
+        return preferred
+    return _pick_free_port()
 
 
 @dataclass
@@ -96,6 +123,7 @@ def configure_eval_llm(
             upstream_url = resolved_base_url.rstrip("/")
         else:
             upstream_url = normalize_chat_completions_url(resolved_base_url)
+        provider_proxy_port = resolve_provider_proxy_port(provider_proxy_port)
         host_base = f"http://127.0.0.1:{provider_proxy_port}/v1"
         container_base = f"http://host.docker.internal:{provider_proxy_port}/v1"
         os.environ.update(
@@ -148,6 +176,16 @@ def configure_eval_llm(
         if log_path is None:
             log_path = harness_eval_root / "eval_provider_proxy.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # The proxy writes metrics relative to WORKSPACE/cwd by default; inside
+        # creation containers harness-eval is mounted read-only, so point the
+        # metrics file at the writable eval output directory explicitly.
+        proxy_env["METRICS_PATH"] = str(log_path.parent / "eval_proxy_metrics.json")
+        proxy_env["WORKSPACE"] = str(log_path.parent)
+        # Creation containers may run their own proxy in Anthropic passthrough
+        # mode and that env var would be inherited here. The eval proxy serves
+        # OpenAI-shaped requests from generated harnesses, so it must use the
+        # converting anthropic-native handler instead of verbatim passthrough.
+        proxy_env["PROVIDER_ANTHROPIC_PASSTHROUGH"] = ""
         log_handle = log_path.open("a", encoding="utf-8")
         process = subprocess.Popen(
             ["node", str(harness_eval_root / "model-proxy.js")],

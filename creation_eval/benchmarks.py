@@ -1149,6 +1149,12 @@ def run_mlebench_generated(
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(mle_root) + os.pathsep + env.get("PYTHONPATH", "")
+    # mlebench creates a diskcache directory relative to the cwd at import
+    # time. mle_root may be a read-only mount inside creation containers, so
+    # run the registry/grader subprocesses from a writable scratch dir; the
+    # import works through PYTHONPATH either way.
+    mle_work_dir = output_dir / "mlebench_work"
+    mle_work_dir.mkdir(parents=True, exist_ok=True)
     if _is_all(competition_config):
         list_code = """
 import json
@@ -1157,7 +1163,7 @@ from mlebench.registry import registry
 reg = registry.set_data_dir(Path(%r))
 print(json.dumps(reg.list_competition_ids()))
 """ % str(data_dir)
-        listed = run_command([python_bin, "-c", list_code], cwd=mle_root, env=env, timeout=120)
+        listed = run_command([python_bin, "-c", list_code], cwd=mle_work_dir, env=env, timeout=120)
         if listed.returncode != 0:
             return HarnessRunResult(
                 status="skipped/missing_dependency",
@@ -1264,7 +1270,7 @@ print(json.dumps({{
   "description": competition.description[:4000]
 }}))
 """
-    check = run_command([python_bin, "-c", check_code], cwd=mle_root, env=env, timeout=120)
+    check = run_command([python_bin, "-c", check_code], cwd=mle_work_dir, env=env, timeout=120)
     if check.returncode != 0:
         return HarnessRunResult(status="skipped/missing_dependency", missing_dependencies=[check.stderr[-1000:] or check.stdout[-1000:]], stdout_path=str(stdout_path), stderr_path=str(stderr_path))
     info = json.loads(check.stdout.strip().splitlines()[-1])
@@ -1373,7 +1379,7 @@ except AssertionError as exc:
     }}
 print(json.dumps(payload, default=str))
 """
-    grade = run_command([python_bin, "-c", grade_code], cwd=mle_root, env=env, timeout=timeout)
+    grade = run_command([python_bin, "-c", grade_code], cwd=mle_work_dir, env=env, timeout=timeout)
     stdout_path.write_text((result.stdout_path and Path(result.stdout_path).read_text(encoding="utf-8", errors="replace") or "") + "\n\n=== grade ===\n" + grade.stdout, encoding="utf-8")
     stderr_path.write_text((result.stderr_path and Path(result.stderr_path).read_text(encoding="utf-8", errors="replace") or "") + "\n\n=== grade ===\n" + grade.stderr, encoding="utf-8")
     if grade.returncode != 0:
