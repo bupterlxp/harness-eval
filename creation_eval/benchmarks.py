@@ -1260,8 +1260,17 @@ print(json.dumps({{
         f"Competition description:\n{info.get('description', '')}\n\n"
         f"Public data directory: {info['public_dir']}\n"
         f"Sample submission: {info['sample_submission']}\n"
-        f"Write a valid submission CSV into this output directory: {task_workspace}\n"
-        "Use the same columns and row ids as the sample submission."
+        f"Write your submission CSV into this output directory: {task_workspace}\n"
+        "Submission requirements:\n"
+        "- The official grader scores the submission CSV; follow the exact format the\n"
+        "  competition description defines, not just the sample submission header.\n"
+        "- Match the sample submission columns, row ids, and row order, and produce the\n"
+        "  prediction value type the grader expects (string labels vs probabilities,\n"
+        "  RLE-encoded mask strings, ordered id sequences, or free text).\n"
+        "- Leave no missing or NaN cells.\n"
+        "- If the metric is a correlation or rank statistic, constant predictions score\n"
+        "  zero or NaN; produce varying predictions even when falling back to a baseline.\n"
+        "- Validate the finished submission against these rules before finishing."
     )
     result = run_agent_cli(
         artifact.path,
