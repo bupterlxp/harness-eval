@@ -180,6 +180,13 @@ missing_dependencies
 
 正式分数只来自 downstream BMK。Public validation / creation-dev feedback 只用于 creation 阶段调试和诊断，不伪造成正式分数。
 
+## 仓库维护说明
+
+- **RQ2 / self-evolve**：`run_self_evolve.py`、`self_evolve/` 已从本分支（RQ1 主线）移除，RQ2 代码以 `self-evolve` 分支为 source of truth；历史版本可从本分支删除 commit 之前的提交找回。
+- **`harbor_generated_harness_agent.py`**：本地 `terminal_2_bench` runner 通过 `harbor run --agent-import-path harbor_generated_harness_agent:GeneratedHarnessAgent` 使用该文件，不是遗留代码，不要删除。
+- **git 内追踪的 `outputs/` artifact**：`.gitignore` 默认忽略 `outputs/`，但 4 个 creation run 的 artifact 被有意提交，因为平台 job 按 `gitRepo.commitSha` clone 本仓库取 harness（`/opt/tiger/Harness_evolve/outputs/...`）。在平台侧改为从 HDFS 下载 artifact 之前，不要 untrack 这些目录；之后应改走 HDFS 并停止向 git 提交新 artifact。
+- **本地实验产物**：`eval_results/`、`logs/`、`exports/`、`memory.md` 均不入 git；已废弃 BMK（DAComp/WritingBench/DeepResearch/LongBench-Write）的旧结果和 verify-*/smoke-* 调试 run 统一移入 `archive/`（gitignored），写聚合脚本时不要扫 `archive/`。
+
 ## Secrets
 
 不要提交 API key、Kaggle token、HDFS token、平台票据或本地实验输出。使用环境变量、忽略的本地配置文件或任务平台 secret 注入。

@@ -24,3 +24,6 @@ self_evolve_outputs/
 analysis_outputs/
 cache/
 logs/
+memory.md
+archive/
+reports/
