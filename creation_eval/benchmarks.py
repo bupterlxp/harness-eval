@@ -4,10 +4,10 @@ import csv
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
-import sqlite3
 import statistics
 import subprocess
 import time
@@ -211,6 +211,33 @@ def _aggregate_harness_tokens(results: list[HarnessRunResult]) -> tuple[int | No
         merged["per_task"] = per_task
     total = _token_total(merged)
     return total, merged
+
+
+def _sum_interactions(results: list[HarnessRunResult]) -> int | None:
+    values = [result.interactions for result in results if result.interactions is not None]
+    if not values:
+        return None
+    return int(sum(values))
+
+
+def _classify_mle_grade_report(report: dict[str, Any]) -> tuple[str, float | None]:
+    """Map an MLE-bench grade report to an honest (eval_status, score) pair.
+
+    Only a real numeric metric value counts as success. Submissions the
+    grader rejects (valid_submission false) and null/NaN metric values must
+    not be reported as scored successes.
+    """
+    try:
+        score = float(report.get("score"))
+        if math.isnan(score):
+            score = None
+    except (TypeError, ValueError):
+        score = None
+    if report.get("valid_submission") is False:
+        return "failed/invalid_submission", None
+    if score is None:
+        return "failed/non_numeric_score", None
+    return "success", score
 
 
 def _apply_result_token_fallback(result: HarnessRunResult, *paths: str | Path | None) -> HarnessRunResult:
@@ -541,25 +568,6 @@ def _decrypt_xor(ciphertext_b64: str, password: str) -> str:
     encrypted = base64.b64decode(ciphertext_b64)
     key = _derive_key(password, len(encrypted))
     return bytes(a ^ b for a, b in zip(encrypted, key)).decode()
-
-
-def _export_sqlite_tables(sqlite_path: Path, output_dir: Path) -> list[Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    exported: list[Path] = []
-    with sqlite3.connect(sqlite_path) as conn:
-        table_rows = conn.execute(
-            "select name from sqlite_master where type='table' and name not like 'sqlite_%'"
-        ).fetchall()
-        for (table_name,) in table_rows:
-            target = output_dir / f"{table_name}.csv"
-            cursor = conn.execute(f'SELECT * FROM "{table_name}"')
-            columns = [desc[0] for desc in cursor.description or []]
-            with target.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(columns)
-                writer.writerows(cursor.fetchall())
-            exported.append(target)
-    return exported
 
 
 def run_swebench_generated(
@@ -961,382 +969,6 @@ def run_eqbench3(
     parsed.stdout_path = str(stdout_path)
     parsed.stderr_path = str(stderr_path)
     return parsed
-
-
-def run_dacomp_generated(
-    artifact: HarnessArtifact,
-    entry: dict[str, Any],
-    output_dir: Path,
-    *,
-    harness_evolve_root: Path,
-    python_bin: str,
-    timeout: int,
-    dry_run: bool,
-) -> HarnessRunResult:
-    run_id = output_dir.name
-    dacomp_root = harness_evolve_root / "harness_house" / "DAComp"
-    eval_root = dacomp_root / "dacomp-da" / "evaluation_suite"
-    task_file = dacomp_root / "dacomp-da" / "tasks" / "dacomp-da.jsonl"
-    stdout_path = output_dir / "dacomp_stdout.log"
-    stderr_path = output_dir / "dacomp_stderr.log"
-    score_dir = output_dir / "model_scores"
-    model_dir = output_dir / "agent_results" / f"generated-harness-{run_id}"
-
-    if dry_run:
-        return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(score_dir), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
-
-    all_tasks = _load_jsonl(task_file)
-    task_ids = entry.get("task_ids", "all")
-    if task_ids is None:
-        task_ids = "all"
-    if isinstance(task_ids, str):
-        if task_ids.strip().lower() == "all":
-            tasks = all_tasks
-        else:
-            selected_ids = [item.strip() for item in task_ids.split(",") if item.strip()]
-            tasks = [task for task in all_tasks if task.get("instance_id") in set(selected_ids)]
-            task_ids = selected_ids
-    else:
-        selected_ids = [str(item).strip() for item in task_ids if str(item).strip()]
-        if len(selected_ids) == 1 and selected_ids[0].lower() == "all":
-            tasks = all_tasks
-            task_ids = "all"
-        else:
-            tasks = [task for task in all_tasks if task.get("instance_id") in set(selected_ids)]
-            task_ids = selected_ids
-    tasks = _limit_sequence(tasks, entry.get("n_limit"), default=None)
-    if not tasks:
-        return HarnessRunResult(status="failed", error=f"No DAComp tasks selected from {task_file}: {task_ids}")
-
-    env = os.environ.copy()
-    env["SEED2LITE_API_KEY"] = env.get("SEED2LITE_API_KEY", env.get("API_KEY", ""))
-    env["SEED2LITE_BASE_URL"] = env.get("SEED2LITE_BASE_URL", env.get("BASE_URL", "http://ark-cn-beijing.bytedance.net/api/v3"))
-    env["SEED2LITE_CHAT_COMPLETIONS_URL_HTTP"] = env.get(
-        "SEED2LITE_CHAT_COMPLETIONS_URL_HTTP",
-        env["SEED2LITE_BASE_URL"].rstrip("/") + "/chat/completions",
-    )
-    env["API_URL"] = env["SEED2LITE_CHAT_COMPLETIONS_URL_HTTP"]
-    env["AUTH_TOKEN"] = env["SEED2LITE_API_KEY"]
-    env["PYTHONPATH"] = str(eval_root) + os.pathsep + env.get("PYTHONPATH", "")
-    judge_model = str(entry.get("judge_model") or env.get("DACOMP_JUDGE_MODEL_CONFIG") or "ep-20260214145701-frz7j")
-
-    harness_results: list[HarnessRunResult] = []
-    for task in tasks:
-        instance_id = str(task["instance_id"])
-        task_workspace = output_dir / "task_workspaces" / instance_id
-        task_workspace.mkdir(parents=True, exist_ok=True)
-        sqlite_src = dacomp_root / "dacomp-da" / "tasks" / instance_id / f"{instance_id}.sqlite"
-        table_summary = "No sqlite task data was found."
-        if sqlite_src.exists():
-            sqlite_dst = task_workspace / sqlite_src.name
-            shutil.copy2(sqlite_src, sqlite_dst)
-            exported = _export_sqlite_tables(sqlite_dst, task_workspace)
-            table_summary = "Exported sqlite tables:\n" + "\n".join(f"- {path.name}" for path in exported)
-        prompt = (
-            f"You are solving DAComp data-analysis task {instance_id}.\n"
-            f"Instruction:\n{task.get('instruction', '')}\n\n"
-            f"Task data directory: {task_workspace}\n{table_summary}\n\n"
-            "Produce a complete English markdown report with quantitative analysis, conclusions, and any referenced chart files."
-        )
-        harness_result = run_agent_cli(
-            artifact.path,
-            "data_analysis",
-            prompt,
-            output_dir / "harness_outputs" / instance_id,
-            task_work_dir=task_workspace,
-            python_bin=python_bin,
-            timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
-        )
-        harness_results.append(harness_result)
-        response = _read_harness_response(harness_result)
-        instance_dir = model_dir / instance_id
-        instance_dir.mkdir(parents=True, exist_ok=True)
-        (instance_dir / f"{instance_id}.md").write_text(response, encoding="utf-8")
-        (instance_dir / f"{instance_id}-traj.txt").write_text(
-            json.dumps(
-                {
-                    "cli_status": harness_result.status,
-                    "raw_result_path": harness_result.raw_result_path,
-                    "stdout_path": harness_result.stdout_path,
-                    "stderr_path": harness_result.stderr_path,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-    judge_timeout = int(entry.get("judge_timeout", min(timeout, 240)))
-    judge = run_command(
-        [
-            python_bin,
-            "llm_judge.py",
-            "--rubrics-model",
-            judge_model,
-            "--gsb-model-text",
-            judge_model,
-            "--gsb-model-vis",
-            judge_model,
-            "--inputs",
-            str(model_dir),
-            "--output-dir",
-            str(score_dir),
-            "--max-workers",
-            str(entry.get("threads", 1)),
-            "--language",
-            "en",
-        ],
-        cwd=eval_root,
-        env=env,
-        timeout=judge_timeout,
-    )
-    score_csvs = [
-        path
-        for path in score_dir.glob("*.csv")
-        if path.name != "overall_results.csv"
-    ]
-    if judge.returncode != 0 and not score_csvs:
-        stdout_path.write_text("\n\n=== harness ===\n" + "\n".join(r.stdout_path for r in harness_results) + "\n\n=== judge ===\n" + judge.stdout, encoding="utf-8")
-        stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr, encoding="utf-8")
-        return HarnessRunResult(
-            status="failed/timeout" if judge.returncode == 124 else "failed",
-            stdout_path=str(stdout_path),
-            stderr_path=str(stderr_path),
-            raw_result_path=str(score_dir),
-            error=(judge.stderr or judge.stdout)[-2000:],
-        )
-    score = run_command(
-        [python_bin, "get_score.py", "--scores-dir", str(score_dir), "--src-dir", "src"],
-        cwd=eval_root,
-        env=env,
-        timeout=600,
-    )
-    stdout_path.write_text("\n\n=== harness ===\n" + "\n".join(r.stdout_path for r in harness_results) + "\n\n=== judge ===\n" + judge.stdout + "\n\n=== score ===\n" + score.stdout, encoding="utf-8")
-    stderr_path.write_text("\n\n=== judge ===\n" + judge.stderr + "\n\n=== score ===\n" + score.stderr, encoding="utf-8")
-    if score.returncode != 0:
-        return HarnessRunResult(
-            status="failed/timeout" if score.returncode == 124 else "failed",
-            stdout_path=str(stdout_path),
-            stderr_path=str(stderr_path),
-            raw_result_path=str(score_dir),
-            error=(score.stderr or score.stdout or judge.stderr or judge.stdout)[-2000:],
-        )
-
-    overall = score_dir / "overall_results.csv"
-    rows = list(csv.DictReader(overall.open("r", encoding="utf-8"))) if overall.exists() else []
-    total = None
-    breakdown: dict[str, Any] = {"tasks": [task["instance_id"] for task in tasks], "metric": "DAComp weighted total"}
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
-    if rows:
-        row = rows[0]
-        breakdown.update(row)
-        try:
-            total = float(row.get("total") or "")
-        except ValueError:
-            total = None
-    return HarnessRunResult(
-        status="success" if total is not None else "failed",
-        score=total,
-        raw_result_path=str(overall if overall.exists() else score_dir),
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
-        score_breakdown=breakdown,
-        harness_run_tokens=harness_tokens,
-        token_breakdown=token_breakdown,
-        interactions=len(harness_results),
-    )
-
-
-def run_writingbench_generated(
-    artifact: HarnessArtifact,
-    entry: dict[str, Any],
-    output_dir: Path,
-    *,
-    harness_eval_root: Path,
-    python_bin: str,
-    timeout: int,
-    dry_run: bool,
-) -> HarnessRunResult:
-    bench_root = harness_eval_root / "external_benchmarks" / "WritingBench"
-    query_file = bench_root / "benchmark_query" / "benchmark_all.jsonl"
-    responses_path = output_dir / "writingbench_responses.jsonl"
-    scores_path = output_dir / "writingbench_scores.jsonl"
-    stdout_path = output_dir / "writingbench_stdout.log"
-    stderr_path = output_dir / "writingbench_stderr.log"
-    if dry_run:
-        return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(responses_path), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
-
-    all_rows = _load_jsonl(query_file)
-    lang = str(entry.get("lang", "en"))
-    filtered_rows = all_rows if lang.lower() == "all" else [row for row in all_rows if row.get("lang") == lang]
-    selected = _limit_sequence(filtered_rows, entry.get("n_limit"), default=1)
-    if not selected:
-        selected = _limit_sequence(all_rows, entry.get("n_limit"), default=1)
-    criteria_limit = _limit_value(entry.get("criteria_limit"), default=5)
-    harness_results: list[HarnessRunResult] = []
-    response_rows: list[dict[str, Any]] = []
-    score_rows: list[dict[str, Any]] = []
-    total_judge_tokens = 0
-    for row in selected:
-        result = run_agent_cli(
-            artifact.path,
-            "writing",
-            str(row["query"]),
-            output_dir / "harness_outputs" / f"index_{row['index']}",
-            python_bin=python_bin,
-            timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
-        )
-        harness_results.append(result)
-        response = _read_harness_response(result)
-        response_rows.append({"index": row["index"], "response": response, "cli_status": result.status})
-        criteria_scores: dict[str, list[dict[str, Any]]] = {}
-        checklist = row.get("checklist", [])
-        if criteria_limit is not None:
-            checklist = checklist[:criteria_limit]
-        for criteria in checklist:
-            prompt = f"""You are an expert evaluator with extensive experience in evaluating responses to writing queries.
-
-Evaluate the Response based on the Query and Criteria. Assign an integer score from 1 to 10 and provide a concrete reason.
-
-Return only JSON:
-{{"score": 1, "reason": "specific reason"}}
-
-Criteria:
-{json.dumps(criteria, ensure_ascii=False)}
-
-Query:
-{row["query"]}
-
-Response:
-{response}
-"""
-            content, usage = _call_chat(prompt, prefix="WRITINGBENCH_JUDGE", max_tokens=2048, temperature=0)
-            total_judge_tokens += int((usage or {}).get("total_tokens") or 0)
-            parsed = _extract_json_object(content) or {"score": None, "reason": content}
-            criteria_scores.setdefault(str(criteria.get("name", "criteria")), []).append(parsed)
-        score_rows.append({"index": row["index"], "scores": criteria_scores})
-    write_jsonl(responses_path, response_rows)
-    write_jsonl(scores_path, score_rows)
-    stdout_path.write_text("\n".join(r.stdout_path for r in harness_results), encoding="utf-8")
-    stderr_path.write_text("\n".join(r.stderr_path for r in harness_results), encoding="utf-8")
-    numeric_scores: list[float] = []
-    for score_row in score_rows:
-        for entries in score_row["scores"].values():
-            for item in entries:
-                try:
-                    numeric_scores.append(float(item.get("score")))
-                except (TypeError, ValueError):
-                    continue
-    score = statistics.mean(numeric_scores) * 10 if numeric_scores else None
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
-    return HarnessRunResult(
-        status="success" if score is not None else "failed",
-        score=score,
-        pass_rate=sum(1 for value in numeric_scores if value >= 7) / len(numeric_scores) if numeric_scores else None,
-        raw_result_path=str(scores_path),
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
-        harness_run_tokens=harness_tokens,
-        token_breakdown=token_breakdown,
-        score_breakdown={
-            "metric": "WritingBench average criterion score x10",
-            "queries": len(selected),
-            "criterion_scores": len(numeric_scores),
-            "judge_tokens": total_judge_tokens or None,
-        },
-        interactions=len(harness_results),
-    )
-
-
-def run_deepresearch_generated(
-    artifact: HarnessArtifact,
-    entry: dict[str, Any],
-    output_dir: Path,
-    *,
-    harness_evolve_root: Path,
-    python_bin: str,
-    timeout: int,
-    dry_run: bool,
-) -> HarnessRunResult:
-    data_path = harness_evolve_root / "harness_house" / "DeepResearch" / "DeepResearch" / "eval_data" / "hle_test.jsonl"
-    pred_path = output_dir / "deepresearch_predictions.jsonl"
-    details_path = output_dir / "deepresearch_eval_details.jsonl"
-    report_path = output_dir / "deepresearch_report.json"
-    stdout_path = output_dir / "deepresearch_stdout.log"
-    stderr_path = output_dir / "deepresearch_stderr.log"
-    if dry_run:
-        return HarnessRunResult(status="skipped/dry_run", raw_result_path=str(report_path), stdout_path=str(stdout_path), stderr_path=str(stderr_path))
-
-    all_rows = _load_jsonl(data_path)
-    rows = [
-        row
-        for row in all_rows
-        if "Uploaded " not in str(row.get("question", ""))
-        and not re.search(r"\.(jpg|jpeg|png|webp|gif)\b", str(row.get("question", "")), re.IGNORECASE)
-    ]
-    rows = _limit_sequence(rows, entry.get("n_limit"), default=1)
-    predictions: list[dict[str, Any]] = []
-    details: list[dict[str, Any]] = []
-    harness_results: list[HarnessRunResult] = []
-    harness_failures = 0
-    correct_count = 0
-    total_judge_tokens = 0
-    for idx, row in enumerate(rows):
-        result = run_agent_cli(
-            artifact.path,
-            "research",
-            str(row["question"]),
-            output_dir / "harness_outputs" / f"item_{idx}",
-            python_bin=python_bin,
-            timeout=min(timeout, int(entry.get("harness_timeout", timeout))),
-        )
-        harness_results.append(result)
-        response = _read_harness_response(result)
-        if result.status != "success" or not response.strip():
-            harness_failures += 1
-            predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "cli_status": result.status})
-            details.append(
-                {
-                    "question": row["question"],
-                    "answer": row.get("answer", ""),
-                    "prediction": response,
-                    "correct": False,
-                    "cli_status": result.status,
-                    "harness_error": result.error,
-                }
-            )
-            continue
-        correct, detail = _judge_short_answer(str(row["question"]), str(row.get("answer", "")), response, prefix="DEEPRESEARCH_JUDGE")
-        total_judge_tokens += int((detail.get("usage") or {}).get("total_tokens") or 0)
-        correct_count += int(correct)
-        predictions.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "cli_status": result.status})
-        details.append({"question": row["question"], "answer": row.get("answer", ""), "prediction": response, "correct": correct, **detail})
-    write_jsonl(pred_path, predictions)
-    write_jsonl(details_path, details)
-    evaluated_count = len(rows) - harness_failures
-    accuracy = correct_count / len(rows) if rows and harness_failures == 0 else None
-    write_json(report_path, {"accuracy": accuracy, "count": len(rows), "evaluated_count": evaluated_count, "harness_failures": harness_failures, "details_path": str(details_path)})
-    stdout_path.write_text("\n".join(r.stdout_path for r in harness_results), encoding="utf-8")
-    stderr_path.write_text("\n".join(r.stderr_path for r in harness_results), encoding="utf-8")
-    status = "success" if accuracy is not None else ("harness_failed" if harness_failures else "failed")
-    harness_tokens, token_breakdown = _aggregate_harness_tokens(harness_results)
-    return HarnessRunResult(
-        status=status,
-        score=accuracy,
-        pass_rate=accuracy,
-        raw_result_path=str(report_path),
-        stdout_path=str(stdout_path),
-        stderr_path=str(stderr_path),
-        harness_run_tokens=harness_tokens,
-        token_breakdown=token_breakdown,
-        score_breakdown={
-            "metric": "HLE-style short-answer judge accuracy",
-            "items": len(rows),
-            "harness_failures": harness_failures,
-            "judge_tokens": total_judge_tokens or None,
-        },
-        interactions=len(harness_results),
-    )
 
 
 def run_browsecomp_generated(
@@ -2125,36 +1757,6 @@ def run_benchmark(
             timeout=timeout,
             dry_run=dry_run,
         )
-    if runner == "dacomp_generated":
-        return run_dacomp_generated(
-            artifact,
-            entry,
-            output_dir,
-            harness_evolve_root=harness_evolve_root,
-            python_bin=python_bin,
-            timeout=timeout,
-            dry_run=dry_run,
-        )
-    if runner == "writingbench_generated":
-        return run_writingbench_generated(
-            artifact,
-            entry,
-            output_dir,
-            harness_eval_root=harness_eval_root,
-            python_bin=python_bin,
-            timeout=timeout,
-            dry_run=dry_run,
-        )
-    if runner == "deepresearch_generated":
-        return run_deepresearch_generated(
-            artifact,
-            entry,
-            output_dir,
-            harness_evolve_root=harness_evolve_root,
-            python_bin=python_bin,
-            timeout=timeout,
-            dry_run=dry_run,
-        )
     if runner == "browsecomp_generated":
         return run_browsecomp_generated(
             artifact,
@@ -2208,12 +1810,7 @@ def base_row(
     entry: dict[str, Any],
     result: HarnessRunResult,
 ) -> dict[str, Any]:
-    if validation.pre_bmk_gate_mode == "off" or validation.pre_bmk_gate_pass is None:
-        end_to_end_score = result.score
-    elif validation.pre_bmk_gate_pass:
-        end_to_end_score = result.score
-    else:
-        end_to_end_score = 0.0
+    end_to_end_score = result.score
     result = _apply_result_token_fallback(result)
     harness_tokens = result.tokens if result.tokens is not None else result.harness_run_tokens
     return {
@@ -2229,23 +1826,11 @@ def base_row(
         "benchmark_id": entry.get("id", ""),
         "generation_status": validation.generation_status,
         "creation_attempts": validation.creation_attempts,
-        "repair_rounds": validation.repair_rounds,
-        "gate_pass_before_repair": validation.gate_pass_before_repair,
-        "gate_pass_after_repair": validation.gate_pass_after_repair,
-        "repair_failure_reasons": validation.repair_failure_reasons,
-        "repair_tokens": validation.repair_tokens,
-        "selected_attempt_path": validation.selected_attempt_path,
         "syntax_ok": validation.syntax_ok,
         "import_ok": validation.import_ok,
         "cli_probe_ok": validation.cli_probe_ok,
         "cli_status": validation.cli_status,
         "harness_invocation": "python -m harness run",
-        "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
-        "gate_pass": validation.pre_bmk_gate_pass,
-        "gate_failure_reason": validation.pre_bmk_failure_reason,
-        "toy_task_score": validation.pre_bmk_toy_task_score,
-        "static_check_pass": validation.pre_bmk_static_pass,
-        "artifact_check_pass": validation.pre_bmk_artifact_pass,
         "eval_status": result.status,
         "score": result.score,
         "end_to_end_score": end_to_end_score,

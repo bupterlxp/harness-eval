@@ -18,23 +18,11 @@ SUMMARY_FIELDS = [
     "benchmark_id",
     "generation_status",
     "creation_attempts",
-    "repair_rounds",
-    "gate_pass_before_repair",
-    "gate_pass_after_repair",
-    "repair_failure_reasons",
-    "repair_tokens",
-    "selected_attempt_path",
     "syntax_ok",
     "import_ok",
     "cli_probe_ok",
     "cli_status",
     "harness_invocation",
-    "pre_bmk_gate_mode",
-    "gate_pass",
-    "gate_failure_reason",
-    "toy_task_score",
-    "static_check_pass",
-    "artifact_check_pass",
     "eval_status",
     "score",
     "end_to_end_score",
@@ -70,12 +58,6 @@ class ValidationResult:
     cli_status: str = "not_checked"
     generation_tokens: int | None = None
     creation_attempts: int | None = None
-    repair_rounds: int | None = None
-    gate_pass_before_repair: bool | None = None
-    gate_pass_after_repair: bool | None = None
-    repair_failure_reasons: list[str] = field(default_factory=list)
-    repair_tokens: int | None = None
-    selected_attempt_path: str = ""
     harness_run_tokens: int | None = None
     harness_run_interactions: int | None = None
     missing_dependencies: list[str] = field(default_factory=list)
@@ -84,14 +66,6 @@ class ValidationResult:
     stderr_path: str = ""
     raw_result_path: str = ""
     creation_profile: str = ""
-    pre_bmk_gate_mode: str = "off"
-    pre_bmk_gate_pass: bool | None = None
-    pre_bmk_gate_status: str = "not_run"
-    pre_bmk_toy_task_score: float | None = None
-    pre_bmk_static_pass: bool | None = None
-    pre_bmk_artifact_pass: bool | None = None
-    pre_bmk_failure_reason: str = ""
-    pre_bmk_report_path: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
 

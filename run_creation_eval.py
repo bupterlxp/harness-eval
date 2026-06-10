@@ -31,10 +31,7 @@ def apply_max_tasks_per_bmk(matrix: list[dict], limit: int) -> list[dict]:
         item = dict(entry)
         item["n_limit"] = limit
         runner = str(item.get("runner") or "")
-        if runner == "dacomp_generated":
-            item["task_ids"] = "all"
-            item["n_limit"] = limit
-        elif runner == "eqbench3":
+        if runner == "eqbench3":
             item["default_subset"] = str(limit)
         elif runner == "the_agent_company_generated":
             item["task_image_name"] = "all"
@@ -74,9 +71,6 @@ def main() -> int:
     parser.add_argument("--eval-provider-proxy-port", type=int, default=3458)
     parser.add_argument("--dry-run", action="store_true", help="Validate and dependency-check only; do not launch BMK commands.")
     parser.add_argument("--max-tasks-per-bmk", type=int, default=0, help="Limit each BMK to this many public/dev tasks. Omit for full eval.")
-    parser.add_argument("--pre-bmk-gate", default="off", choices=["off", "soft", "hard"], help=argparse.SUPPRESS)
-    parser.add_argument("--pre-bmk-timeout-seconds", type=int, default=300, help=argparse.SUPPRESS)
-    parser.add_argument("--refresh-pre-bmk-gate", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--proxy-smoke-for-unsupported",
         action="store_true",
@@ -125,7 +119,6 @@ def main() -> int:
         rows = []
         for artifact in artifacts:
             validation = validate_artifact(artifact, python_bin=python_bin)
-            validation.pre_bmk_gate_mode = "off"
             validation.creation_profile = str(validation.meta.get("creation_profile") or "")
             validation.meta["eval_model"] = eval_model_resolved or ""
             validation.meta["eval_model_input"] = eval_model_input
@@ -137,24 +130,11 @@ def main() -> int:
                 "creation_profile": validation.creation_profile,
                 "generation_status": validation.generation_status,
                 "creation_attempts": validation.creation_attempts,
-                "repair_rounds": validation.repair_rounds,
-                "gate_pass_before_repair": validation.gate_pass_before_repair,
-                "gate_pass_after_repair": validation.gate_pass_after_repair,
-                "repair_failure_reasons": validation.repair_failure_reasons,
-                "repair_tokens": validation.repair_tokens,
-                "selected_attempt_path": validation.selected_attempt_path,
                 "syntax_ok": validation.syntax_ok,
                 "import_ok": validation.import_ok,
                 "cli_probe_ok": validation.cli_probe_ok,
                 "cli_status": validation.cli_status,
                 "harness_invocation": harness_invocation,
-                "pre_bmk_gate_mode": validation.pre_bmk_gate_mode,
-                "gate_pass": validation.pre_bmk_gate_pass,
-                "gate_failure_reason": validation.pre_bmk_failure_reason,
-                "toy_task_score": validation.pre_bmk_toy_task_score,
-                "static_check_pass": validation.pre_bmk_static_pass,
-                "artifact_check_pass": validation.pre_bmk_artifact_pass,
-                "pre_bmk_report_path": validation.pre_bmk_report_path,
                 "missing_dependencies": validation.missing_dependencies,
                 "errors": validation.errors,
             }
@@ -196,8 +176,6 @@ def main() -> int:
                 "bench": args.bench,
                 "domain": args.domain,
                 "dry_run": args.dry_run,
-                "pre_bmk_gate": "off",
-                "public_validation_gate": "disabled",
                 "max_tasks_per_bmk": args.max_tasks_per_bmk,
                 "proxy_smoke_for_unsupported": args.proxy_smoke_for_unsupported,
                 "eval_model_name": eval_model_resolved,

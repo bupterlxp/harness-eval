@@ -1066,9 +1066,6 @@ def run_task(task: dict, config: dict, output_dir: Path) -> dict:
 
     meta = _generation_meta(task, config, status=status, stdout=stdout, stderr=stderr)
     meta["creation_attempts"] = 1
-    meta["repair_rounds"] = 0
-    meta["external_repair_loop"] = "disabled"
-    meta["formal_public_gate"] = "disabled"
     meta["dev_bmk_runs_index"] = str((task_output_dir / "dev_bmk_runs" / "index.jsonl").resolve()) if (task_output_dir / "dev_bmk_runs" / "index.jsonl").exists() else ""
     _attach_generation_metrics(meta, task_output_dir)
 
@@ -1156,30 +1153,6 @@ def parse_args() -> argparse.Namespace:
         "--docker-memory",
         default=None,
         help="Memory limit passed to each Claude Code Docker creation container, e.g. 16g.",
-    )
-    parser.add_argument(
-        "--pre-bmk-gate",
-        default=None,
-        choices=["off", "soft", "hard"],
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--creation-repair-rounds",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--repair-gate",
-        default=None,
-        choices=["public-contract"],
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--repair-mode",
-        default=None,
-        choices=["same-workspace"],
-        help=argparse.SUPPRESS,
     )
     parser.add_argument("--no-system-prompt", action="store_true", help="Do not prepend system prompt.")
     parser.add_argument("--max-concurrent", type=int, default=None)
