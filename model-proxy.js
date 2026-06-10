@@ -17,6 +17,8 @@ const PROVIDER_STRIP_MAX_TOKENS = process.env.PROVIDER_STRIP_MAX_TOKENS === '1' 
 const PROVIDER_STRIP_CACHE_CONTROL = process.env.PROVIDER_STRIP_CACHE_CONTROL === '1' || process.env.PROVIDER_STRIP_CACHE_CONTROL === 'true';
 const PROVIDER_FIX_CACHE_CONTROL = process.env.PROVIDER_FIX_CACHE_CONTROL === '1' || process.env.PROVIDER_FIX_CACHE_CONTROL === 'true';
 const PROVIDER_DEFAULT_MAX_TOKENS = process.env.PROVIDER_DEFAULT_MAX_TOKENS || '';
+const PROVIDER_RETRY_MAX_ATTEMPTS = Math.max(1, parseInt(process.env.PROVIDER_RETRY_MAX_ATTEMPTS || '5', 10) || 5);
+const PROVIDER_RETRY_BASE_MS = Math.max(100, parseInt(process.env.PROVIDER_RETRY_BASE_MS || '2000', 10) || 2000);
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
 const IS_EXACT_PROVIDER_ENDPOINT = String(UPSTREAM_BASE_URL || '').toLowerCase().includes('/v2/crawl');
 
@@ -519,6 +521,71 @@ function fixCacheControl(value) {
   }
 }
 
+function providerRetryDelayMs(attempt) {
+  const jitter = Math.floor(Math.random() * 500);
+  return PROVIDER_RETRY_BASE_MS * Math.pow(2, Math.max(0, attempt - 1)) + jitter;
+}
+
+function isRetriableProviderFailure(statusCode, rawBody) {
+  if ([429, 502, 503, 504, 529].includes(Number(statusCode))) {
+    return true;
+  }
+  const text = String(rawBody || '').toLowerCase();
+  return [
+    'qpm limit',
+    'rate limit',
+    'too many requests',
+    'gateway',
+    'time-out',
+    'timeout',
+    'time out',
+    'temporarily unavailable',
+  ].some((marker) => text.includes(marker));
+}
+
+function forwardProviderRequest({ options, transport, shapedBody, res, attempt = 1 }) {
+  const upstreamReq = transport.request(options, (upstreamRes) => {
+    const chunks = [];
+    upstreamRes.on('data', (chunk) => chunks.push(chunk));
+    upstreamRes.on('end', () => {
+      const rawBody = Buffer.concat(chunks);
+      const statusCode = upstreamRes.statusCode || 502;
+      if (statusCode >= 400) {
+        console.error(`[provider_proxy] upstream ${statusCode}: ${rawBody.toString('utf-8').slice(0, 1000)}`);
+      }
+      if (
+        attempt < PROVIDER_RETRY_MAX_ATTEMPTS &&
+        isRetriableProviderFailure(statusCode, rawBody.toString('utf-8'))
+      ) {
+        const delayMs = providerRetryDelayMs(attempt);
+        console.error(`[provider_proxy] retrying upstream request attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
+        setTimeout(() => {
+          forwardProviderRequest({ options, transport, shapedBody, res, attempt: attempt + 1 });
+        }, delayMs);
+        return;
+      }
+      res.writeHead(statusCode, upstreamRes.headers);
+      res.end(rawBody);
+    });
+  });
+
+  upstreamReq.on('error', (err) => {
+    if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
+      const delayMs = providerRetryDelayMs(attempt);
+      console.error(`[provider_proxy] upstream network error: ${err.message}; retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
+      setTimeout(() => {
+        forwardProviderRequest({ options, transport, shapedBody, res, attempt: attempt + 1 });
+      }, delayMs);
+      return;
+    }
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: `Upstream proxy error: ${err.message}` } }));
+  });
+
+  upstreamReq.write(shapedBody);
+  upstreamReq.end();
+}
+
 const providerProxy = http.createServer((req, res) => {
   if (!UPSTREAM_BASE_URL || !UPSTREAM_API_KEY) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -537,27 +604,7 @@ const providerProxy = http.createServer((req, res) => {
     const shapedBody = shapeProviderRequest(originalBody);
     const options = buildUpstreamOptions(UPSTREAM_BASE_URL, req.method, req.headers, shapedBody.length);
     const transport = options.protocol === 'https:' ? require('https') : http;
-
-    const upstreamReq = transport.request(options, (upstreamRes) => {
-      const chunks = [];
-      upstreamRes.on('data', (chunk) => chunks.push(chunk));
-      upstreamRes.on('end', () => {
-        const rawBody = Buffer.concat(chunks);
-        if ((upstreamRes.statusCode || 0) >= 400) {
-          console.error(`[provider_proxy] upstream ${upstreamRes.statusCode}: ${rawBody.toString('utf-8').slice(0, 1000)}`);
-        }
-        res.writeHead(upstreamRes.statusCode, upstreamRes.headers);
-        res.end(rawBody);
-      });
-    });
-
-    upstreamReq.on('error', (err) => {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Upstream proxy error: ${err.message}` } }));
-    });
-
-    upstreamReq.write(shapedBody);
-    upstreamReq.end();
+    forwardProviderRequest({ options, transport, shapedBody, res });
   });
 });
 
