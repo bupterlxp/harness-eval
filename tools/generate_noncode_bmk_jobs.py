@@ -536,7 +536,14 @@ print(json.dumps(registry.list_competition_ids()))
     ids = json.loads(out.strip().splitlines()[-1])
     if not ids:
         raise RuntimeError(f"No MLE competitions parsed from {mle_root}")
-    return [str(item) for item in ids]
+    sys.path.insert(0, str(harness_eval_root))
+    from creation_eval.mle_dev_split import formal_competition_ids
+
+    formal_ids = formal_competition_ids([str(item) for item in ids])
+    excluded = sorted(set(str(item) for item in ids) - set(formal_ids))
+    if excluded:
+        print(f"[mle] excluding dev competitions from formal jobs: {', '.join(excluded)}", file=sys.stderr)
+    return formal_ids
 
 
 def main() -> int:

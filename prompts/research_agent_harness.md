@@ -30,6 +30,17 @@ Requirements:
 - If search APIs or web access are unavailable, record missing dependencies and
   return `partial`; do not fabricate URLs, citations, or evidence.
 
+## Runtime LLM Requirement
+
+The harness must use the runtime LLM provided by the scaffold (the `llm`
+object passed to `GeneratedHarnessProgram.run`) as its reasoning engine —
+for example task interpretation, strategy selection, code or content
+generation, and self-review. How you use it is your design decision, but a
+harness that completes tasks without a single LLM call is a hard-coded
+pipeline, not a harness, and is non-compliant: downstream eval records
+`llm_used=false` for such runs and they are excluded from harness-quality
+comparison.
+
 ## Unified Entry Point
 
 ```bash

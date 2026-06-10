@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent_cli import read_harness_response as read_agent_cli_response, run_agent_cli
+from .mle_dev_split import competition_ids_override, formal_competition_ids
 from .schema import HarnessArtifact, HarnessRunResult, ValidationResult
 from .token_usage import (
     extract_harness_token_usage,
@@ -1165,6 +1166,15 @@ print(json.dumps(reg.list_competition_ids()))
                 stderr_path=str(stderr_path),
             )
         competition_ids = json.loads(listed.stdout.strip().splitlines()[-1])
+        override_ids = competition_ids_override()
+        excluded_dev_ids: list[str] = []
+        if override_ids is not None:
+            allowed = set(override_ids)
+            competition_ids = [cid for cid in competition_ids if cid in allowed]
+        else:
+            formal_ids = formal_competition_ids(competition_ids)
+            excluded_dev_ids = [cid for cid in competition_ids if cid not in set(formal_ids)]
+            competition_ids = formal_ids
         competition_ids = _limit_sequence(competition_ids, entry.get("n_limit"), default=None)
         child_results: list[dict[str, Any]] = []
         child_run_results: list[HarnessRunResult] = []
@@ -1217,6 +1227,7 @@ print(json.dumps(reg.list_competition_ids()))
             "scored_competitions": len(scores),
             "missing_or_failed_competitions": len(competition_ids) - len(scores),
             "status_counts": status_counts,
+            "excluded_dev_competitions": excluded_dev_ids,
             "score": statistics.mean(scores) if scores else None,
             "child_results": child_results,
         }
@@ -1273,16 +1284,11 @@ print(json.dumps({{
         f"Public data directory: {info['public_dir']}\n"
         f"Sample submission: {info['sample_submission']}\n"
         f"Write your submission CSV into this output directory: {task_workspace}\n"
-        "Submission requirements:\n"
-        "- The official grader scores the submission CSV; follow the exact format the\n"
-        "  competition description defines, not just the sample submission header.\n"
-        "- Match the sample submission columns, row ids, and row order, and produce the\n"
-        "  prediction value type the grader expects (string labels vs probabilities,\n"
-        "  RLE-encoded mask strings, ordered id sequences, or free text).\n"
-        "- Leave no missing or NaN cells.\n"
-        "- If the metric is a correlation or rank statistic, constant predictions score\n"
-        "  zero or NaN; produce varying predictions even when falling back to a baseline.\n"
-        "- Validate the finished submission against these rules before finishing."
+        "The official grader scores only the submission CSV. The required submission\n"
+        "format is defined by this competition's own description and sample submission;\n"
+        "read both first, then produce predictions in exactly that format. Before\n"
+        "finishing, validate the file: same ids and row count as the sample submission,\n"
+        "no missing cells, and value types consistent with what the description asks for."
     )
     result = run_agent_cli(
         artifact.path,
@@ -1833,6 +1839,11 @@ def base_row(
     end_to_end_score = result.score
     result = _apply_result_token_fallback(result)
     harness_tokens = result.tokens if result.tokens is not None else result.harness_run_tokens
+    status_str = str(result.status or "")
+    if status_str.startswith("skipped") or status_str.startswith("proxy_smoke"):
+        llm_used = None
+    else:
+        llm_used = bool((harness_tokens or 0) > 0 or (result.interactions or 0) > 0)
     return {
         "generation_model": artifact.generation_model,
         "eval_model": validation.meta.get("eval_model") or "",
@@ -1861,6 +1872,7 @@ def base_row(
         "harness_run_tokens": harness_tokens,
         "harness_run_token_breakdown": result.token_breakdown,
         "harness_run_interactions": result.interactions,
+        "llm_used": llm_used,
         "generation_tokens": validation.generation_tokens,
         "missing_dependencies": result.missing_dependencies or validation.missing_dependencies,
         "stdout_path": result.stdout_path or validation.stdout_path,

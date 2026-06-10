@@ -100,6 +100,9 @@ Forbidden:
 - Output only a traditional `harness/` package without a scaffold program.
 - Treat a fixed template, file list, or execution plan as success.
 - Bypass trajectory, result, and artifact contracts.
+- Ship a program that never calls the provided LLM. Every run must include at
+  least one real LLM call recorded in the trajectory; a purely hard-coded
+  pipeline is non-compliant and is marked `llm_used=false` in downstream eval.
 
 ## Downstream Interface
 

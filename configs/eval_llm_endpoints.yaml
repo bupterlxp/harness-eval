@@ -1,0 +1,56 @@
+# Eval-time LLM endpoints for creation dev-BMK self-tests and local downstream eval.
+#
+# run.py reads this file when eval_base_url / eval_api_key / eval_model_name are
+# not already set via config.yaml, CLI flags, or environment variables, and
+# injects the selected entry as EVAL_BASE_URL / EVAL_API_KEY / EVAL_MODEL_NAME /
+# EVAL_REASONING_EFFORT into the creation environment (Claude Code container or
+# Codex process). That is what lets the creation agent actually run
+# `run_dev_bmk.py` against a real eval LLM.
+#
+# To add a test model: paste its endpoint into the matching entry below and
+# select it with `--eval-endpoint <name>` (or set `eval_endpoint: <name>` in
+# config.yaml). Entries with an empty base_url are skipped.
+default: gpt55-high
+
+endpoints:
+  gpt55-high:
+    base_url: "https://aidp.bytedance.net/api/modelhub/online/v2/crawl?ak=N16bpo05MD3SG9fKfX0cD3ScUu5lwBdC"
+    api_key: "N16bpo05MD3SG9fKfX0cD3ScUu5lwBdC"
+    model_name: "gpt-5.5-2026-04-24"
+    reasoning_effort: "high"
+
+  glm51-high:
+    base_url: ""
+    api_key: ""
+    model_name: "glm-5.1"
+    reasoning_effort: "high"
+
+  seed20-high:
+    base_url: ""
+    api_key: ""
+    model_name: ""
+    reasoning_effort: "high"
+
+  qwen37-high:
+    base_url: ""
+    api_key: ""
+    model_name: ""
+    reasoning_effort: "high"
+
+  gemini31-high:
+    base_url: ""
+    api_key: ""
+    model_name: ""
+    reasoning_effort: "high"
+
+  k26-high:
+    base_url: ""
+    api_key: ""
+    model_name: ""
+    reasoning_effort: "high"
+
+  claude47-high:
+    base_url: ""
+    api_key: ""
+    model_name: ""
+    reasoning_effort: "high"

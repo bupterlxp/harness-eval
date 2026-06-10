@@ -33,6 +33,7 @@ SUMMARY_FIELDS = [
     "harness_run_tokens",
     "harness_run_token_breakdown",
     "harness_run_interactions",
+    "llm_used",
     "generation_tokens",
     "missing_dependencies",
     "stdout_path",

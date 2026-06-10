@@ -27,6 +27,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from creation_eval.mle_dev_split import MLE_DEV_COMPETITIONS
 from creation_eval.model_aliases import (
     BUILTIN_CODEX_MODEL_ALIASES,
     BUILTIN_MODEL_ALIASES,
@@ -123,6 +124,8 @@ def apply_cli_overrides(config: dict, args: argparse.Namespace) -> dict:
         "eval_api_key": args.eval_api_key,
         "eval_model_name": args.eval_model_name,
         "eval_reasoning_effort": args.eval_reasoning_effort,
+        "eval_endpoint": args.eval_endpoint,
+        "eval_endpoints_file": args.eval_endpoints_file,
         "meta_harness": args.meta_harness,
         "codex_bin": args.codex_bin,
         "codex_sandbox": args.codex_sandbox,
@@ -219,6 +222,41 @@ def print_model_aliases(config: dict) -> None:
     merged_codex.update({str(key).strip().lower().replace(" ", ""): str(value) for key, value in codex_aliases.items()})
     for key, value in sorted(merged_codex.items()):
         print(f"{key}: {value}")
+
+
+def apply_eval_endpoint_defaults(config: dict) -> None:
+    """Fill eval LLM settings from configs/eval_llm_endpoints.yaml when unset.
+
+    The selected endpoint is what the creation agent's `run_dev_bmk.py` uses to
+    drive the generated harness against real dev BMK tasks, so creation runs
+    must always end up with a usable EVAL_BASE_URL/EVAL_API_KEY/EVAL_MODEL_NAME.
+    Explicit config.yaml values, CLI flags, and environment variables win.
+    """
+    if config.get("eval_base_url") and config.get("eval_api_key") and config.get("eval_model_name"):
+        return
+    endpoints_file = Path(str(config.get("eval_endpoints_file") or HARNESS_EVAL_ROOT / "configs" / "eval_llm_endpoints.yaml"))
+    if not endpoints_file.exists():
+        return
+    try:
+        import yaml  # type: ignore
+
+        payload = yaml.safe_load(endpoints_file.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return
+    endpoints = payload.get("endpoints") or {}
+    name = str(config.get("eval_endpoint") or payload.get("default") or "")
+    entry = endpoints.get(name) or {}
+    if not entry or not str(entry.get("base_url") or "").strip():
+        return
+    if not config.get("eval_base_url"):
+        config["eval_base_url"] = str(entry.get("base_url") or "")
+    if not config.get("eval_api_key"):
+        config["eval_api_key"] = str(entry.get("api_key") or "")
+    if not config.get("eval_model_name"):
+        config["eval_model_name"] = str(entry.get("model_name") or "")
+    if not config.get("eval_reasoning_effort"):
+        config["eval_reasoning_effort"] = str(entry.get("reasoning_effort") or "")
+    config["eval_endpoint_used"] = name
 
 
 def validate_generation_config(config: dict) -> None:
@@ -579,9 +617,12 @@ def install_dev_bmk_feedback_tools(workspace: Path, task: dict, config: dict) ->
         "harness_eval_root": "/harness-eval",
         "harness_evolve_root": "/harness-evolve",
         "output_root": "dev_bmk_runs",
+        "mle_dev_competitions": list(MLE_DEV_COMPETITIONS),
         "notes": (
             "Use run_dev_bmk.py during creation to test the current harness on public/dev BMK tasks. "
-            "These runs are for the creation agent's own feedback, not a public validation gate."
+            "These runs are for the creation agent's own feedback, not a public validation gate. "
+            "MLE-bench dev runs are restricted to the fixed dev competitions; formal eval uses the "
+            "disjoint official competition split."
         ),
     }
     (workspace / "dev_bmk_config.json").write_text(
@@ -628,6 +669,15 @@ Each run writes under `dev_bmk_runs/<timestamp>/`:
 
 Use these files, plus any generated `trajectory.jsonl`, harness artifacts, and
 stdout/stderr, to decide what to change.
+
+## MLE-bench dev competitions
+
+MLE-bench dev runs are restricted to this fixed dev set (identical for every
+generation model, disjoint from the formal eval competitions):
+
+```text
+{", ".join(MLE_DEV_COMPETITIONS)}
+```
 
 ## Finish condition
 
@@ -732,6 +782,9 @@ def main() -> int:
         env["EVAL_BASE_URL"] = env.get("BASE_URL", "")
     if not env.get("EVAL_MODEL_NAME"):
         env["EVAL_MODEL_NAME"] = env.get("MODEL_NAME", "")
+    dev_competitions = [str(item) for item in (CONFIG.get("mle_dev_competitions") or []) if str(item).strip()]
+    if dev_competitions and not env.get("MLEBENCH_COMPETITION_IDS"):
+        env["MLEBENCH_COMPETITION_IDS"] = ",".join(dev_competitions)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     print("Running public/dev BMK feedback:")
@@ -822,6 +875,14 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
     docker_memory = str(config.get("docker_memory") or os.environ.get("HARNESS_EVAL_DOCKER_MEMORY") or "").strip()
     if docker_memory:
         docker_command[2:2] = ["--memory", docker_memory, "--memory-swap", docker_memory]
+    # Mount prepared MLE-bench data so creation-time dev BMK runs can grade
+    # real competitions inside the container.
+    mle_data_dir = Path(os.environ.get("MLEBENCH_DATA_DIR") or (Path.home() / ".cache" / "mle-bench" / "data")).expanduser()
+    if mle_data_dir.exists():
+        docker_command.extend([
+            "-v", f"{mle_data_dir.resolve()}:/mle-bench-data:ro",
+            "-e", "MLEBENCH_DATA_DIR=/mle-bench-data",
+        ])
     for name in passthrough_env_names:
         if os.environ.get(name):
             docker_command.extend(["-e", f"{name}={os.environ[name]}"])
@@ -896,8 +957,6 @@ def run_codex_generation(task_id: str, workspace: str, config: dict, timeout: in
         str(config["model_name"]),
         "-s",
         str(config.get("codex_sandbox") or "workspace-write"),
-        "-a",
-        "never",
         "--skip-git-repo-check",
         "--output-last-message",
         str(output_last_message),
@@ -924,6 +983,22 @@ def run_codex_generation(task_id: str, workspace: str, config: dict, timeout: in
                 "model_name": "MODEL_NAME",
             }[key]
             env[env_key] = str(config[key])
+    # Give the Codex creation agent the same dev BMK environment that the
+    # Claude Code container receives, so run_dev_bmk.py can call a real eval
+    # LLM and grade prepared MLE dev competitions.
+    if config.get("eval_base_url"):
+        env.setdefault("EVAL_BASE_URL", str(config["eval_base_url"]))
+    if config.get("eval_api_key"):
+        env.setdefault("EVAL_API_KEY", str(config["eval_api_key"]))
+    if config.get("eval_model_name"):
+        env.setdefault("EVAL_MODEL_NAME", str(config["eval_model_name"]))
+    if config.get("eval_reasoning_effort") or config.get("reasoning_effort"):
+        env.setdefault("EVAL_REASONING_EFFORT", str(config.get("eval_reasoning_effort") or config.get("reasoning_effort")))
+    env.setdefault("HARNESS_EVAL_ROOT", str(HARNESS_EVAL_ROOT))
+    env.setdefault("HARNESS_EVOLVE_ROOT", str(Path(str(config.get("harness_evolve_root") or DEFAULT_HARNESS_EVOLVE_ROOT)).expanduser()))
+    codex_mle_data = Path(os.environ.get("MLEBENCH_DATA_DIR") or (Path.home() / ".cache" / "mle-bench" / "data")).expanduser()
+    if codex_mle_data.exists():
+        env.setdefault("MLEBENCH_DATA_DIR", str(codex_mle_data.resolve()))
     try:
         result = subprocess.run(
             command,
@@ -1182,6 +1257,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-base-url", default=None, help="OpenAI-compatible base URL or chat completions URL for eval-time harness LLM. Defaults to generation --base-url.")
     parser.add_argument("--eval-api-key", default=None, help="API key for eval-time harness LLM. Defaults to generation --api-key.")
     parser.add_argument("--eval-model-name", default=None, help="Model used by the generated harness during downstream eval. Defaults to generation --model-name.")
+    parser.add_argument("--eval-endpoint", default=None, help="Named entry in configs/eval_llm_endpoints.yaml used to fill eval LLM settings when not set explicitly.")
+    parser.add_argument("--eval-endpoints-file", default=None, help="Path to the eval LLM endpoints YAML (default configs/eval_llm_endpoints.yaml).")
     parser.add_argument(
         "--eval-reasoning-effort",
         default=None,
@@ -1258,6 +1335,7 @@ def main():
     args = parse_args()
     config = resolve_config_models(apply_cli_overrides(load_config(args.config), args))
     config["creation_profile"] = normalize_creation_profile(str(config.get("creation_profile") or "claude_code_scaffold_native"))
+    apply_eval_endpoint_defaults(config)
 
     if args.list_model_aliases:
         print_model_aliases(config)

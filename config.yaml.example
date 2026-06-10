@@ -40,7 +40,11 @@ model_aliases:
   Claude4.7: "anthropic/claude-opus-4.7"
 
 # 下游 eval 时，被测 generated harness 调用的 LLM。
-# 不填时，run.py --eval-after 默认复用上面的 generation LLM 配置。
+# 不填时，run.py 先查 configs/eval_llm_endpoints.yaml（按 eval_endpoint 选条目，
+# 默认取文件里的 default），让 creation 阶段的 run_dev_bmk.py 一定有可用的
+# eval LLM；其他测试模型的 endpoint 直接粘贴进那个文件即可。
+# eval_endpoint: "gpt55-high"
+# eval_endpoints_file: "./configs/eval_llm_endpoints.yaml"
 # eval_base_url: "https://your-api-endpoint.example.com/v1/chat/completions"
 # eval_api_key: "your-api-key-here"
 # eval_model_name: "your-eval-model-name"
