@@ -265,3 +265,76 @@ def extract_harness_token_usage_from_result(result: Any) -> dict[str, Any]:
         getattr(result, "stdout_path", ""),
         getattr(result, "stderr_path", ""),
     )
+
+
+INTERACTION_COUNT_KEYS = ("interactions", "llm_calls", "num_llm_calls")
+INTERACTION_STEP_KEYS = ("steps",)
+INTERACTION_REQUEST_KEYS = ("effective_requests", "total_requests")
+LLM_RESULT_EVENT_TYPES = {"llm_result", "llm_response"}
+
+
+def _interactions_from_json_files(roots: list[Path], keys: tuple[str, ...]) -> int | None:
+    for name in ("metadata.json", "result.json", "harness_result.json", "metrics.json"):
+        for root in roots:
+            for path in _iter_named_files(root, {name}):
+                data = _safe_read_json(path)
+                if not isinstance(data, dict):
+                    continue
+                for key in keys:
+                    number = _as_number(data.get(key))
+                    if number is not None and number > 0:
+                        return int(number)
+    return None
+
+
+def _interactions_from_trajectory_files(roots: list[Path]) -> int | None:
+    total = 0
+    for root in roots:
+        for path in _iter_named_files(root, JSONL_FILENAMES):
+            try:
+                if path.stat().st_size > 20_000_000:
+                    continue
+                calls = 0
+                results = 0
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_type = str(event.get("type") or event.get("event") or "")
+                    if event_type == "llm_call":
+                        calls += 1
+                    elif event_type in LLM_RESULT_EVENT_TYPES:
+                        results += 1
+                total += max(calls, results)
+            except Exception:
+                continue
+    return total or None
+
+
+def extract_harness_interactions(*paths: str | Path | None) -> int | None:
+    """Extract the real number of harness<->LLM interactions for a harness run.
+
+    Priority: explicit counters in result/metadata JSON files, then
+    llm_call/llm_result events in trajectory.jsonl, then scaffold step
+    counters, then provider request counters. Returns None when no source is
+    available; callers must not substitute a fake placeholder count.
+    """
+    roots = _candidate_roots(paths)
+    if not roots:
+        return None
+    explicit = _interactions_from_json_files(roots, INTERACTION_COUNT_KEYS)
+    if explicit is not None:
+        return explicit
+    from_trajectory = _interactions_from_trajectory_files(roots)
+    if from_trajectory is not None:
+        return from_trajectory
+    steps = _interactions_from_json_files(roots, INTERACTION_STEP_KEYS)
+    if steps is not None:
+        return steps
+    return _interactions_from_json_files(roots, INTERACTION_REQUEST_KEYS)

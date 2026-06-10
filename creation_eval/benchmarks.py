@@ -259,7 +259,16 @@ def _parse_eqbench_csv(csv_path: Path) -> HarnessRunResult:
     input_tokens = _avg_float([row.get("input_tokens", "") or row.get("agent_input_tokens", "") for row in rows])
     output_tokens = _avg_float([row.get("output_tokens", "") or row.get("agent_output_tokens", "") for row in rows])
     reasoning_tokens = _avg_float([row.get("reasoning_tokens", "") or row.get("agent_reasoning_tokens", "") for row in rows])
-    interactions = _avg_float([row.get("agent_invocations", "") for row in rows])
+    invocation_values: list[float] = []
+    for row in rows:
+        raw = str(row.get("agent_invocations", "") or "").strip()
+        if not raw:
+            continue
+        try:
+            invocation_values.append(float(raw))
+        except ValueError:
+            continue
+    interactions = sum(invocation_values) if invocation_values else None
     token_breakdown = {}
     if total_tokens is not None:
         token_breakdown = {
@@ -1114,7 +1123,7 @@ def run_browsecomp_generated(
             "harness_failures": harness_failures,
             "judge_tokens": total_judge_tokens or None,
         },
-        interactions=len(harness_results),
+        interactions=_sum_interactions(harness_results),
     )
 
 
@@ -1158,11 +1167,12 @@ print(json.dumps(reg.list_competition_ids()))
         competition_ids = json.loads(listed.stdout.strip().splitlines()[-1])
         competition_ids = _limit_sequence(competition_ids, entry.get("n_limit"), default=None)
         child_results: list[dict[str, Any]] = []
+        child_run_results: list[HarnessRunResult] = []
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
         scores: list[float] = []
         missing_dependencies: list[str] = []
-        total_interactions = 0
+        status_counts: dict[str, int] = {}
         child_token_usages: list[dict[str, Any]] = []
         for competition_id in competition_ids:
             child_entry = {**entry, "competition_id": competition_id}
@@ -1176,7 +1186,8 @@ print(json.dumps(reg.list_competition_ids()))
                 timeout=timeout,
                 dry_run=False,
             )
-            total_interactions += child_result.interactions or 0
+            child_run_results.append(child_result)
+            status_counts[child_result.status] = status_counts.get(child_result.status, 0) + 1
             child_usage = _result_token_usage(child_result)
             if child_usage or child_result.harness_run_tokens is not None:
                 if child_result.harness_run_tokens is not None:
@@ -1205,6 +1216,7 @@ print(json.dumps(reg.list_competition_ids()))
             "competitions_total": len(competition_ids),
             "scored_competitions": len(scores),
             "missing_or_failed_competitions": len(competition_ids) - len(scores),
+            "status_counts": status_counts,
             "score": statistics.mean(scores) if scores else None,
             "child_results": child_results,
         }
@@ -1223,7 +1235,7 @@ print(json.dumps(reg.list_competition_ids()))
             score_breakdown={"metric": "MLE-bench mean grade_csv score over competitions", **report},
             harness_run_tokens=_token_total(token_breakdown),
             token_breakdown=token_breakdown,
-            interactions=total_interactions,
+            interactions=_sum_interactions(child_run_results),
         )
 
     competition_id = str(competition_config)
@@ -1289,18 +1301,18 @@ print(json.dumps({{
     if not csv_candidates:
         report = {
             "competition_id": competition_id,
-            "score": 0.0,
+            "score": None,
             "submission_exists": False,
             "valid_submission": False,
             "failure_mode": "no_submission",
             "cli_status": result.status,
             "harness_error": result.error,
-            "metric_source": "no_submission_zero_score",
+            "metric_source": "no_submission",
         }
         write_json(report_path, report)
         stdout_path.write_text(
             (result.stdout_path and Path(result.stdout_path).read_text(encoding="utf-8", errors="replace") or "")
-            + "\n\n=== grade ===\nNo submission CSV found; scored as 0.0.\n",
+            + "\n\n=== grade ===\nNo submission CSV found; not scored.\n",
             encoding="utf-8",
         )
         stderr_path.write_text(
@@ -1308,16 +1320,16 @@ print(json.dumps({{
             encoding="utf-8",
         )
         return HarnessRunResult(
-            status="success",
-            score=0.0,
+            status="failed/no_submission",
+            score=None,
             raw_result_path=str(report_path),
             stdout_path=str(stdout_path),
             stderr_path=str(stderr_path),
             error="Generated harness did not produce a submission CSV",
-            score_breakdown={"metric": "MLE-bench no-submission zero score", **report},
+            score_breakdown={"metric": "MLE-bench no submission (not scored)", **report},
             harness_run_tokens=result.harness_run_tokens,
             token_breakdown=_result_token_usage(result),
-            interactions=1,
+            interactions=result.interactions,
         )
     submission = csv_candidates[0]
     grade_code = f"""
@@ -1362,21 +1374,18 @@ print(json.dumps(payload, default=str))
         return HarnessRunResult(status="failed/timeout" if grade.returncode == 124 else "failed", raw_result_path=str(submission), stdout_path=str(stdout_path), stderr_path=str(stderr_path), error=grade.stderr[-2000:] or grade.stdout[-2000:])
     report = json.loads(grade.stdout.strip().splitlines()[-1])
     write_json(report_path, report)
-    score = report.get("score")
-    try:
-        score_float = float(score)
-    except (TypeError, ValueError):
-        score_float = None
+    eval_status, score_float = _classify_mle_grade_report(report)
     return HarnessRunResult(
-        status="success",
+        status=eval_status,
         score=score_float,
         raw_result_path=str(report_path),
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
+        error="" if eval_status == "success" else f"MLE grader produced no usable numeric score ({eval_status})",
         score_breakdown={"metric": "MLE-bench grade_csv score", "competition_id": competition_id, **report},
         harness_run_tokens=result.harness_run_tokens,
         token_breakdown=_result_token_usage(result),
-        interactions=1,
+        interactions=result.interactions,
     )
 
 
@@ -1431,6 +1440,7 @@ def run_the_agent_company_generated(
         stderr_parts: list[str] = []
         missing_dependencies: list[str] = []
         child_token_usages: list[dict[str, Any]] = []
+        child_run_results: list[HarnessRunResult] = []
         for image in task_images:
             task_name = image.split("/")[-1].split(":")[0].replace("-image", "")
             child_entry = {**entry, "task_image_name": image}
@@ -1444,6 +1454,7 @@ def run_the_agent_company_generated(
                 timeout=timeout,
                 dry_run=False,
             )
+            child_run_results.append(child_result)
             if child_result.stdout_path and Path(child_result.stdout_path).exists():
                 stdout_parts.append(f"=== {image} ===\n" + Path(child_result.stdout_path).read_text(encoding="utf-8", errors="replace"))
             if child_result.stderr_path and Path(child_result.stderr_path).exists():
@@ -1491,7 +1502,7 @@ def run_the_agent_company_generated(
             score_breakdown={"metric": "TheAgentCompany mean final_score.result / total over task images", **report},
             harness_run_tokens=_token_total(token_breakdown),
             token_breakdown=token_breakdown,
-            interactions=len(task_images),
+            interactions=_sum_interactions(child_run_results),
         )
 
     healthy, health_detail = _http_head_ok(health_url)
@@ -1653,7 +1664,7 @@ def run_the_agent_company_generated(
             score_breakdown={"stage": "evaluator", "task_image": task_image, "cli_status": harness_result.status},
             harness_run_tokens=harness_result.harness_run_tokens,
             token_breakdown=_result_token_usage(harness_result),
-            interactions=1,
+            interactions=harness_result.interactions,
         )
     result = read_json(eval_result_path) if eval_result_path.exists() else {}
     final = result.get("final_score") or {}
@@ -1683,7 +1694,7 @@ def run_the_agent_company_generated(
         score_breakdown={"metric": "TheAgentCompany final_score.result / total", "task_image": task_image, **final},
         harness_run_tokens=harness_result.harness_run_tokens,
         token_breakdown=_result_token_usage(harness_result),
-        interactions=1,
+        interactions=harness_result.interactions,
     )
 
 

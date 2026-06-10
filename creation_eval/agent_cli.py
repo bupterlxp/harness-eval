@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .schema import HarnessRunResult
-from .token_usage import extract_harness_token_usage
+from .token_usage import extract_harness_interactions, extract_harness_token_usage
 from .utils import read_json, run_command, write_json
 
 
@@ -241,6 +241,6 @@ def run_agent_cli(
         stderr_path=str(stderr_path),
         error=str(payload.get("error") or ""),
         score_breakdown={"harness_cli": "python -m harness run"},
-        interactions=1,
+        interactions=extract_harness_interactions(output_dir),
     )
     return _attach_token_usage(result, output_dir, raw_result_path, stdout_path, stderr_path)
