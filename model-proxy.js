@@ -685,11 +685,13 @@ function clientPayloadFromCompletion(completion, clientWantsStream) {
 // valid JSON to every parser.
 const PROVIDER_EARLY_KEEPALIVE_MS = Math.max(1000, parseInt(process.env.PROVIDER_EARLY_KEEPALIVE_MS || '15000', 10) || 15000);
 // Overloaded gateways sometimes accept the TCP connection and then never
-// respond at all — without a socket-inactivity timeout that retry attempt
-// freezes forever and the whole chain deadlocks behind the keepalives.
-// Streaming responses reset this timer on every byte, so legitimately long
-// generations are unaffected; only fully silent sockets are killed.
-const PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS = Math.max(10000, parseInt(process.env.PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS || '600000', 10) || 600000);
+// respond at all. The timeout below applies only to the headers-wait phase:
+// a live backend sends SSE response headers within seconds even when the
+// model then reasons silently for many minutes, while a hung socket never
+// sends anything. Once headers arrive the timer is disabled so long silent
+// reasoning is never killed; mid-stream cuts are caught by abort/error and
+// incomplete-stream detection instead.
+const PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS = Math.max(10000, parseInt(process.env.PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS || '120000', 10) || 120000);
 
 function makeProviderResponder(res, clientWantsStream, earlyCommit) {
   const state = { committed: false, finished: false, timer: null, clientGone: false };
@@ -787,6 +789,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
     }, delayMs);
   };
   const upstreamReq = transport.request(options, (upstreamRes) => {
+    if (upstreamRes.socket) upstreamRes.socket.setTimeout(0);
     const chunks = [];
     let settled = false;
     const failStream = (err) => {
@@ -923,6 +926,7 @@ function forwardAnthropicPassthrough({ req, res, body, attempt = 1 }) {
   const transport = target.protocol === 'https:' ? require('https') : http;
   const startedAt = Date.now();
   const upstreamReq = transport.request(options, (upstreamRes) => {
+    if (upstreamRes.socket) upstreamRes.socket.setTimeout(0);
     const statusCode = upstreamRes.statusCode || 502;
     if (statusCode >= 400) {
       const chunks = [];
