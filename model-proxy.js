@@ -692,6 +692,12 @@ const PROVIDER_EARLY_KEEPALIVE_MS = Math.max(1000, parseInt(process.env.PROVIDER
 // reasoning is never killed; mid-stream cuts are caught by abort/error and
 // incomplete-stream detection instead.
 const PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS = Math.max(10000, parseInt(process.env.PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS || '120000', 10) || 120000);
+// The gateway can also hang AFTER sending response headers (observed: Claude
+// Code waited out its whole request timeout on one such socket). Apply a
+// generous post-headers stall timeout — far above the longest observed
+// legitimate silent-reasoning gap (~16min) — so those sockets also die into
+// the retry path instead of stalling the run for hours.
+const PROVIDER_UPSTREAM_STALL_TIMEOUT_MS = Math.max(60000, parseInt(process.env.PROVIDER_UPSTREAM_STALL_TIMEOUT_MS || '1800000', 10) || 1800000);
 
 function makeProviderResponder(res, clientWantsStream, earlyCommit) {
   const state = { committed: false, finished: false, timer: null, clientGone: false };
@@ -789,7 +795,12 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
     }, delayMs);
   };
   const upstreamReq = transport.request(options, (upstreamRes) => {
-    if (upstreamRes.socket) upstreamRes.socket.setTimeout(0);
+    if (upstreamRes.socket) {
+      upstreamRes.socket.setTimeout(PROVIDER_UPSTREAM_STALL_TIMEOUT_MS, () => {
+        console.error(`[provider_proxy] upstream stalled after headers; destroying attempt=${attempt}`);
+        upstreamRes.destroy(new Error('upstream post-headers stall'));
+      });
+    }
     const chunks = [];
     let settled = false;
     const failStream = (err) => {
@@ -926,7 +937,12 @@ function forwardAnthropicPassthrough({ req, res, body, attempt = 1 }) {
   const transport = target.protocol === 'https:' ? require('https') : http;
   const startedAt = Date.now();
   const upstreamReq = transport.request(options, (upstreamRes) => {
-    if (upstreamRes.socket) upstreamRes.socket.setTimeout(0);
+    if (upstreamRes.socket) {
+      upstreamRes.socket.setTimeout(PROVIDER_UPSTREAM_STALL_TIMEOUT_MS, () => {
+        console.error(`[anthropic_passthrough] upstream stalled after headers; destroying attempt=${attempt}`);
+        upstreamRes.destroy(new Error('upstream post-headers stall'));
+      });
+    }
     const statusCode = upstreamRes.statusCode || 502;
     if (statusCode >= 400) {
       const chunks = [];
