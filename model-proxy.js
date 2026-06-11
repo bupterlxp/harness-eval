@@ -576,6 +576,22 @@ function isRetriableProviderFailure(statusCode, rawBody) {
   ].some((marker) => text.includes(marker));
 }
 
+// A 2xx body that parses as a real completion (OpenAI JSON, Anthropic JSON,
+// or an SSE stream with data: chunks) must never be marker-sniffed for retry:
+// generated content legitimately contains words like "timeout" or "gateway",
+// and discarding such responses poison-loops the session — every healthy turn
+// mentioning those words gets thrown away and regenerated forever.
+function looksLikeCompletionBody(rawText) {
+  const text = String(rawText || '');
+  if (text.trimStart().startsWith('data:') || text.includes('\ndata:')) return true;
+  try {
+    const json = JSON.parse(text);
+    if (json && Array.isArray(json.choices)) return true;
+    if (json && Array.isArray(json.content)) return true;
+  } catch (e) {}
+  return false;
+}
+
 function reassembleOpenAiStream(rawText) {
   const completion = {
     id: '',
@@ -1062,8 +1078,9 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
       if (statusCode >= 400) {
         console.error(`[provider_proxy] upstream ${statusCode}: ${rawText.slice(0, 1000)}`);
       }
-      if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS && isRetriableProviderFailure(statusCode, rawText)) {
-        scheduleRetry('retrying upstream request');
+      const sniffable = statusCode >= 400 || !looksLikeCompletionBody(rawText);
+      if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS && sniffable && isRetriableProviderFailure(statusCode, rawText)) {
+        scheduleRetry(`retriable upstream response status=${statusCode} body=${rawText.slice(0, 200).replace(/\s+/g, ' ')}`);
         return;
       }
       if (PROVIDER_UPSTREAM_STREAM && statusCode >= 200 && statusCode < 300) {
@@ -1082,7 +1099,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
         }
         if (!result || !result.complete) {
           if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
-            scheduleRetry('incomplete upstream stream');
+            scheduleRetry(`incomplete upstream stream body=${rawText.slice(0, 200).replace(/\s+/g, ' ')}`);
             return;
           }
           responder.sendError(502, { error: { message: 'Upstream stream ended prematurely' } });
