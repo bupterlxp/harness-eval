@@ -684,6 +684,12 @@ function clientPayloadFromCompletion(completion, clientWantsStream) {
 // `: keepalive` comment lines; JSON clients get leading whitespace, which is
 // valid JSON to every parser.
 const PROVIDER_EARLY_KEEPALIVE_MS = Math.max(1000, parseInt(process.env.PROVIDER_EARLY_KEEPALIVE_MS || '15000', 10) || 15000);
+// Overloaded gateways sometimes accept the TCP connection and then never
+// respond at all — without a socket-inactivity timeout that retry attempt
+// freezes forever and the whole chain deadlocks behind the keepalives.
+// Streaming responses reset this timer on every byte, so legitimately long
+// generations are unaffected; only fully silent sockets are killed.
+const PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS = Math.max(10000, parseInt(process.env.PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS || '600000', 10) || 600000);
 
 function makeProviderResponder(res, clientWantsStream, earlyCommit) {
   const state = { committed: false, finished: false, timer: null, clientGone: false };
@@ -734,7 +740,12 @@ function makeProviderResponder(res, clientWantsStream, earlyCommit) {
         return;
       }
       if (clientWantsStream) {
-        res.end(`data: ${bodyText}\n\ndata: [DONE]\n\n`);
+        // CCR's OpenAI transformer chokes on non-chunk SSE events; deliver the
+        // failure as a valid chunk so the client pipeline always terminates.
+        const base = { id: `chatcmpl-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: MODEL_NAME };
+        const head = { ...base, choices: [{ index: 0, delta: { role: 'assistant', content: `[provider_proxy_error status=${statusCode}] ${bodyText.slice(0, 600)}` }, finish_reason: null }] };
+        const tail = { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+        res.end(`data: ${JSON.stringify(head)}\n\ndata: ${JSON.stringify(tail)}\n\ndata: [DONE]\n\n`);
       } else {
         res.end(bodyText);
       }
@@ -882,6 +893,10 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
     }
     responder.sendError(502, { error: { message: `Upstream proxy error: ${err.message}` } });
   });
+  upstreamReq.setTimeout(PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS, () => {
+    console.error(`[provider_proxy] upstream socket idle ${PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS}ms; destroying attempt=${attempt}`);
+    upstreamReq.destroy(new Error('upstream idle timeout'));
+  });
 
   upstreamReq.write(shapedBody);
   upstreamReq.end();
@@ -940,6 +955,10 @@ function forwardAnthropicPassthrough({ req, res, body, attempt = 1 }) {
     }
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `Anthropic passthrough error: ${err.message}` } }));
+  });
+  upstreamReq.setTimeout(PROVIDER_UPSTREAM_IDLE_TIMEOUT_MS, () => {
+    console.error(`[anthropic_passthrough] upstream socket idle; destroying attempt=${attempt}`);
+    upstreamReq.destroy(new Error('upstream idle timeout'));
   });
   upstreamReq.write(body);
   upstreamReq.end();
