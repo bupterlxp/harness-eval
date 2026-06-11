@@ -182,7 +182,7 @@ missing_dependencies
 
 ## MLE-bench dev / formal split
 
-- Dev 集（creation 阶段 `run_dev_bmk.py` 专用，固定种子 20260610 从官方 `experiments/splits/dev.txt` 池抽取，所有 generation model 一致）：`playground-series-s3e18`、`spaceship-titanic`、`ml2021spring-hw2`，定义在 `creation_eval/mle_dev_split.py`，不要改动。
+- Dev 集（creation 阶段 `run_dev_bmk.py` 专用，固定种子 20260610 从官方 `experiments/splits/dev.txt` 池抽取，所有 generation model 一致）：`spaceship-titanic`、`ml2021spring-hw2`，定义在 `creation_eval/mle_dev_split.py`，不要改动。原抽取结果还含 `playground-series-s3e18`，但该 Kaggle 比赛已过期、无法接受规则、数据永远无法 prepare，2026-06-12 起从 dev 集移除。
 - 正式集：`competition_id: all` 与平台 job 生成器会剔除全部官方 dev 比赛，剩下的恰好是官方 `split75` 的 75 题。需要显式指定比赛时用环境变量 `MLEBENCH_COMPETITION_IDS=a,b,c`。
 - Creation 阶段的 eval LLM 凭据来自 `configs/eval_llm_endpoints.yaml`（`--eval-endpoint` 选条目，默认 `default`），run.py 会注入 CC 容器和 Codex 进程，并把本机 prepared 的 MLE 数据挂载/透传进去，保证 dev BMK 真实可跑。
 - Summary 增加 `llm_used` 字段：一次 run 中没有任何真实 LLM 调用（token 与 llm_call 轨迹均为零）记为 `false`，此类 harness 属于硬编码管线，不参与 harness 质量对比。

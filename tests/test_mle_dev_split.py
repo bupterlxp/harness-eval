@@ -16,7 +16,7 @@ class MleDevSplitTests(unittest.TestCase):
     def test_dev_set_is_fixed(self) -> None:
         self.assertEqual(
             MLE_DEV_COMPETITIONS,
-            ("playground-series-s3e18", "spaceship-titanic", "ml2021spring-hw2"),
+            ("spaceship-titanic", "ml2021spring-hw2"),
         )
 
     def test_dev_competitions_come_from_official_dev_pool(self) -> None:

@@ -12,6 +12,12 @@ from the official 75-competition formal split (``experiments/splits/split75.txt`
 so excluding every official dev competition from "all competitions" leaves
 exactly the official formal set. Do not edit the drawn ids; changing them
 breaks comparability across generation models.
+
+2026-06-12: ``playground-series-s3e18`` was dropped from the drawn set. The
+Kaggle competition has expired, its rules can no longer be accepted, so its
+data can never be prepared; every harness saw it only as
+``skipped/missing_dependency``. The two remaining competitions stay exactly
+as drawn and remain identical for every generation model.
 """
 from __future__ import annotations
 
@@ -19,9 +25,9 @@ import os
 
 MLE_DEV_SPLIT_SEED = 20260610
 
-# Seeded draw result. Identical for every generation model.
+# Seeded draw result minus the expired playground-series-s3e18 (see module
+# docstring). Identical for every generation model.
 MLE_DEV_COMPETITIONS: tuple[str, ...] = (
-    "playground-series-s3e18",
     "spaceship-titanic",
     "ml2021spring-hw2",
 )
