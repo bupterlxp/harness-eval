@@ -860,6 +860,7 @@ def run_claude_code_generation(task_id: str, workspace: str, config: dict, timeo
         "-e", f"PROVIDER_RETRY_BASE_MS={os.environ.get('PROVIDER_RETRY_BASE_MS', '')}",
         "-e", f"PROVIDER_UPSTREAM_STREAM={os.environ.get('PROVIDER_UPSTREAM_STREAM', '')}",
         "-e", f"PROVIDER_ANTHROPIC_PASSTHROUGH={os.environ.get('PROVIDER_ANTHROPIC_PASSTHROUGH', '')}",
+        "-e", f"PROVIDER_ANTHROPIC_FRONTEND={os.environ.get('PROVIDER_ANTHROPIC_FRONTEND', '')}",
         "-e", f"PROVIDER_RETRY_MAX_DELAY_MS={os.environ.get('PROVIDER_RETRY_MAX_DELAY_MS', '')}",
         "-e", f"PROVIDER_STRIP_CACHE_CONTROL={os.environ.get('PROVIDER_STRIP_CACHE_CONTROL', '')}",
         "-e", f"PROVIDER_FIX_CACHE_CONTROL={os.environ.get('PROVIDER_FIX_CACHE_CONTROL', '')}",

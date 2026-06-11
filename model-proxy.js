@@ -34,6 +34,12 @@ const PROVIDER_UPSTREAM_STREAM = process.env.PROVIDER_UPSTREAM_STREAM === '1' ||
 // paths pass through untouched; successful responses are piped (streaming
 // included), only pre-body failures are retried.
 const PROVIDER_ANTHROPIC_PASSTHROUGH = process.env.PROVIDER_ANTHROPIC_PASSTHROUGH === '1' || process.env.PROVIDER_ANTHROPIC_PASSTHROUGH === 'true';
+// Anthropic frontend: Claude Code talks native Anthropic Messages protocol
+// directly to this proxy, which converts to OpenAI chat for the upstream and
+// synthesizes Anthropic SSE back. This removes CCR and the metrics relay
+// from the chain entirely — both were black boxes with their own 300s
+// undici deadlines, response-holding bugs and connection leaks.
+const PROVIDER_ANTHROPIC_FRONTEND = process.env.PROVIDER_ANTHROPIC_FRONTEND === '1' || process.env.PROVIDER_ANTHROPIC_FRONTEND === 'true';
 // Cap exponential retry backoff so long retry budgets stay practical.
 const PROVIDER_RETRY_MAX_DELAY_MS = Math.max(1000, parseInt(process.env.PROVIDER_RETRY_MAX_DELAY_MS || '60000', 10) || 60000);
 const METRICS_PATH = process.env.METRICS_PATH || path.join(process.env.WORKSPACE || process.cwd(), 'metrics.json');
@@ -310,6 +316,7 @@ function normalizeProviderTools(payload) {
   if (choice && typeof choice === 'object') {
     if (choice.type === 'auto') payload.tool_choice = 'auto';
     else if (choice.type === 'any') payload.tool_choice = 'required';
+    else if (choice.type === 'none') payload.tool_choice = 'none';
     else if (choice.name) {
       payload.tool_choice = { type: 'function', function: { name: choice.name } };
     } else if (choice.function?.name) {
@@ -459,6 +466,7 @@ function shapeProviderRequest(bodyText) {
 
   if (PROVIDER_UPSTREAM_STREAM) {
     payload.stream = true;
+    payload.stream_options = { ...(payload.stream_options || {}), include_usage: true };
   }
 
   if (PROVIDER_EXTRA_BODY_JSON) {
@@ -612,7 +620,10 @@ function reassembleOpenAiStream(rawText) {
       if (typeof delta.content === 'string') acc.content += delta.content;
       if (typeof delta.reasoning_content === 'string') acc.reasoningContent += delta.reasoning_content;
       for (const toolDelta of delta.tool_calls || []) {
-        const tcIndex = toolDelta.index != null ? toolDelta.index : acc.toolCalls.size;
+        let tcIndex;
+        if (toolDelta.index != null) tcIndex = toolDelta.index;
+        else if (toolDelta.id || (toolDelta.function && toolDelta.function.name)) tcIndex = acc.toolCalls.size;
+        else tcIndex = acc.toolCalls.size ? acc.toolCalls.size - 1 : 0;
         if (!acc.toolCalls.has(tcIndex)) {
           acc.toolCalls.set(tcIndex, { id: '', type: 'function', function: { name: '', arguments: '' } });
         }
@@ -779,6 +790,219 @@ function makeProviderResponder(res, clientWantsStream, earlyCommit) {
   };
 }
 
+
+function contentBlocksToText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((b) => {
+      if (typeof b === 'string') return b;
+      if (b && b.type === 'text') return b.text || '';
+      if (b && b.type === 'image') return '[image omitted]';
+      if (b && b.text) return b.text;
+      if (b && b.type) return `[${b.type} omitted]`;
+      return '';
+    }).filter(Boolean).join('\n\n');
+  }
+  if (content == null) return '';
+  if (typeof content === 'object') return JSON.stringify(content);
+  return String(content);
+}
+
+function anthropicToOpenAiRequest(payload) {
+  const out = { model: MODEL_NAME, messages: [] };
+  if (payload.system) {
+    const sys = contentBlocksToText(payload.system);
+    if (sys) out.messages.push({ role: 'system', content: sys });
+  }
+  for (const m of payload.messages || []) {
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const content = m.content;
+    if (typeof content === 'string') {
+      out.messages.push({ role, content });
+      continue;
+    }
+    if (!Array.isArray(content)) {
+      out.messages.push({ role, content: contentBlocksToText(content) });
+      continue;
+    }
+    if (role === 'assistant') {
+      let text = '';
+      const toolCalls = [];
+      for (const b of content) {
+        if (!b || typeof b !== 'object') continue;
+        if (b.type === 'text') text += b.text || '';
+        else if (b.type === 'tool_use') {
+          toolCalls.push({ id: b.id || `call_${toolCalls.length}`, type: 'function', function: { name: b.name || '', arguments: JSON.stringify(b.input || {}) } });
+        }
+        // thinking / redacted_thinking blocks are not replayed upstream
+      }
+      const msg = { role: 'assistant', content: text || (toolCalls.length ? null : '') };
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      out.messages.push(msg);
+    } else {
+      let text = '';
+      for (const b of content) {
+        if (!b || typeof b !== 'object') continue;
+        if (b.type === 'tool_result') {
+          out.messages.push({ role: 'tool', tool_call_id: b.tool_use_id || '', content: contentBlocksToText(b.content) || (b.is_error ? '[tool error]' : '') });
+        } else if (b.type === 'text') text += b.text || '';
+        else if (b.type === 'image') text += '[image omitted]';
+      }
+      if (text) out.messages.push({ role: 'user', content: text });
+    }
+  }
+  if (Array.isArray(payload.tools) && payload.tools.length) out.tools = payload.tools;
+  if (payload.tool_choice) out.tool_choice = payload.tool_choice;
+  if (payload.max_tokens != null) out.max_tokens = payload.max_tokens;
+  if (payload.temperature !== undefined) out.temperature = payload.temperature;
+  if (payload.top_p !== undefined) out.top_p = payload.top_p;
+  return out;
+}
+
+function completionToAnthropicMessage(completion) {
+  const choice = (completion.choices || [])[0] || {};
+  const msg = choice.message || {};
+  const blocks = [];
+  if (typeof msg.content === 'string' && msg.content) blocks.push({ type: 'text', text: msg.content });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function && tc.function.arguments || '{}'); } catch (e) { input = { _raw: tc.function && tc.function.arguments || '' }; }
+    blocks.push({ type: 'tool_use', id: tc.id || `toolu_${Date.now()}_${blocks.length}`, name: (tc.function && tc.function.name) || '', input });
+  }
+  if (!blocks.length) blocks.push({ type: 'text', text: '' });
+  const finish = choice.finish_reason || (msg.tool_calls && msg.tool_calls.length ? 'tool_calls' : 'stop');
+  const hasToolUse = blocks.some((b) => b.type === 'tool_use');
+  const stopReason = finish === 'length' ? 'max_tokens' : hasToolUse ? 'tool_use' : finish === 'tool_calls' ? 'tool_use' : 'end_turn';
+  const usage = completion.usage || {};
+  return {
+    id: `msg_${completion.id || Date.now()}`,
+    type: 'message',
+    role: 'assistant',
+    model: completion.model || MODEL_NAME,
+    content: blocks,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 },
+  };
+}
+
+function anthropicMessageToSse(message) {
+  const ev = (type, data) => `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+  const skeleton = { ...message, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: message.usage.input_tokens, output_tokens: 0 } };
+  let out = ev('message_start', { type: 'message_start', message: skeleton });
+  message.content.forEach((block, i) => {
+    if (block.type === 'text') {
+      out += ev('content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'text', text: '' } });
+      out += ev('content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'text_delta', text: block.text || '' } });
+    } else {
+      out += ev('content_block_start', { type: 'content_block_start', index: i, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } });
+      out += ev('content_block_delta', { type: 'content_block_delta', index: i, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input || {}) } });
+    }
+    out += ev('content_block_stop', { type: 'content_block_stop', index: i });
+  });
+  out += ev('message_delta', { type: 'message_delta', delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: { output_tokens: message.usage.output_tokens } });
+  out += ev('message_stop', { type: 'message_stop' });
+  return out;
+}
+
+function anthropicErrorType(statusCode) {
+  if (statusCode === 400) return 'invalid_request_error';
+  if (statusCode === 401) return 'authentication_error';
+  if (statusCode === 403) return 'permission_error';
+  if (statusCode === 404) return 'not_found_error';
+  if (statusCode === 429) return 'rate_limit_error';
+  if (statusCode === 529) return 'overloaded_error';
+  return 'api_error';
+}
+
+function makeAnthropicFrontendResponder(res, clientWantsStream) {
+  const state = { committed: false, finished: false, timer: null, clientGone: false };
+  res.on('close', () => {
+    state.clientGone = true;
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  });
+  if (clientWantsStream) {
+    state.committed = true;
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+    const ping = () => { try { res.write(`event: ping\ndata: {"type": "ping"}\n\n`); } catch (e) {} };
+    ping();
+    state.timer = setInterval(() => {
+      if (state.finished || state.clientGone) { clearInterval(state.timer); state.timer = null; return; }
+      ping();
+    }, PROVIDER_EARLY_KEEPALIVE_MS);
+  }
+  const finish = () => {
+    state.finished = true;
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  };
+  const emitMessage = (message) => {
+    if (state.finished || state.clientGone) return;
+    finish();
+    if (clientWantsStream) {
+      res.end(anthropicMessageToSse(message));
+    } else if (state.committed) {
+      res.end(JSON.stringify(message));
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(message));
+    }
+  };
+  return {
+    isClientGone: () => state.clientGone,
+    sendCompletion(completion) {
+      const message = completionToAnthropicMessage(completion);
+      const usage = message.usage;
+      console.log(`[anthropic_frontend] message stop=${message.stop_reason} blocks=${message.content.length} in=${usage.input_tokens} out=${usage.output_tokens}`);
+      emitMessage(message);
+    },
+    sendError(statusCode, errorBody) {
+      if (state.finished || state.clientGone) return;
+      const bodyText = typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody);
+      console.error(`[anthropic_frontend] error status=${statusCode}: ${bodyText.slice(0, 300)}`);
+      if (clientWantsStream || state.committed) {
+        // Anthropic streaming has a first-class error event; emit it so
+        // Claude Code's own retry / prompt-too-long handling engages instead
+        // of recording the failure as model output.
+        finish();
+        const err = { type: 'error', error: { type: anthropicErrorType(statusCode), message: bodyText.slice(0, 600) } };
+        res.end(`event: error\ndata: ${JSON.stringify(err)}\n\n`);
+        return;
+      }
+      finish();
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: anthropicErrorType(statusCode), message: bodyText.slice(0, 600) } }));
+    },
+    sendRaw(statusCode, headers, rawBody) {
+      const rawText = Buffer.isBuffer(rawBody) ? rawBody.toString('utf-8') : String(rawBody || '');
+      if (statusCode >= 200 && statusCode < 300) {
+        try {
+          const json = JSON.parse(rawText);
+          if (json && Array.isArray(json.choices)) { this.sendCompletion(json); return; }
+        } catch (e) {}
+      }
+      this.sendError(statusCode, rawText || `upstream status ${statusCode}`);
+    },
+  };
+}
+
+function handleAnthropicFrontend(req, res, originalBody) {
+  let anthropicPayload;
+  try {
+    anthropicPayload = JSON.parse(originalBody || '{}');
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Invalid JSON: ${e.message}` } }));
+    return;
+  }
+  const ccStream = anthropicPayload.stream === true;
+  const openaiBody = anthropicToOpenAiRequest(anthropicPayload);
+  const shapedBody = shapeProviderRequest(JSON.stringify(openaiBody));
+  const options = buildUpstreamOptions(UPSTREAM_BASE_URL, 'POST', { 'content-type': 'application/json' }, shapedBody.length);
+  const transport = options.protocol === 'https:' ? require('https') : http;
+  const responder = makeAnthropicFrontendResponder(res, ccStream);
+  forwardProviderRequest({ options, transport, shapedBody, res, responder, clientWantsStream: ccStream });
+}
+
 function forwardProviderRequest({ options, transport, shapedBody, res, responder = null, clientWantsStream = false, attempt = 1 }) {
   if (!responder) {
     responder = makeProviderResponder(res, clientWantsStream, false);
@@ -795,7 +1019,23 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
   // Fresh socket per attempt: pooled keep-alive sockets carry timeout timers
   // and listeners from previous attempts, which fired the 30min stall timer
   // on a 2min schedule and murdered healthy long turns.
-  const upstreamReq = transport.request({ ...options, agent: false }, (upstreamRes) => {
+  // attemptSettled gates EVERY terminal path of this attempt (response end,
+  // response error/abort, request error) so one failure cannot spawn two
+  // retry chains; onClientClose destroys the in-flight socket when Claude
+  // Code abandons the request instead of leaking ESTABLISHED connections.
+  let attemptSettled = false;
+  let upstreamReq = null;
+  const onClientClose = () => {
+    if (upstreamReq) { try { upstreamReq.destroy(new Error('client disconnected')); } catch (e) {} }
+  };
+  const settleAttempt = () => {
+    if (attemptSettled) return false;
+    attemptSettled = true;
+    res.removeListener('close', onClientClose);
+    return true;
+  };
+  res.once('close', onClientClose);
+  upstreamReq = transport.request({ ...options, agent: false }, (upstreamRes) => {
     if (upstreamRes.socket) {
       upstreamRes.socket.setTimeout(PROVIDER_UPSTREAM_STALL_TIMEOUT_MS, () => {
         console.error(`[provider_proxy] upstream stalled after headers; destroying attempt=${attempt}`);
@@ -803,10 +1043,8 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
       });
     }
     const chunks = [];
-    let settled = false;
     const failStream = (err) => {
-      if (settled) return;
-      settled = true;
+      if (!settleAttempt()) return;
       if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
         scheduleRetry(`upstream stream failed: ${err.message}`);
         return;
@@ -817,8 +1055,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
     upstreamRes.on('aborted', () => failStream(new Error('upstream connection aborted')));
     upstreamRes.on('error', failStream);
     upstreamRes.on('end', () => {
-      if (settled) return;
-      settled = true;
+      if (!settleAttempt()) return;
       const rawBody = Buffer.concat(chunks);
       const rawText = rawBody.toString('utf-8');
       const statusCode = upstreamRes.statusCode || 502;
@@ -902,6 +1139,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, responder
   });
 
   upstreamReq.on('error', (err) => {
+    if (!settleAttempt()) return;
     if (attempt < PROVIDER_RETRY_MAX_ATTEMPTS) {
       scheduleRetry(`upstream network error: ${err.message}`);
       return;
@@ -996,6 +1234,22 @@ const providerProxy = http.createServer((req, res) => {
   req.on('data', (chunk) => reqChunks.push(chunk));
   req.on('end', () => {
     const originalBody = Buffer.concat(reqChunks).toString('utf-8');
+    if (PROVIDER_ANTHROPIC_FRONTEND) {
+      const urlPath = String(req.url || '').split('?')[0];
+      if (req.method === 'POST' && /\/count_tokens$/.test(urlPath)) {
+        const estimate = extractInputFromRequest(originalBody) || estimateTokens(originalBody);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ input_tokens: estimate }));
+        return;
+      }
+      if (req.method === 'POST' && /\/messages$/.test(urlPath)) {
+        handleAnthropicFrontend(req, res, originalBody);
+        return;
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `No handler for ${req.method} ${urlPath}` } }));
+      return;
+    }
     if (PROVIDER_ANTHROPIC_PASSTHROUGH) {
       forwardAnthropicPassthrough({ req, res, body: Buffer.from(originalBody) });
       return;
