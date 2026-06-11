@@ -677,12 +677,102 @@ function clientPayloadFromCompletion(completion, clientWantsStream) {
   };
 }
 
-function forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream = false, attempt = 1 }) {
+// Commit response headers to the client immediately and keep the socket warm
+// while upstream retries run underneath. CCR's outbound HTTP client (undici)
+// aborts at headersTimeout=300s if no response headers arrive — that, not the
+// gateway, produced the stable ~302s request deaths. SSE clients get legal
+// `: keepalive` comment lines; JSON clients get leading whitespace, which is
+// valid JSON to every parser.
+const PROVIDER_EARLY_KEEPALIVE_MS = Math.max(1000, parseInt(process.env.PROVIDER_EARLY_KEEPALIVE_MS || '15000', 10) || 15000);
+
+function makeProviderResponder(res, clientWantsStream, earlyCommit) {
+  const state = { committed: false, finished: false, timer: null, clientGone: false };
+  res.on('close', () => {
+    state.clientGone = true;
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  });
+  const commit = () => {
+    if (state.committed || state.finished || state.clientGone) return;
+    state.committed = true;
+    if (clientWantsStream) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+      res.write(': keepalive\n\n');
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Transfer-Encoding': 'chunked' });
+      res.write(' ');
+    }
+    state.timer = setInterval(() => {
+      if (state.finished || state.clientGone) { clearInterval(state.timer); state.timer = null; return; }
+      try { res.write(clientWantsStream ? ': keepalive\n\n' : ' '); } catch (e) {}
+    }, PROVIDER_EARLY_KEEPALIVE_MS);
+  };
+  if (earlyCommit) commit();
+  const finish = () => {
+    state.finished = true;
+    if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  };
+  return {
+    isClientGone: () => state.clientGone,
+    sendCompletion(completion) {
+      if (state.finished || state.clientGone) return;
+      finish();
+      const payload = clientPayloadFromCompletion(completion, clientWantsStream);
+      if (!state.committed) {
+        res.writeHead(200, { 'Content-Type': payload.contentType });
+        res.end(payload.body);
+        return;
+      }
+      res.end(clientWantsStream ? payload.body : JSON.stringify(completion));
+    },
+    sendError(statusCode, errorBody) {
+      if (state.finished || state.clientGone) return;
+      finish();
+      const bodyText = typeof errorBody === 'string' ? errorBody : JSON.stringify(errorBody);
+      if (!state.committed) {
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(bodyText);
+        return;
+      }
+      if (clientWantsStream) {
+        res.end(`data: ${bodyText}\n\ndata: [DONE]\n\n`);
+      } else {
+        res.end(bodyText);
+      }
+    },
+    sendRaw(statusCode, headers, rawBody) {
+      if (state.finished || state.clientGone) return;
+      if (!state.committed) {
+        finish();
+        res.writeHead(statusCode, headers);
+        res.end(rawBody);
+        return;
+      }
+      const rawText = Buffer.isBuffer(rawBody) ? rawBody.toString('utf-8') : String(rawBody || '');
+      if (statusCode >= 200 && statusCode < 300) {
+        try {
+          const json = JSON.parse(rawText);
+          if (json && Array.isArray(json.choices)) {
+            this.sendCompletion(json);
+            return;
+          }
+        } catch (e) {}
+      }
+      this.sendError(statusCode, rawText || JSON.stringify({ error: { message: `upstream status ${statusCode}` } }));
+    },
+  };
+}
+
+function forwardProviderRequest({ options, transport, shapedBody, res, responder = null, clientWantsStream = false, attempt = 1 }) {
+  if (!responder) {
+    responder = makeProviderResponder(res, clientWantsStream, false);
+  }
+  if (responder.isClientGone()) return;
   const scheduleRetry = (reason) => {
+    if (responder.isClientGone()) return;
     const delayMs = providerRetryDelayMs(attempt);
     console.error(`[provider_proxy] ${reason}; retrying attempt=${attempt + 1}/${PROVIDER_RETRY_MAX_ATTEMPTS} delay_ms=${delayMs}`);
     setTimeout(() => {
-      forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream, attempt: attempt + 1 });
+      forwardProviderRequest({ options, transport, shapedBody, res, responder, clientWantsStream, attempt: attempt + 1 });
     }, delayMs);
   };
   const upstreamReq = transport.request(options, (upstreamRes) => {
@@ -695,8 +785,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
         scheduleRetry(`upstream stream failed: ${err.message}`);
         return;
       }
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `Upstream stream failed: ${err.message}` } }));
+      responder.sendError(502, { error: { message: `Upstream stream failed: ${err.message}` } });
     };
     upstreamRes.on('data', (chunk) => chunks.push(chunk));
     upstreamRes.on('aborted', () => failStream(new Error('upstream connection aborted')));
@@ -733,19 +822,16 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
             scheduleRetry('incomplete upstream stream');
             return;
           }
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'Upstream stream ended prematurely' } }));
+          responder.sendError(502, { error: { message: 'Upstream stream ended prematurely' } });
           return;
         }
-        const payload = clientPayloadFromCompletion(result.completion, clientWantsStream);
         const firstChoice = result.completion.choices[0] || {};
         console.log(
           `[provider_proxy] ${result.sawChunk ? 'sse_reassembled' : 'json_passthrough'} `
           + `finish=${firstChoice.finish_reason || ''} tool_calls=${(firstChoice.message && firstChoice.message.tool_calls || []).length} `
           + `usage=${result.completion.usage ? 'api' : 'none'}`,
         );
-        res.writeHead(200, { 'Content-Type': payload.contentType });
-        res.end(payload.body);
+        responder.sendCompletion(result.completion);
         return;
       }
       // Some ModelHub crawl routes answer OpenAI-shaped requests with
@@ -779,16 +865,13 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
                 total_tokens: (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0),
               };
             }
-            const payload = clientPayloadFromCompletion(completion, clientWantsStream);
             console.log(`[provider_proxy] anthropic_json_converted finish=${completion.choices[0].finish_reason} usage=${completion.usage ? 'api' : 'none'}`);
-            res.writeHead(200, { 'Content-Type': payload.contentType });
-            res.end(payload.body);
+            responder.sendCompletion(completion);
             return;
           }
         } catch (e) {}
       }
-      res.writeHead(statusCode, upstreamRes.headers);
-      res.end(rawBody);
+      responder.sendRaw(statusCode, upstreamRes.headers, rawBody);
     });
   });
 
@@ -797,8 +880,7 @@ function forwardProviderRequest({ options, transport, shapedBody, res, clientWan
       scheduleRetry(`upstream network error: ${err.message}`);
       return;
     }
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: `Upstream proxy error: ${err.message}` } }));
+    responder.sendError(502, { error: { message: `Upstream proxy error: ${err.message}` } });
   });
 
   upstreamReq.write(shapedBody);
@@ -889,7 +971,8 @@ const providerProxy = http.createServer((req, res) => {
     const shapedBody = shapeProviderRequest(originalBody);
     const options = buildUpstreamOptions(UPSTREAM_BASE_URL, req.method, req.headers, shapedBody.length);
     const transport = options.protocol === 'https:' ? require('https') : http;
-    forwardProviderRequest({ options, transport, shapedBody, res, clientWantsStream });
+    const responder = makeProviderResponder(res, clientWantsStream, PROVIDER_UPSTREAM_STREAM);
+    forwardProviderRequest({ options, transport, shapedBody, res, responder, clientWantsStream });
   });
 });
 
