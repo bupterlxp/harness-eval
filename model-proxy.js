@@ -406,6 +406,56 @@ function anthropicToOpenAiCompletion(rawBody, stream) {
   };
 }
 
+// --- Upstream HTTP CONNECT proxy support ---
+// node http/https do NOT honor *_proxy env vars on their own. A CN cluster
+// cannot reach the ROW Anthropic gateway (aidp-i18ntt-sg.tiktok-row.net)
+// directly — it is rejected by the ROW Operations Gateway (code 4005). When a
+// forward proxy is configured via env, tunnel the upstream HTTPS call through
+// it with CONNECT. Gated on env, so default (no proxy) behavior is unchanged.
+function upstreamProxyConfig() {
+  const raw = process.env.UPSTREAM_HTTPS_PROXY || process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy || '';
+  if (!raw) return null;
+  // URL.hostname keeps brackets for IPv6 ([::1]); node http.request needs the
+  // raw address (brackets => treated as a DNS name => ENOTFOUND).
+  try { const u = new URL(raw); return { host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || 3128 }; }
+  catch (e) { return null; }
+}
+
+function dispatchUpstream(options, body, onResponse, onError) {
+  const https = require('https');
+  const proxy = upstreamProxyConfig();
+  if (proxy && options.protocol === 'https:') {
+    const tls = require('tls');
+    const host = options.hostname;
+    const port = Number(options.port) || 443;
+    const connectReq = http.request({
+      host: proxy.host, port: proxy.port, method: 'CONNECT',
+      path: `${host}:${port}`, headers: { Host: `${host}:${port}` },
+    });
+    connectReq.once('connect', (res, socket) => {
+      if (res.statusCode !== 200) { onError(new Error(`proxy CONNECT failed status=${res.statusCode}`)); return; }
+      // agent:false makes node ignore createConnection (one-off direct dial that
+      // leaks past the tunnel). Use a custom Agent whose createConnection returns
+      // a TLS socket riding the CONNECT tunnel, so the request egresses the proxy.
+      const agent = new https.Agent({ maxSockets: 1 });
+      agent.createConnection = () => tls.connect({ socket, servername: host }, () => {});
+      const req = https.request({ ...options, agent }, onResponse);
+      req.on('error', onError);
+      if (body) req.write(body);
+      req.end();
+    });
+    connectReq.on('error', onError);
+    connectReq.end();
+    return;
+  }
+  const transport = options.protocol === 'https:' ? https : http;
+  const req = transport.request({ ...options, agent: false }, onResponse);
+  req.on('error', onError);
+  if (body) req.write(body);
+  req.end();
+}
+
 function handleAnthropicNativeProvider(req, res, originalBody) {
   let openAiPayload;
   let anthropicPayload;
@@ -430,8 +480,7 @@ function handleAnthropicNativeProvider(req, res, originalBody) {
     },
     shapedBody.length,
   );
-  const transport = options.protocol === 'https:' ? require('https') : http;
-  const upstreamReq = transport.request(options, (upstreamRes) => {
+  const onResponse = (upstreamRes) => {
     const chunks = [];
     upstreamRes.on('data', (chunk) => chunks.push(chunk));
     upstreamRes.on('end', () => {
@@ -445,13 +494,12 @@ function handleAnthropicNativeProvider(req, res, originalBody) {
       res.writeHead(converted.statusCode, { 'Content-Type': converted.contentType || 'application/json' });
       res.end(converted.body);
     });
-  });
-  upstreamReq.on('error', (err) => {
+  };
+  const onError = (err) => {
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `Anthropic upstream proxy error: ${err.message}` } }));
-  });
-  upstreamReq.write(shapedBody);
-  upstreamReq.end();
+  };
+  dispatchUpstream(options, shapedBody, onResponse, onError);
 }
 
 function shapeProviderRequest(bodyText) {
